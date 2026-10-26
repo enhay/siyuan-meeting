@@ -4,6 +4,7 @@ const { Plugin, Menu, showMessage, openTab } = require("siyuan");
 const { ICONS } = require("./icons");
 const { MeetingController } = require("./controller");
 const { TranscriptionManager } = require("./transcription");
+const { SummaryTemplateStore } = require("./summary-templates");
 const ui = require("./ui");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
@@ -18,6 +19,8 @@ module.exports = class MeetingPlugin extends Plugin {
     this.controller = new MeetingController(this);
     this.transcription = new TranscriptionManager(this);
     await this.controller.init();
+    this.summaryTemplates = new SummaryTemplateStore(this);
+    await this.summaryTemplates.init();
     this.registerTabs();
     this.registerTopBar();
     this.registerCommands();

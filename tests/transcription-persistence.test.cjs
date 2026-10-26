@@ -46,3 +46,19 @@ test("post-recording policy distinguishes offline speakers, online gaps and disa
   await manager.afterRecording(meeting, disabled);
   assert.deepEqual(jobs.slice(1), [{ id: "online", gapsOnly: true }, { id: "disabled", gapsOnly: false }]);
 });
+
+test("configuration-only transcription state is distinguished from an actual failure on the persisted path", async (t) => {
+  const { RealtimeTranscriber } = require("../capture/realtime.cjs");
+  let report;
+  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 1, enabled: true, configured: false, emit: (value) => { report = value; } });
+  realtime.report();
+  const persisted = {};
+  t.mock.method(store, "updateRecordingTranscription", async (_meeting, _id, patch) => Object.assign(persisted, patch));
+  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}) } });
+  await manager.onRealtime({ id: "meeting" }, "recording", report);
+  assert.equal(persisted.transcriptionIssue, "configuration-required");
+  await manager.onRealtime({ id: "meeting" }, "recording", { status: "incomplete", error: "录音仍在保存，连接已中断", gaps: [] });
+  assert.equal(persisted.transcriptionIssue, "");
+  assert.equal(persisted.transcriptionStatus, "incomplete");
+  assert.equal(persisted.transcriptionError, "录音仍在保存，连接已中断");
+});

@@ -452,6 +452,23 @@
   cursor: pointer;
 }
 .meeting-link:hover { color: var(--b3-theme-on-background); text-decoration: underline; }
+.meeting-inline-notice { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; padding: 4px 2px; margin: 0 0 8px; color: var(--meeting-muted); font-size: 12px; line-height: 1.6; }
+.meeting-inline-notice .meeting-link { margin-left: 0; padding: 0; color: inherit; }
+.meeting-template-picker { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.meeting-summary-template { max-width: 180px; min-width: 0; padding: 3px 20px 3px 8px; border: 1px solid var(--meeting-border); border-radius: 6px; background: var(--b3-theme-background); color: var(--b3-theme-on-background); font: inherit; font-size: 12px; }
+.meeting-template-manager { display: flex; flex-direction: column; gap: 12px; max-height: 75vh; overflow: auto; }
+.meeting-template-manager__toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.meeting-template-manager__toolbar select { flex: 1; min-width: 140px; }
+.meeting-template-manager__field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.meeting-template-manager__field textarea { resize: vertical; min-height: 80px; line-height: 1.6; }
+.meeting-template-manager__markdown { font-family: var(--b3-font-family-code); }
+.meeting-template-manager__field [readonly] { color: var(--b3-theme-on-surface); }
+.meeting-template-manager__error { color: var(--b3-theme-error); margin: 0; font-size: 12px; }
+.meeting-summary-inputs { margin-bottom: 8px; }
+.meeting-summary-inputs .meeting-summary-scope { justify-content: flex-start; }
+.meeting-summary-missing { color: var(--meeting-muted); font-size: 12px; line-height: 1.6; text-align: left; }
+.meeting-summary-missing summary { cursor: pointer; padding: 4px 0; }
+.meeting-summary-missing ul { margin: 0 0 6px; padding-left: 20px; }
 
 /* ---- recordings --------------------------------------------------------- */
 .meeting-segments { display: flex; flex-direction: column; gap: 6px; }

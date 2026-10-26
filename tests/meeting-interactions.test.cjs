@@ -23,11 +23,13 @@ test("retrying summary metadata save preserves a single result and refuses to ov
     if (failMetadata) { failMetadata = false; throw new Error("save interrupted"); }
     document.attrs = { ...document.attrs, ...attrs };
   });
-  const draft = { markdown: "周五复核，负责人待定。", sources: "会议笔记", receipt: {} };
+  const basis = { templateId: "actions", template: "template-hash", notes: "notes-hash", transcript: "transcript-hash", onlyNotes: false, recordingIds: null };
+  const draft = { markdown: "周五复核，负责人待定。", sources: "会议笔记", basis, receipt: {} };
   await assert.rejects(store.saveSummary({ id: "meeting" }, draft));
   await store.saveSummary({ id: "meeting" }, draft);
   assert.equal(document.content, "周五复核，负责人待定。");
   assert.equal(document.attrs[store.ATTR.summarySources], "会议笔记");
+  assert.deepEqual(JSON.parse(document.attrs[store.ATTR.summaryBasis]), basis);
   document.content = "人工确认的纪要";
   await assert.rejects(store.saveSummary({ id: "meeting" }, draft));
   assert.equal(document.content, "人工确认的纪要");

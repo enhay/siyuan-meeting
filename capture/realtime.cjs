@@ -260,6 +260,7 @@ class RealtimeTranscriber {
         : !this.configured ? "incomplete"
           : final ? (!gaps.length && this.channels === 2 ? "done" : "incomplete") : "recording",
       error: this.error,
+      configurationRequired: this.enabled && !this.configured,
       final,
     });
   }

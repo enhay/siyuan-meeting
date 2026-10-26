@@ -55,6 +55,7 @@ class MeetingController {
       .digest("hex")
       .slice(0, 16);
     this.storageRoot = path.join(this.userData, "siyuan-meeting", workspaceKey);
+    this.preferencesPath = path.join(this.storageRoot, "preferences.json");
     this.recordingRoot = path.join(this.storageRoot, "recordings");
     this.peaksRoot = path.join(this.storageRoot, "peaks");
     this.pendingArchivePath = path.join(this.storageRoot, "pending-archives.json");
@@ -157,13 +158,21 @@ class MeetingController {
   }
 
   async init() {
+    let legacy = {};
     try {
-      const stored = JSON.parse(localStorage.getItem(PREF_KEY) || "{}");
-      for (const key of Object.keys(this.prefs)) {
-        if (Object.hasOwn(stored, key)) this.prefs[key] = stored[key];
-      }
+      legacy = JSON.parse(localStorage.getItem(PREF_KEY) || "{}");
     } catch {
-      // use defaults
+      // A browser preference is migrated only when it can be read.
+    }
+    const stored = { ...legacy, ...readJson(this.preferencesPath, {}) };
+    for (const key of Object.keys(this.prefs)) {
+      if (Object.hasOwn(stored, key)) this.prefs[key] = stored[key];
+    }
+    try {
+      writeJson(this.preferencesPath, this.prefs);
+      localStorage.removeItem(PREF_KEY);
+    } catch {
+      // Keep the legacy preference until its local replacement is saved.
     }
     this.state.online = this.prefs.mode === "online";
     this.state.deviceId = this.prefs.deviceId || "";
@@ -182,12 +191,9 @@ class MeetingController {
   }
 
   setPrefs(patch) {
-    this.prefs = { ...this.prefs, ...patch };
-    try {
-      localStorage.setItem(PREF_KEY, JSON.stringify(this.prefs));
-    } catch {
-      // private mode or storage disabled
-    }
+    const next = { ...this.prefs, ...patch };
+    writeJson(this.preferencesPath, next);
+    this.prefs = next;
     if (!this.isBusy()) {
       if (patch.mode) this.state.online = patch.mode === "online";
       if (typeof patch.deviceId === "string") this.state.deviceId = patch.deviceId;

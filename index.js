@@ -271,6 +271,7 @@ class RealtimeTranscriber {
         : !this.configured ? "incomplete"
           : final ? (!gaps.length && this.channels === 2 ? "done" : "incomplete") : "recording",
       error: this.error,
+      configurationRequired: this.enabled && !this.configured,
       final,
     });
   }
@@ -991,6 +992,7 @@ class MeetingController {
       .digest("hex")
       .slice(0, 16);
     this.storageRoot = path.join(this.userData, "siyuan-meeting", workspaceKey);
+    this.preferencesPath = path.join(this.storageRoot, "preferences.json");
     this.recordingRoot = path.join(this.storageRoot, "recordings");
     this.peaksRoot = path.join(this.storageRoot, "peaks");
     this.pendingArchivePath = path.join(this.storageRoot, "pending-archives.json");
@@ -1093,13 +1095,21 @@ class MeetingController {
   }
 
   async init() {
+    let legacy = {};
     try {
-      const stored = JSON.parse(localStorage.getItem(PREF_KEY) || "{}");
-      for (const key of Object.keys(this.prefs)) {
-        if (Object.hasOwn(stored, key)) this.prefs[key] = stored[key];
-      }
+      legacy = JSON.parse(localStorage.getItem(PREF_KEY) || "{}");
     } catch {
-      // use defaults
+      // A browser preference is migrated only when it can be read.
+    }
+    const stored = { ...legacy, ...readJson(this.preferencesPath, {}) };
+    for (const key of Object.keys(this.prefs)) {
+      if (Object.hasOwn(stored, key)) this.prefs[key] = stored[key];
+    }
+    try {
+      writeJson(this.preferencesPath, this.prefs);
+      localStorage.removeItem(PREF_KEY);
+    } catch {
+      // Keep the legacy preference until its local replacement is saved.
     }
     this.state.online = this.prefs.mode === "online";
     this.state.deviceId = this.prefs.deviceId || "";
@@ -1118,12 +1128,9 @@ class MeetingController {
   }
 
   setPrefs(patch) {
-    this.prefs = { ...this.prefs, ...patch };
-    try {
-      localStorage.setItem(PREF_KEY, JSON.stringify(this.prefs));
-    } catch {
-      // private mode or storage disabled
-    }
+    const next = { ...this.prefs, ...patch };
+    writeJson(this.preferencesPath, next);
+    this.prefs = next;
     if (!this.isBusy()) {
       if (patch.mode) this.state.online = patch.mode === "online";
       if (typeof patch.deviceId === "string") this.state.deviceId = patch.deviceId;
@@ -2308,6 +2315,7 @@ const { Plugin, Menu, showMessage, openTab } = require("siyuan");
 const { ICONS } = require("./icons");
 const { MeetingController } = require("./controller");
 const { TranscriptionManager } = require("./transcription");
+const { SummaryTemplateStore } = require("./summary-templates");
 const ui = require("./ui");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
@@ -2322,6 +2330,8 @@ module.exports = class MeetingPlugin extends Plugin {
     this.controller = new MeetingController(this);
     this.transcription = new TranscriptionManager(this);
     await this.controller.init();
+    this.summaryTemplates = new SummaryTemplateStore(this);
+    await this.summaryTemplates.init();
     this.registerTabs();
     this.registerTopBar();
     this.registerCommands();
@@ -2648,6 +2658,7 @@ const ATTR = {
   recordingInterrupted: "custom-recording-interrupted",
   transcriptionStatus: "custom-recording-transcription-status",
   transcriptionError: "custom-recording-transcription-error",
+  transcriptionIssue: "custom-recording-transcription-issue",
   transcriptionGaps: "custom-recording-transcription-gaps",
   transcriptionFingerprint: "custom-recording-transcription-fingerprint",
   realtimeEnabled: "custom-recording-realtime-enabled",
@@ -2663,6 +2674,8 @@ const ATTR = {
   summaryGeneratedAt: "custom-summary-generated-at",
   summarySources: "custom-summary-sources",
   summaryFingerprint: "custom-summary-fingerprint",
+  summaryTemplate: "custom-meeting-summary-template",
+  summaryBasis: "custom-summary-basis",
 };
 
 const MEETING_STATUS = {
@@ -2686,6 +2699,7 @@ function meetingFrom(row, attrs = {}) {
     segments: Number(attrs[ATTR.segments] || 0) || 0,
     preNotes: attrs[ATTR.preNotes] || "",
     isMeeting: Boolean(attrs[ATTR.id]),
+    summaryTemplate: attrs[ATTR.summaryTemplate] || "general",
   };
 }
 
@@ -2916,6 +2930,7 @@ async function readRecordings(meeting) {
         events: parseEvents(attrs[ATTR.recordingEvents]),
         transcriptionStatus: attrs[ATTR.transcriptionStatus] || "",
         transcriptionError: attrs[ATTR.transcriptionError] || "",
+        transcriptionIssue: attrs[ATTR.transcriptionIssue] || "",
         transcriptionFingerprint: attrs[ATTR.transcriptionFingerprint] || "",
         gaps: parseEvents(attrs[ATTR.transcriptionGaps]),
         realtimeEnabled: attrs[ATTR.realtimeEnabled] === "1",
@@ -3090,6 +3105,7 @@ async function updateRecordingTranscription(meeting, recordingId, patch) {
   const fields = {
     transcriptionStatus: ATTR.transcriptionStatus,
     transcriptionError: ATTR.transcriptionError,
+    transcriptionIssue: ATTR.transcriptionIssue,
     transcriptionFingerprint: ATTR.transcriptionFingerprint,
     gaps: ATTR.transcriptionGaps,
     realtimeEnabled: ATTR.realtimeEnabled,
@@ -3112,14 +3128,24 @@ async function readSummaries(meeting) {
       generatedAt: child.attrs[ATTR.summaryGeneratedAt] || "",
       sources: child.attrs[ATTR.summarySources] || "",
       fingerprint: child.attrs[ATTR.summaryFingerprint] || "",
+      basis: readSummaryBasis(child.attrs[ATTR.summaryBasis]),
     }));
+}
+
+function readSummaryBasis(value) {
+  try {
+    const basis = JSON.parse(value || "null");
+    return basis && typeof basis === "object" && !Array.isArray(basis) ? basis : null;
+  } catch {
+    return null;
+  }
 }
 
 async function readSummaryContent(docId) {
   return api.getDocMarkdown(docId);
 }
 
-async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {} }) {
+async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {}, basis = null }) {
   const content = String(markdown || "").trim();
   if (!content) throw new Error("纪要内容为空，未写入文档");
   const summaries = await readSummaries(meeting);
@@ -3134,6 +3160,7 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
     [ATTR.parent]: meeting.id,
     [ATTR.summaryGeneratedAt]: generatedAt,
     [ATTR.summarySources]: sources,
+    [ATTR.summaryBasis]: basis ? JSON.stringify(basis) : "",
   };
   // A metadata write or the subsequent UI refresh can fail after the content
   // was saved. A retry must not append that content a second time.
@@ -3228,6 +3255,9 @@ module.exports = {
   "src/prompts.js": function (module, exports, require) {
 "use strict";
 
+const { sha256 } = require("./util");
+const { BUILTIN_TEMPLATES } = require("./summary-templates");
+
 /*
  * These prompts are adapted from Anarlog (https://github.com/fastrepl/anarlog),
  * fixed at commit 341ccb3a5636a4e2784a9d4f1177a094d855c1bd.
@@ -3304,23 +3334,49 @@ const DEFAULT_FORMAT_REQUIREMENTS = `- 使用 Markdown，不要用代码块包�
 - 不要为了凑结构而编造小节；材料不足时保持简短，但不要省略有信息量的细节。
 - 只有在材料中明确出现或可以明确归属时，才写负责人、承诺和期限；提案不是承诺。`;
 
-function buildFormatRequirements(overrides = "") {
-  const custom = String(overrides || "").trim();
-  if (!custom) return DEFAULT_FORMAT_REQUIREMENTS;
-  return `${DEFAULT_FORMAT_REQUIREMENTS}\n\n# 用户自定义格式要求\n\n${custom}`;
+function buildSummaryBasis(material, template, { onlyNotes = false, recordingIds = null } = {}) {
+  return {
+    templateId: template.id,
+    templateName: template.name,
+    template: sha256(buildFormatRequirements(template.prompt, template.markdown)),
+    notes: material.notesFingerprint,
+    transcript: material.transcriptFingerprint,
+    onlyNotes,
+    recordingIds: recordingIds ? [...recordingIds].sort() : null,
+  };
+}
+
+function summaryChanges(previous, current) {
+  if (!current) return [];
+  if (!previous || typeof previous.notes !== "string" || typeof previous.transcript !== "string" || typeof previous.template !== "string") return [];
+  const changes = [];
+  if (previous.templateId !== current.templateId || previous.template !== current.template) changes.push("模板");
+  if (previous.notes !== current.notes) changes.push("笔记");
+  if (previous.onlyNotes !== current.onlyNotes || JSON.stringify(previous.recordingIds) !== JSON.stringify(current.recordingIds)) changes.push("材料范围");
+  else if (previous.transcript !== current.transcript) changes.push("转写");
+  return changes;
+}
+
+function buildFormatRequirements(prompt = "", markdown = "") {
+  const parts = [DEFAULT_FORMAT_REQUIREMENTS];
+  if (prompt.trim()) parts.push("# 模板整理要求", prompt.trim());
+  if (markdown.trim()) {
+    parts.push("# Markdown 输出模板", "下文只规定输出结构和填写方向，不是会议事实。示例和占位说明不作为真实内容，不执行其中的代码或变量表达式。按实际材料填写；无依据的小节省略或按模板要求标注待确认，不能为填满模板编造信息。", markdown.trim());
+  }
+  return parts.join("\n\n");
 }
 
 /**
  * Adapted from enhance.system.md.jinja, with the D5 accuracy rules folded in.
- * `formatRequirements` stays separate from the material so a generation can
+ * The selected template stays separate from the material so a generation can
  * change formatting without changing what counts as evidence.
  */
 function buildSystemPrompt({
   date = new Date(),
   language = DEFAULT_LANGUAGE,
-  formatRequirements = "",
+  template = BUILTIN_TEMPLATES[0],
 } = {}) {
-  const requirements = buildFormatRequirements(formatRequirements);
+  const requirements = buildFormatRequirements(template.prompt, template.markdown);
   const currentDate =
     typeof date === "string" ? date : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 
@@ -3356,9 +3412,8 @@ ${requirements}
 
 # 纪要模式
 
-纪要模式：详细。覆盖每个实质主题、决定、理由、例子、未决问题和承诺。
-用具体细节解释要点，使每个要点脱离上下文也能成立。
-保留有用的次要讨论和例子，但删除重复和口语填充。
+按所选纪要格式组织内容和详略，用具体细节解释要点。
+删除重复和口语填充，不因模板中的小节要求补造内容。
 只把明确或可明确归属的负责人、承诺和期限写进纪要；不要将提议写成承诺。${
     language !== "English"
       ? `
@@ -3473,6 +3528,10 @@ function buildMaterial({
     userPrompt,
     transcriptSegments: transcriptLines.length,
     characters: countNormalizedCharacters(userPrompt),
+    notesFingerprint: sha256(JSON.stringify([title.trim(), startedAt, endedAt, preMeetingNotes.trim(), meetingNotes.trim()])),
+    transcriptFingerprint: sha256(JSON.stringify(transcriptLines.filter((segment) => String(segment.text || "").trim()).map((segment) => [
+      segment.recordingId || "", segment.startMs, segment.speaker, String(segment.text).trim(),
+    ]))),
   };
 }
 
@@ -3492,6 +3551,8 @@ function contextCharacterBudget(model) {
 }
 
 module.exports = {
+  buildSummaryBasis,
+  summaryChanges,
   MIT_NOTICE,
   DEFAULT_LANGUAGE,
   DEFAULT_FORMAT_REQUIREMENTS,
@@ -3803,6 +3864,318 @@ module.exports = {
 };
 
   },
+  "src/summary-templates.js": function (module, exports, require) {
+"use strict";
+
+const { randomUUID } = require("node:crypto");
+const { EventEmitter } = require("node:events");
+
+const TEMPLATE_FILE = "summary-templates.json";
+const BUILTIN_TEMPLATES = [
+  {
+    id: "general", name: "通用纪要",
+    prompt: "按实际讨论主题详细整理讨论要点、明确决定、行动项和待确认问题，覆盖有信息量的主题、理由与例子。保留有用的上下文，材料未涉及的部分不设空小节。",
+    markdown: "## 讨论要点\n按主题整理讨论与依据。\n\n## 明确决定\n\n## 行动项\n\n## 待确认问题",
+  },
+  {
+    id: "actions", name: "行动清单",
+    prompt: "优先整理明确的行动项，逐项说明要做什么、明确的负责人和期限、相关依赖或待确认事项。负责人或期限缺失时写待确认。将尚未形成承诺的建议单列，不混入已确认任务。",
+    markdown: "## 已确认行动\n| 行动 | 负责人 | 期限 | 依赖或待确认 |\n| --- | --- | --- | --- |\n\n## 尚未确认的建议",
+  },
+  {
+    id: "decisions", name: "决策记录",
+    prompt: "围绕实际决策整理问题、讨论过的选项与依据、已确认的决定、明确的后续行动和仍未解决的问题。区分决定、提议和待确认内容，没有形成决定时如实说明。",
+    markdown: "## 决策问题\n\n## 选项与依据\n\n## 已确认决定\n\n## 后续行动\n\n## 待确认问题",
+  },
+].map((template) => Object.freeze(template));
+Object.freeze(BUILTIN_TEMPLATES);
+
+function getSummaryTemplate(id = "general", templates = BUILTIN_TEMPLATES) {
+  return templates.find((template) => template.id === id) || null;
+}
+
+function validateTemplate(value) {
+  if (!value || typeof value !== "object" ||
+      !["name", "prompt", "markdown"].every((key) => typeof value[key] === "string")) {
+    throw new Error("请填写模板名称、提示词或 Markdown 模板。");
+  }
+  const template = { name: value.name.trim(), prompt: value.prompt.trim(), markdown: value.markdown.trim() };
+  if (!template.name) throw new Error("请填写模板名称。");
+  if (!template.prompt && !template.markdown) throw new Error("请填写提示词或 Markdown 模板。");
+  return template;
+}
+
+class SummaryTemplateStore {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.custom = [];
+    this.events = new EventEmitter();
+    this.error = "";
+    this.ready = false;
+    this.saving = false;
+  }
+
+  async init() {
+    try {
+      const saved = await this.plugin.loadData(TEMPLATE_FILE);
+      const items = saved == null || saved === "" ? [] : saved;
+      if (!Array.isArray(items)) throw new Error("invalid template data");
+      const ids = new Set(BUILTIN_TEMPLATES.map((item) => item.id));
+      this.custom = items.map((item) => {
+        if (typeof item?.id !== "string" || !item.id.startsWith("custom-") || ids.has(item.id)) throw new Error("invalid template id");
+        ids.add(item.id);
+        return { id: item.id, ...validateTemplate(item) };
+      });
+      this.ready = true;
+      this.error = "";
+    } catch {
+      this.ready = false;
+      this.error = "自定义模板未能读取，请重新加载插件后重试。";
+    }
+  }
+
+  list() {
+    return [...BUILTIN_TEMPLATES, ...this.custom].map((item) => ({ ...item }));
+  }
+
+  get(id) {
+    return getSummaryTemplate(id, this.list());
+  }
+
+  subscribe(listener) {
+    this.events.on("change", listener);
+    return () => this.events.off("change", listener);
+  }
+
+  async save(value) {
+    this.assertReady();
+    const id = value.id || `custom-${randomUUID()}`;
+    if (getSummaryTemplate(id)) throw new Error("请复制内置模板后再修改。");
+    if (value.id && !this.custom.some((item) => item.id === id)) throw new Error("模板已删除，请重新选择。");
+    const template = { id, ...validateTemplate(value) };
+    const next = this.custom.filter((item) => item.id !== id);
+    const index = this.custom.findIndex((item) => item.id === id);
+    next.splice(index < 0 ? next.length : index, 0, template);
+    await this.persist(next);
+    return { ...template };
+  }
+
+  async remove(id) {
+    this.assertReady();
+    if (getSummaryTemplate(id)) throw new Error("内置模板不能删除。");
+    await this.persist(this.custom.filter((item) => item.id !== id));
+  }
+
+  assertReady() {
+    if (!this.ready) throw new Error(this.error || "模板尚未读取完成。");
+  }
+
+  async persist(items) {
+    // Settings and a meeting can each have a template editor open. Do not let
+    // overlapping writes replace the other editor's newly saved collection.
+    if (this.saving) throw new Error("另一个窗口正在保存模板，请稍后重试。");
+    this.saving = true;
+    try {
+      const response = await this.plugin.saveData(TEMPLATE_FILE, items);
+      if (response?.code) throw new Error("模板未能保存，请重试。");
+      this.custom = items;
+    } finally {
+      this.saving = false;
+    }
+    this.events.emit("change");
+  }
+}
+
+module.exports = { BUILTIN_TEMPLATES, getSummaryTemplate, SummaryTemplateStore, validateTemplate };
+
+  },
+  "src/template-ui.js": function (module, exports, require) {
+"use strict";
+
+const { Dialog } = require("siyuan");
+const { BUILTIN_TEMPLATES, getSummaryTemplate } = require("./summary-templates");
+
+function node(tag, className, text = "") {
+  const element = document.createElement(tag);
+  element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+function appendOptions(select, templates, selectedId) {
+  for (const [name, custom] of [["内置模板", false], ["自定义模板", true]]) {
+    const group = document.createElement("optgroup");
+    group.label = name;
+    for (const template of templates.filter((item) => !getSummaryTemplate(item.id) === custom)) {
+      group.append(new Option(template.name, template.id, false, template.id === selectedId));
+    }
+    if (group.children.length) select.append(group);
+  }
+}
+
+function createTemplatePicker({ store, selectedId, disabled = false, onSelect, onManage }) {
+  const wrapper = node("div", "meeting-template-picker");
+  const select = document.createElement("select");
+  select.className = "meeting-summary-template";
+  select.setAttribute("aria-label", "纪要模板");
+  const templates = store.list();
+  appendOptions(select, templates, selectedId);
+  if (!store.get(selectedId)) {
+    const missing = new Option("模板不可用，请重新选择", selectedId, true, true);
+    missing.disabled = true;
+    select.prepend(missing);
+  }
+  select.value = selectedId;
+  select.disabled = disabled;
+  select.onchange = () => onSelect(select.value);
+  const manage = node("button", "meeting-link", "管理模板");
+  manage.type = "button";
+  manage.disabled = disabled;
+  manage.onclick = onManage;
+  wrapper.append(select, manage);
+  return wrapper;
+}
+
+function openTemplateManager({ store, selectedId = "general", onUse, confirm }) {
+  let currentId = store.get(selectedId)?.id || "general";
+  let original = null;
+  let busy = false;
+  const dialog = new Dialog({
+    title: "纪要模板", width: "720px", hideCloseIcon: true,
+    content: `<div class="b3-dialog__content meeting-template-manager">
+      <div class="meeting-template-manager__toolbar">
+        <select class="b3-select" aria-label="管理的模板" data-field="templates"></select>
+        <button type="button" class="meeting-link" data-action="new">新建</button>
+        <button type="button" class="meeting-link" data-action="copy">复制</button>
+        <button type="button" class="meeting-link" data-action="delete">删除</button>
+      </div>
+      <label class="meeting-template-manager__field">模板名称<input class="b3-text-field" name="name" autocomplete="off"></label>
+      <label class="meeting-template-manager__field">提示词<textarea class="b3-text-field" name="prompt" rows="4" placeholder="例如：重点整理已经确认的行动，保留负责人、期限和依赖。"></textarea></label>
+      <label class="meeting-template-manager__field">Markdown 模板<textarea class="b3-text-field meeting-template-manager__markdown" name="markdown" rows="9" placeholder="## 讨论要点&#10;&#10;## 行动清单&#10;&#10;## 待确认问题"></textarea></label>
+      <p class="meeting-settings__hint" data-field="hint"></p>
+      <p class="meeting-inline-notice" data-field="notice"></p>
+      <p class="meeting-template-manager__error" role="alert" data-field="error"></p>
+      <div class="meeting-confirm__actions"><button type="button" class="b3-button b3-button--cancel" data-action="close">关闭</button><button type="button" class="b3-button" data-action="save"></button></div>
+    </div>`,
+  });
+  const element = dialog.element;
+  const field = (name) => element.querySelector(`[data-field="${name}"]`);
+  const action = (name) => element.querySelector(`[data-action="${name}"]`);
+  const input = (name) => element.querySelector(`[name="${name}"]`);
+  const values = () => ({ name: input("name").value, prompt: input("prompt").value, markdown: input("markdown").value });
+  const dirty = () => !getSummaryTemplate(currentId) && (!currentId
+    ? Object.values(values()).some((value) => value.trim())
+    : JSON.stringify(values()) !== JSON.stringify(original));
+  const allowDiscard = () => !dirty() || confirm("放弃模板修改", "当前模板的修改尚未保存。", "放弃修改");
+
+  function render(template) {
+    currentId = template.id || "";
+    original = { name: template.name, prompt: template.prompt, markdown: template.markdown };
+    const builtin = Boolean(getSummaryTemplate(currentId));
+    const select = field("templates");
+    select.replaceChildren();
+    appendOptions(select, store.list(), currentId);
+    if (!currentId) select.prepend(new Option("新建自定义模板", "", true, true));
+    for (const name of ["name", "prompt", "markdown"]) {
+      input(name).value = template[name];
+      input(name).readOnly = builtin || !store.ready;
+    }
+    action("delete").hidden = builtin || !currentId;
+    action("save").textContent = builtin ? "使用模板" : onUse ? "保存并使用" : "保存模板";
+    action("save").hidden = builtin && !onUse;
+    field("hint").textContent = builtin
+      ? "内置模板可复制后修改。提示词规定整理要求，Markdown 模板定义输出结构。"
+      : "提示词和 Markdown 模板至少填写一项。模板示例不作为会议事实；保存后不会自动生成纪要。";
+    field("notice").textContent = "";
+    field("error").textContent = store.error;
+    setBusy(false);
+    element.dataset.state = builtin ? "builtin" : "editing";
+  }
+
+  function setBusy(value) {
+    busy = value;
+    for (const control of element.querySelectorAll("input, textarea, select, button")) control.disabled = value;
+    if (!value && !store.ready) {
+      for (const name of ["save", "new", "copy", "delete"]) action(name).disabled = true;
+    }
+  }
+
+  field("templates").onchange = async (event) => {
+    const next = store.get(event.target.value);
+    if (!next || busy) return;
+    if (await allowDiscard()) render(next);
+    else field("templates").value = currentId;
+  };
+  action("new").onclick = async () => {
+    if (busy || !await allowDiscard()) return;
+    render({ name: "", prompt: "", markdown: "" });
+    input("name").focus();
+  };
+  action("copy").onclick = async () => {
+    if (busy) return;
+    const copy = values();
+    // Copy the draft too, so creating a variant never discards unsaved edits.
+    render({ ...copy, name: `${copy.name || "模板"}（副本）` });
+    input("name").focus();
+  };
+  action("close").onclick = async () => {
+    if (!busy && await allowDiscard()) dialog.destroy();
+  };
+  action("save").onclick = async () => {
+    if (busy) return;
+    setBusy(true);
+    field("error").textContent = "";
+    element.dataset.state = "saving";
+    try {
+      let saved = store.get(currentId);
+      if (!getSummaryTemplate(currentId)) {
+        if (currentId && JSON.stringify(saved && { name: saved.name, prompt: saved.prompt, markdown: saved.markdown }) !== JSON.stringify(original)) {
+          throw new Error("模板已在其他窗口变更，请重新选择后再编辑。");
+        }
+        saved = await store.save({ id: currentId, ...values() });
+        // Meeting selection can fail after the template was saved. Retain its
+        // identity so retrying uses that template rather than creating a copy.
+        render(saved);
+        setBusy(true);
+      }
+      if (onUse) {
+        await onUse(saved.id);
+        dialog.destroy();
+      } else {
+        render(saved);
+        field("notice").textContent = "模板已保存。";
+      }
+      element.dataset.state = "saved";
+    } catch (error) {
+      field("error").textContent = error.message;
+      element.dataset.state = "error";
+    } finally {
+      setBusy(false);
+    }
+  };
+  action("delete").onclick = async () => {
+    if (busy || !currentId) return;
+    if (!await confirm("删除自定义模板", "已有纪要会保留。使用此模板的会议需要重新选择模板后才能生成。", "删除模板")) return;
+    setBusy(true);
+    try {
+      await store.remove(currentId);
+      render(BUILTIN_TEMPLATES[0]);
+      field("notice").textContent = "模板已删除，已有纪要已保留。";
+      element.dataset.state = "deleted";
+    } catch (error) {
+      field("error").textContent = error.message;
+      element.dataset.state = "error";
+    } finally {
+      setBusy(false);
+    }
+  };
+  render(store.get(currentId));
+  return dialog;
+}
+
+module.exports = { createTemplatePicker, openTemplateManager };
+
+  },
   "src/tencent.js": function (module, exports, require) {
 "use strict";
 
@@ -4102,7 +4475,7 @@ class TranscriptionManager {
 
   async setState(meeting, recordingId, status, error = "", patch = {}) {
     await meetingStore.updateRecordingTranscription(meeting, recordingId, {
-      ...patch, transcriptionStatus: status, transcriptionError: error,
+      transcriptionIssue: "", ...patch, transcriptionStatus: status, transcriptionError: error,
     });
     this.notify(meeting, recordingId, status, error);
   }
@@ -4125,6 +4498,7 @@ class TranscriptionManager {
     const status = message.final && missing.length ? "incomplete" : message.status || "recording";
     const error = missing.length ? "部分转写未能写入会议，录音仍已保存；结束后可补齐缺口" : message.error || "";
     await this.setState(meeting, recordingId, status, error, {
+      transcriptionIssue: message.configurationRequired && !missing.length ? "configuration-required" : "",
       gaps, ...(message.meta ? { realtimeEnabled: Boolean(message.meta.realtimeEnabled) } : {}),
     });
     return { gaps, status, error };
@@ -4204,7 +4578,7 @@ class TranscriptionManager {
   async afterRecording(meeting, recording) {
     if (this.closing || recording.interrupted) return;
     if (!this.isConfigured()) {
-      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置");
+      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
       return;
     }
     if (recording.realtimeEnabled) {
@@ -4249,6 +4623,7 @@ const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
+const { createTemplatePicker, openTemplateManager } = require("./template-ui");
 const ai = require("./ai");
 const { findTranscriptMatches, playbackSegments } = require("./transcript-view");
 const {
@@ -4375,6 +4750,7 @@ function statusLabel(status) {
 function transcriptStatus(recording, transcriptSegments, manager, meetingId) {
   const live = manager?.statusFor(meetingId, recording.recordingId) || {};
   const status = live.status || recording.transcriptionStatus || "";
+  if (recording.transcriptionIssue === "configuration-required" && (!live.status || live.status === "incomplete")) return "";
   if (status) return status;
   return "";
 }
@@ -4633,6 +5009,9 @@ function mountMeetingTab(plugin, tab) {
     summaryNotice: "",
     summaryOnlyNotes: false,
     summarySelectedIds: null,
+    summaryTemplateId: "general",
+    summaryTemplateSaving: false,
+    summaryBasisInitialized: "",
     summaryAbort: null,
     material: null,
     materialDirty: true,
@@ -4719,6 +5098,9 @@ function mountMeetingTab(plugin, tab) {
     }).catch((error) => showMessage(`刷新转写失败：${error.message}`, 5000, "error"));
   });
   onCleanup(unsubscribeTranscription);
+  onCleanup(plugin.summaryTemplates.subscribe(() => {
+    if (!state.destroyed) renderSummary(state);
+  }));
 
   const refreshTitleFromServer = debounce(async () => {
     if (state.destroyed || !state.meeting) return;
@@ -4879,8 +5261,7 @@ function mountMeetingTab(plugin, tab) {
   const markMaterialDirty = debounce(() => {
     if (state.destroyed) return;
     state.materialDirty = true;
-    if (resolveMeetingView(state) === "summary" &&
-        !state.summaryEditorElement?.contains(document.activeElement)) {
+    if (resolveMeetingView(state) === "summary") {
       state.materialDirty = false;
       void safeRefreshMaterial(state);
     }
@@ -4896,6 +5277,7 @@ function mountMeetingTab(plugin, tab) {
   async function initialize() {
     try {
       state.meeting = await meetingStore.getMeeting(docId);
+      state.summaryTemplateId = state.meeting.summaryTemplate || "general";
       plugin.controller.selectMeeting(state.meeting);
       titleInput.value = state.meeting.title || "";
       tab.tab?.updateTitle?.(state.meeting.title || "");
@@ -5178,10 +5560,10 @@ function renderBanners(state) {
   state.bannerSignature = signature;
   container.replaceChildren();
 
-  if (snapshot.realtimeNotice && snapshot.meeting?.id === state.docId) {
-    const banner = h("div", "meeting-banner");
+  if (snapshot.realtimeNotice && snapshot.meeting?.id === state.docId && state.plugin.transcription.isConfigured()) {
+    const banner = h("div", "meeting-inline-notice");
     banner.append(h("span", "", snapshot.realtimeNotice));
-    const settings = h("button", "meeting-banner__action", "会议设置");
+    const settings = h("button", "meeting-link", "查看设置");
     settings.onclick = () => openSettings(state.plugin);
     banner.append(settings);
     container.append(banner);
@@ -5438,6 +5820,12 @@ async function refreshSummaries(state) {
   if (latest) {
     state.summaryDocId = latest.id;
     state.summaryContent = await meetingStore.readSummaryContent(latest.id);
+    if (state.summaryBasisInitialized !== latest.id) {
+      state.summaryBasisInitialized = latest.id;
+      state.summaryOnlyNotes = Boolean(latest.basis?.onlyNotes);
+      state.summarySelectedIds = Array.isArray(latest.basis?.recordingIds) ? latest.basis.recordingIds : null;
+      state.materialDirty = true;
+    }
   } else {
     state.summaryDocId = "";
     state.summaryContent = "";
@@ -5453,13 +5841,18 @@ function safeRefreshMaterial(state) {
 }
 
 async function refreshMaterial(state) {
-  const notes = await api.getDocMarkdown(state.docId);
+  const [notes, { segments }] = await Promise.all([
+    api.getDocMarkdown(state.docId), meetingStore.readTranscript(state.meeting),
+  ]);
+  if (state.destroyed) return;
+  state.transcript = segments;
   const selected = state.summarySelectedIds
     ? new Set(state.summarySelectedIds)
     : null;
   const transcript = state.transcript
     .filter((segment) => !selected || selected.has(segment.recordingId))
     .map((segment) => ({
+      recordingId: segment.recordingId,
       startMs: segment.startMs,
       speaker: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
       text: segment.text,
@@ -5868,10 +6261,10 @@ function renderViewStatus(state) {
   if (!button) return;
   const current = state.recordings.find((recording) => recording.recordingId === state.snapshot.recordingId);
   const status = isLiveTranscript(state)
-    ? state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
-      : !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
+    ? !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
+      : state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
       : state.snapshot.phase === "paused" ? "paused" : "recording"
-    : state.recordings.some((recording) => ["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length)
+    : state.recordings.some((recording) => recording.transcriptionIssue !== "configuration-required" && (["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length))
       ? "failed"
       : state.recordings.some((recording) => ["uploading", "processing"].includes(recording.transcriptionStatus))
         ? "processing" : current?.transcriptionStatus || "idle";
@@ -5991,7 +6384,15 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   section.append(header);
 
   const live = isLiveTranscript(state);
-  if (live) {
+  const configured = state.plugin.transcription.isConfigured();
+  if (!configured) {
+    const notice = h("div", "meeting-inline-notice", "配置腾讯云后可使用转写，录音仍可正常保存。");
+    notice.dataset.state = "configuration-required";
+    const settings = h("button", "meeting-link", "去配置");
+    settings.onclick = () => openSettings(state.plugin);
+    notice.append(settings);
+    section.append(notice);
+  } else if (live) {
     const phase = state.snapshot.phase;
     const hasCurrentText = state.transcript.some((segment) => segment.recordingId === state.snapshot.recordingId);
     const message = phase === "preparing" ? "正在准备录音，开始后将在这里显示实时转写。"
@@ -6001,8 +6402,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       : state.snapshot.realtimeNotice ? state.snapshot.realtimeNotice
       : phase === "paused" ? "录音已暂停，继续后会接着显示实时转写。"
       : hasCurrentText ? "正在实时转写，已确认的句子会持续显示。" : "已开启实时转写，正在等待第一句话。";
-    const notice = h("div", "meeting-transcript-notice", message);
-    notice.setAttribute("role", "status");
+    const notice = h("div", "meeting-inline-notice", message);
     section.append(notice);
   }
 
@@ -6046,20 +6446,12 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     section.append(notice);
   }
 
-  if (!live && !state.plugin.transcription.isConfigured()) {
-    const notice = h("div", "meeting-transcript-notice");
-    notice.append(h("span", "", "尚未配置腾讯云转写服务，录音仍可正常保存。"));
-    const settings = h("button", "meeting-link", "会议设置");
-    settings.onclick = () => openSettings(state.plugin);
-    notice.append(settings);
-    section.append(notice);
-  }
   for (const recording of state.recordings) {
     if (recording.gaps?.length) {
       const ranges = recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、");
-      section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
+      if (configured) section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
     }
-    if (recording.transcriptionError) section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
+    if (recording.transcriptionError && recording.transcriptionIssue !== "configuration-required") section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
   }
 
   if (!state.transcript.length) {
@@ -6067,7 +6459,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       emptyState(
         "iconMeetingTranscript",
         "尚无转写",
-        "选择上方录音段并点击「转写」，使用已配置的腾讯云服务。",
+        configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
       ),
     );
     renderTranscriptTools(state);
@@ -6176,18 +6568,43 @@ function renameTranscriptSpeaker(state, segment) {
 }
 
 function renderSummary(state) {
+  if (state.destroyed) return;
   const section = state.root.querySelector('[data-view-content="summary"]');
   if (!section) return;
+  const latest = state.summaries[0];
+  const changes = latest && state.material ? prompts.summaryChanges(latest.basis, currentSummaryBasis(state)) : [];
+  const selectedTemplate = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+  const templateUnavailable = !selectedTemplate;
+  section.dataset.state = state.summaryError ? "error" : state.summaryGenerating || state.summarySaving ? "generating" : templateUnavailable ? "template-unavailable" : !latest ? "empty" : changes.length ? "outdated" : "current";
+  const retainedEditor = state.summaryEditorElement;
   const summaryTab = state.root.querySelector('[data-view="summary"]');
   summaryTab.dataset.state = state.summaryError ? "failed" : state.summaryGenerating || state.summarySaving ? "processing" : "idle";
   summaryTab.setAttribute("aria-label", state.summaryError ? "纪要需要查看" : state.summarySaving ? "正在保存纪要" : state.summaryGenerating ? "正在生成纪要" : "纪要");
   // Keep the native editor alive through material refreshes; replacing it
   // while typing would lose focus and pending edits.
-  state.summaryEditorElement?.remove();
-  section.replaceChildren();
+  for (const child of Array.from(section.children)) {
+    if (child !== retainedEditor) child.remove();
+  }
+  if (retainedEditor) retainedEditor.hidden = Boolean(state.summaryGenerating || state.summarySaving || state.summaryError || !latest);
   const header = h("div", "meeting-view-header");
   header.innerHTML = `<span class="meeting-view-title">纪要</span>`;
-  section.append(header);
+  header.append(createTemplatePicker({
+    store: state.plugin.summaryTemplates,
+    selectedId: state.summaryTemplateId,
+    disabled: Boolean(state.summaryGenerating || state.summarySaving || state.summaryTemplateSaving),
+    onSelect: (id) => void selectSummaryTemplate(state, id).catch(() => {}),
+    onManage: () => openTemplateManager({
+      store: state.plugin.summaryTemplates, selectedId: state.summaryTemplateId,
+      onUse: (id) => {
+        if (state.destroyed) return;
+        if (state.summaryGenerating || state.summarySaving) throw new Error("纪要正在生成或保存，请完成后再选择模板。");
+        return selectSummaryTemplate(state, id);
+      },
+      confirm: confirmDialog,
+    }),
+  }));
+  section.prepend(header);
+  if (templateUnavailable) section.append(h("p", "meeting-inline-notice", state.plugin.summaryTemplates.error || "此模板已不可用，请重新选择模板后再生成。"));
 
   if (state.summaryGenerating || state.summarySaving) {
     renderSummaryStreaming(state, section);
@@ -6225,7 +6642,6 @@ function renderSummary(state) {
     return;
   }
 
-  const latest = state.summaries[0];
   const hasContent = Boolean(latest);
   if (!hasContent && !ai.isConfigured()) {
     section.append(configError(state));
@@ -6245,6 +6661,7 @@ function renderSummary(state) {
       <p class="meeting-summary-state__title">生成会议纪要</p>
       <p class="meeting-summary-state__text">${summaryMaterialText(state)}</p>`;
     const generate = h("button", "meeting-btn meeting-btn--primary", "生成纪要");
+    generate.disabled = Boolean(state.summaryTemplateSaving || templateUnavailable);
     generate.onclick = () => void generateSummary(state, {});
     empty.append(generate);
     if (state.summaryNotice) empty.append(h("p", "meeting-summary-state__notice", state.summaryNotice));
@@ -6257,26 +6674,37 @@ function renderSummary(state) {
   const metaText = h(
     "span",
     "meeting-summary-meta__text",
-    `${latest.generatedAt ? `生成于 ${formatClock(latest.generatedAt)}` : "已生成"}${latest.sources ? ` · ${latest.sources}` : ""}`,
+    `${latest.generatedAt ? `生成于 ${formatClock(latest.generatedAt)}` : "已生成"}${latest.basis?.templateId ? ` · ${latest.basis.templateName || state.plugin.summaryTemplates.get(latest.basis.templateId)?.name || "自定义模板"}` : ""}${latest.sources ? ` · ${latest.sources}` : ""}`,
   );
   const actions = h("div", "meeting-summary-actions");
   const regenerate = h("button", "meeting-link", "重新生成");
+  regenerate.disabled = Boolean(state.summaryTemplateSaving || templateUnavailable);
   regenerate.onclick = () => void regenerateSummary(state);
   const open = h("button", "meeting-link", "打开纪要文档");
   open.onclick = () => openChildDoc(state, "summary", latest.id);
   actions.append(regenerate, open);
   meta.append(metaText, actions);
-  section.append(meta);
+  section.insertBefore(meta, retainedEditor?.parentNode === section ? retainedEditor : null);
+  const inputs = h("div", "meeting-summary-inputs");
+  appendSummaryScope(state, inputs);
+  section.insertBefore(inputs, retainedEditor?.parentNode === section ? retainedEditor : null);
+  if (changes.length) {
+    const notice = h("div", "meeting-inline-notice", `${changes.join("、")}已更新，重新生成后生效。`);
+    notice.dataset.state = "outdated";
+    section.insertBefore(notice, retainedEditor?.parentNode === section ? retainedEditor : null);
+  }
   if (state.summaryNotice) {
-    section.append(h("p", "meeting-summary-state__notice", state.summaryNotice));
+    section.insertBefore(h("p", "meeting-summary-state__notice", state.summaryNotice), retainedEditor?.parentNode === section ? retainedEditor : null);
   }
   if (state.summaryEditorId !== latest.id) {
     state.summaryProtyle?.destroy();
+    state.summaryEditorElement?.remove();
     state.summaryProtyle = null;
     state.summaryEditorElement = h("div", "meeting-summary-editor");
     state.summaryEditorId = latest.id;
   }
-  section.append(state.summaryEditorElement);
+  state.summaryEditorElement.hidden = false;
+  if (state.summaryEditorElement.parentNode !== section) section.append(state.summaryEditorElement);
   if (!state.summaryProtyle) {
     state.summaryProtyle = new Protyle(state.plugin.app, state.summaryEditorElement, {
       blockId: latest.id,
@@ -6287,6 +6715,35 @@ function renderSummary(state) {
   } else {
     state.summaryProtyle.resize?.();
   }
+}
+
+async function selectSummaryTemplate(state, templateId) {
+  if (state.summaryTemplateSaving) throw new Error("正在保存模板选择，请稍后重试。");
+  const previous = state.summaryTemplateId;
+  if (!state.plugin.summaryTemplates.get(templateId)) throw new Error("模板已不可用，请重新选择。");
+  state.summaryTemplateId = templateId;
+  state.summaryNotice = "";
+  state.summaryTemplateSaving = true;
+  renderSummary(state);
+  try {
+    await api.setBlockAttrs(state.docId, { [meetingStore.ATTR.summaryTemplate]: state.summaryTemplateId });
+    state.meeting.summaryTemplate = state.summaryTemplateId;
+  } catch (error) {
+    state.summaryTemplateId = previous;
+    state.summaryNotice = "模板选择未能保存，请重试。";
+    throw new Error(state.summaryNotice);
+  } finally {
+    state.summaryTemplateSaving = false;
+    renderSummary(state);
+  }
+}
+
+function currentSummaryBasis(state) {
+  const template = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+  if (!template) return null;
+  return prompts.buildSummaryBasis(state.material, template, {
+    onlyNotes: state.summaryOnlyNotes, recordingIds: state.summarySelectedIds,
+  });
 }
 
 function summaryMaterialText(state) {
@@ -6324,8 +6781,8 @@ function appendSummaryScope(state, container) {
   container.append(scope);
   const incomplete = incompleteSummaryRecordings(state);
   if (incomplete.length) {
-    const warning = h("div", "meeting-summary-scope__note");
-    warning.append(h("p", "", "以下录音尚未转写完整，缺少的内容不会进入纪要："));
+    const warning = h("details", "meeting-summary-missing");
+    warning.append(h("summary", "", `${incomplete.length} 份录音转写未完整，仅使用已有内容。`));
     const list = h("ul", "");
     incomplete.forEach((item) => list.append(h("li", "", item)));
     warning.append(list);
@@ -6357,11 +6814,8 @@ function incompleteSummaryRecordings(state) {
 }
 
 function configError(state) {
-  const card = h("div", "meeting-summary-state");
-  card.innerHTML = `${icon("iconMeetingWarning", "meeting-summary-state__icon")}
-    <p class="meeting-summary-state__title">尚未配置 AI</p>
-    <p class="meeting-summary-state__text">纪要使用思源设置中的 AI 模型。配置模型后即可使用本场笔记与转写生成纪要。</p>`;
-  const open = h("button", "meeting-btn", "打开思源设置");
+  const card = h("div", "meeting-inline-notice", "配置思源 AI 后可生成纪要。");
+  const open = h("button", "meeting-link", "去配置");
   open.onclick = () => {
     try {
       openSetting(state.plugin.app);
@@ -6456,7 +6910,7 @@ function renderSummaryStreaming(state, section) {
 }
 
 async function generateSummary(state) {
-  if (state.summaryGenerating || state.summarySaving) return;
+  if (state.summaryGenerating || state.summarySaving || state.summaryTemplateSaving) return;
   if (!state.meeting?.isMeeting) {
     state.summaryError = "这篇文档不是会议文档，无法生成纪要";
     renderSummary(state);
@@ -6484,8 +6938,11 @@ async function generateSummary(state) {
     await refreshMaterial(state);
     const resolved = JSON.parse(JSON.stringify(ai.getEditingModel()));
     const budget = prompts.contextCharacterBudget(resolved?.model);
-    const system = prompts.buildSystemPrompt({ date: new Date() });
+    const template = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+    if (!template) throw new Error("模板已不可用，请重新选择模板后再生成。");
+    const system = prompts.buildSystemPrompt({ date: new Date(), template });
     const user = state.material.userPrompt;
+    const basis = currentSummaryBasis(state);
     const characters = prompts.countNormalizedCharacters(`${system}\n${user}`);
     if (budget && characters > budget) {
       throw new Error(
@@ -6493,7 +6950,6 @@ async function generateSummary(state) {
       );
     }
     const sources = summarySourceText(state);
-    const incomplete = incompleteSummaryRecordings(state);
     const existing = state.summaries[0];
     const expectedFingerprint = existing ? sha256(state.summaryContent.trim()) : "";
     const edited = Boolean(existing && (!existing.fingerprint || existing.fingerprint !== expectedFingerprint));
@@ -6502,9 +6958,6 @@ async function generateSummary(state) {
       warnings.push(edited
         ? "当前纪要已被修改。重新生成会替换这份纪要，你的修改将丢失。"
         : "重新生成会替换这份纪要。");
-    }
-    if (incomplete.length) {
-      warnings.push(`以下内容不会完整进入本次纪要：${incomplete.join("；")}。`);
     }
     if (abort.signal.aborted) throw new Error("已取消生成");
     if (warnings.length) {
@@ -6531,7 +6984,7 @@ async function generateSummary(state) {
       },
     });
     if (abort.signal.aborted) throw new Error("已取消生成");
-    state.summaryDraft = { markdown: text, sources, generatedAt, expectedFingerprint, receipt: {} };
+    state.summaryDraft = { markdown: text, sources, generatedAt, expectedFingerprint, basis, receipt: {} };
     state.summarySaving = true;
     renderSummary(state);
     await saveSummaryDraft(state);
@@ -6554,12 +7007,19 @@ async function generateSummary(state) {
 async function saveSummaryDraft(state) {
   const draft = state.summaryDraft;
   const saved = await meetingStore.saveSummary(state.meeting, draft);
-  state.summaries = [{ id: saved.docId, generatedAt: draft.generatedAt, sources: draft.sources, fingerprint: saved.fingerprint }];
+  state.summaries = [{ id: saved.docId, generatedAt: draft.generatedAt, sources: draft.sources, fingerprint: saved.fingerprint, basis: draft.basis }];
+  state.summaryBasisInitialized = saved.docId;
   state.summaryDocId = saved.docId;
   state.summaryContent = saved.content;
   state.summaryNotice = saved.replaced ? "已替换纪要" : "纪要已保存";
   state.summaryStream = "";
   state.summaryDraft = null;
+  try {
+    await refreshMaterial(state);
+  } catch {
+    state.materialDirty = true;
+    state.summaryNotice = "纪要已保存，重新打开可刷新材料状态。";
+  }
 }
 
 async function retrySummarySave(state) {
@@ -6740,6 +7200,7 @@ function openSettings(plugin) {
         <h3>AI 纪要</h3>
         <p class="meeting-settings__hint">纪要使用思源设置中的 AI 模型；本插件不保存模型密钥。</p>
         <button class="b3-button b3-button--outline" type="button" data-action="open-ai">打开思源设置</button>
+        <button class="b3-button b3-button--outline" type="button" data-action="templates">管理纪要模板</button>
       </section>
     </div>
     <div class="b3-dialog__action meeting-settings__actions">
@@ -6760,6 +7221,9 @@ function openSettings(plugin) {
       showMessage("请打开思源设置 → AI", 5000);
     }
   };
+  element.querySelector('[data-action="templates"]').onclick = () => openTemplateManager({
+    store: plugin.summaryTemplates, confirm: confirmDialog,
+  });
   element.querySelector(".b3-button--cancel").onclick = () => dialog.destroy();
   element.querySelector('[data-action="save"]').onclick = async () => {
     const save = element.querySelector('[data-action="save"]');

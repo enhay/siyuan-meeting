@@ -32,6 +32,7 @@ const ATTR = {
   recordingInterrupted: "custom-recording-interrupted",
   transcriptionStatus: "custom-recording-transcription-status",
   transcriptionError: "custom-recording-transcription-error",
+  transcriptionIssue: "custom-recording-transcription-issue",
   transcriptionGaps: "custom-recording-transcription-gaps",
   transcriptionFingerprint: "custom-recording-transcription-fingerprint",
   realtimeEnabled: "custom-recording-realtime-enabled",
@@ -47,6 +48,8 @@ const ATTR = {
   summaryGeneratedAt: "custom-summary-generated-at",
   summarySources: "custom-summary-sources",
   summaryFingerprint: "custom-summary-fingerprint",
+  summaryTemplate: "custom-meeting-summary-template",
+  summaryBasis: "custom-summary-basis",
 };
 
 const MEETING_STATUS = {
@@ -70,6 +73,7 @@ function meetingFrom(row, attrs = {}) {
     segments: Number(attrs[ATTR.segments] || 0) || 0,
     preNotes: attrs[ATTR.preNotes] || "",
     isMeeting: Boolean(attrs[ATTR.id]),
+    summaryTemplate: attrs[ATTR.summaryTemplate] || "general",
   };
 }
 
@@ -300,6 +304,7 @@ async function readRecordings(meeting) {
         events: parseEvents(attrs[ATTR.recordingEvents]),
         transcriptionStatus: attrs[ATTR.transcriptionStatus] || "",
         transcriptionError: attrs[ATTR.transcriptionError] || "",
+        transcriptionIssue: attrs[ATTR.transcriptionIssue] || "",
         transcriptionFingerprint: attrs[ATTR.transcriptionFingerprint] || "",
         gaps: parseEvents(attrs[ATTR.transcriptionGaps]),
         realtimeEnabled: attrs[ATTR.realtimeEnabled] === "1",
@@ -474,6 +479,7 @@ async function updateRecordingTranscription(meeting, recordingId, patch) {
   const fields = {
     transcriptionStatus: ATTR.transcriptionStatus,
     transcriptionError: ATTR.transcriptionError,
+    transcriptionIssue: ATTR.transcriptionIssue,
     transcriptionFingerprint: ATTR.transcriptionFingerprint,
     gaps: ATTR.transcriptionGaps,
     realtimeEnabled: ATTR.realtimeEnabled,
@@ -496,14 +502,24 @@ async function readSummaries(meeting) {
       generatedAt: child.attrs[ATTR.summaryGeneratedAt] || "",
       sources: child.attrs[ATTR.summarySources] || "",
       fingerprint: child.attrs[ATTR.summaryFingerprint] || "",
+      basis: readSummaryBasis(child.attrs[ATTR.summaryBasis]),
     }));
+}
+
+function readSummaryBasis(value) {
+  try {
+    const basis = JSON.parse(value || "null");
+    return basis && typeof basis === "object" && !Array.isArray(basis) ? basis : null;
+  } catch {
+    return null;
+  }
 }
 
 async function readSummaryContent(docId) {
   return api.getDocMarkdown(docId);
 }
 
-async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {} }) {
+async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {}, basis = null }) {
   const content = String(markdown || "").trim();
   if (!content) throw new Error("纪要内容为空，未写入文档");
   const summaries = await readSummaries(meeting);
@@ -518,6 +534,7 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
     [ATTR.parent]: meeting.id,
     [ATTR.summaryGeneratedAt]: generatedAt,
     [ATTR.summarySources]: sources,
+    [ATTR.summaryBasis]: basis ? JSON.stringify(basis) : "",
   };
   // A metadata write or the subsequent UI refresh can fail after the content
   // was saved. A retry must not append that content a second time.

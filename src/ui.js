@@ -4,6 +4,7 @@ const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
+const { createTemplatePicker, openTemplateManager } = require("./template-ui");
 const ai = require("./ai");
 const { findTranscriptMatches, playbackSegments } = require("./transcript-view");
 const {
@@ -130,6 +131,7 @@ function statusLabel(status) {
 function transcriptStatus(recording, transcriptSegments, manager, meetingId) {
   const live = manager?.statusFor(meetingId, recording.recordingId) || {};
   const status = live.status || recording.transcriptionStatus || "";
+  if (recording.transcriptionIssue === "configuration-required" && (!live.status || live.status === "incomplete")) return "";
   if (status) return status;
   return "";
 }
@@ -388,6 +390,9 @@ function mountMeetingTab(plugin, tab) {
     summaryNotice: "",
     summaryOnlyNotes: false,
     summarySelectedIds: null,
+    summaryTemplateId: "general",
+    summaryTemplateSaving: false,
+    summaryBasisInitialized: "",
     summaryAbort: null,
     material: null,
     materialDirty: true,
@@ -474,6 +479,9 @@ function mountMeetingTab(plugin, tab) {
     }).catch((error) => showMessage(`刷新转写失败：${error.message}`, 5000, "error"));
   });
   onCleanup(unsubscribeTranscription);
+  onCleanup(plugin.summaryTemplates.subscribe(() => {
+    if (!state.destroyed) renderSummary(state);
+  }));
 
   const refreshTitleFromServer = debounce(async () => {
     if (state.destroyed || !state.meeting) return;
@@ -634,8 +642,7 @@ function mountMeetingTab(plugin, tab) {
   const markMaterialDirty = debounce(() => {
     if (state.destroyed) return;
     state.materialDirty = true;
-    if (resolveMeetingView(state) === "summary" &&
-        !state.summaryEditorElement?.contains(document.activeElement)) {
+    if (resolveMeetingView(state) === "summary") {
       state.materialDirty = false;
       void safeRefreshMaterial(state);
     }
@@ -651,6 +658,7 @@ function mountMeetingTab(plugin, tab) {
   async function initialize() {
     try {
       state.meeting = await meetingStore.getMeeting(docId);
+      state.summaryTemplateId = state.meeting.summaryTemplate || "general";
       plugin.controller.selectMeeting(state.meeting);
       titleInput.value = state.meeting.title || "";
       tab.tab?.updateTitle?.(state.meeting.title || "");
@@ -933,10 +941,10 @@ function renderBanners(state) {
   state.bannerSignature = signature;
   container.replaceChildren();
 
-  if (snapshot.realtimeNotice && snapshot.meeting?.id === state.docId) {
-    const banner = h("div", "meeting-banner");
+  if (snapshot.realtimeNotice && snapshot.meeting?.id === state.docId && state.plugin.transcription.isConfigured()) {
+    const banner = h("div", "meeting-inline-notice");
     banner.append(h("span", "", snapshot.realtimeNotice));
-    const settings = h("button", "meeting-banner__action", "会议设置");
+    const settings = h("button", "meeting-link", "查看设置");
     settings.onclick = () => openSettings(state.plugin);
     banner.append(settings);
     container.append(banner);
@@ -1193,6 +1201,12 @@ async function refreshSummaries(state) {
   if (latest) {
     state.summaryDocId = latest.id;
     state.summaryContent = await meetingStore.readSummaryContent(latest.id);
+    if (state.summaryBasisInitialized !== latest.id) {
+      state.summaryBasisInitialized = latest.id;
+      state.summaryOnlyNotes = Boolean(latest.basis?.onlyNotes);
+      state.summarySelectedIds = Array.isArray(latest.basis?.recordingIds) ? latest.basis.recordingIds : null;
+      state.materialDirty = true;
+    }
   } else {
     state.summaryDocId = "";
     state.summaryContent = "";
@@ -1208,13 +1222,18 @@ function safeRefreshMaterial(state) {
 }
 
 async function refreshMaterial(state) {
-  const notes = await api.getDocMarkdown(state.docId);
+  const [notes, { segments }] = await Promise.all([
+    api.getDocMarkdown(state.docId), meetingStore.readTranscript(state.meeting),
+  ]);
+  if (state.destroyed) return;
+  state.transcript = segments;
   const selected = state.summarySelectedIds
     ? new Set(state.summarySelectedIds)
     : null;
   const transcript = state.transcript
     .filter((segment) => !selected || selected.has(segment.recordingId))
     .map((segment) => ({
+      recordingId: segment.recordingId,
       startMs: segment.startMs,
       speaker: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
       text: segment.text,
@@ -1623,10 +1642,10 @@ function renderViewStatus(state) {
   if (!button) return;
   const current = state.recordings.find((recording) => recording.recordingId === state.snapshot.recordingId);
   const status = isLiveTranscript(state)
-    ? state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
-      : !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
+    ? !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
+      : state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
       : state.snapshot.phase === "paused" ? "paused" : "recording"
-    : state.recordings.some((recording) => ["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length)
+    : state.recordings.some((recording) => recording.transcriptionIssue !== "configuration-required" && (["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length))
       ? "failed"
       : state.recordings.some((recording) => ["uploading", "processing"].includes(recording.transcriptionStatus))
         ? "processing" : current?.transcriptionStatus || "idle";
@@ -1746,7 +1765,15 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   section.append(header);
 
   const live = isLiveTranscript(state);
-  if (live) {
+  const configured = state.plugin.transcription.isConfigured();
+  if (!configured) {
+    const notice = h("div", "meeting-inline-notice", "配置腾讯云后可使用转写，录音仍可正常保存。");
+    notice.dataset.state = "configuration-required";
+    const settings = h("button", "meeting-link", "去配置");
+    settings.onclick = () => openSettings(state.plugin);
+    notice.append(settings);
+    section.append(notice);
+  } else if (live) {
     const phase = state.snapshot.phase;
     const hasCurrentText = state.transcript.some((segment) => segment.recordingId === state.snapshot.recordingId);
     const message = phase === "preparing" ? "正在准备录音，开始后将在这里显示实时转写。"
@@ -1756,8 +1783,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       : state.snapshot.realtimeNotice ? state.snapshot.realtimeNotice
       : phase === "paused" ? "录音已暂停，继续后会接着显示实时转写。"
       : hasCurrentText ? "正在实时转写，已确认的句子会持续显示。" : "已开启实时转写，正在等待第一句话。";
-    const notice = h("div", "meeting-transcript-notice", message);
-    notice.setAttribute("role", "status");
+    const notice = h("div", "meeting-inline-notice", message);
     section.append(notice);
   }
 
@@ -1801,20 +1827,12 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     section.append(notice);
   }
 
-  if (!live && !state.plugin.transcription.isConfigured()) {
-    const notice = h("div", "meeting-transcript-notice");
-    notice.append(h("span", "", "尚未配置腾讯云转写服务，录音仍可正常保存。"));
-    const settings = h("button", "meeting-link", "会议设置");
-    settings.onclick = () => openSettings(state.plugin);
-    notice.append(settings);
-    section.append(notice);
-  }
   for (const recording of state.recordings) {
     if (recording.gaps?.length) {
       const ranges = recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、");
-      section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
+      if (configured) section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
     }
-    if (recording.transcriptionError) section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
+    if (recording.transcriptionError && recording.transcriptionIssue !== "configuration-required") section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
   }
 
   if (!state.transcript.length) {
@@ -1822,7 +1840,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       emptyState(
         "iconMeetingTranscript",
         "尚无转写",
-        "选择上方录音段并点击「转写」，使用已配置的腾讯云服务。",
+        configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
       ),
     );
     renderTranscriptTools(state);
@@ -1931,18 +1949,43 @@ function renameTranscriptSpeaker(state, segment) {
 }
 
 function renderSummary(state) {
+  if (state.destroyed) return;
   const section = state.root.querySelector('[data-view-content="summary"]');
   if (!section) return;
+  const latest = state.summaries[0];
+  const changes = latest && state.material ? prompts.summaryChanges(latest.basis, currentSummaryBasis(state)) : [];
+  const selectedTemplate = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+  const templateUnavailable = !selectedTemplate;
+  section.dataset.state = state.summaryError ? "error" : state.summaryGenerating || state.summarySaving ? "generating" : templateUnavailable ? "template-unavailable" : !latest ? "empty" : changes.length ? "outdated" : "current";
+  const retainedEditor = state.summaryEditorElement;
   const summaryTab = state.root.querySelector('[data-view="summary"]');
   summaryTab.dataset.state = state.summaryError ? "failed" : state.summaryGenerating || state.summarySaving ? "processing" : "idle";
   summaryTab.setAttribute("aria-label", state.summaryError ? "纪要需要查看" : state.summarySaving ? "正在保存纪要" : state.summaryGenerating ? "正在生成纪要" : "纪要");
   // Keep the native editor alive through material refreshes; replacing it
   // while typing would lose focus and pending edits.
-  state.summaryEditorElement?.remove();
-  section.replaceChildren();
+  for (const child of Array.from(section.children)) {
+    if (child !== retainedEditor) child.remove();
+  }
+  if (retainedEditor) retainedEditor.hidden = Boolean(state.summaryGenerating || state.summarySaving || state.summaryError || !latest);
   const header = h("div", "meeting-view-header");
   header.innerHTML = `<span class="meeting-view-title">纪要</span>`;
-  section.append(header);
+  header.append(createTemplatePicker({
+    store: state.plugin.summaryTemplates,
+    selectedId: state.summaryTemplateId,
+    disabled: Boolean(state.summaryGenerating || state.summarySaving || state.summaryTemplateSaving),
+    onSelect: (id) => void selectSummaryTemplate(state, id).catch(() => {}),
+    onManage: () => openTemplateManager({
+      store: state.plugin.summaryTemplates, selectedId: state.summaryTemplateId,
+      onUse: (id) => {
+        if (state.destroyed) return;
+        if (state.summaryGenerating || state.summarySaving) throw new Error("纪要正在生成或保存，请完成后再选择模板。");
+        return selectSummaryTemplate(state, id);
+      },
+      confirm: confirmDialog,
+    }),
+  }));
+  section.prepend(header);
+  if (templateUnavailable) section.append(h("p", "meeting-inline-notice", state.plugin.summaryTemplates.error || "此模板已不可用，请重新选择模板后再生成。"));
 
   if (state.summaryGenerating || state.summarySaving) {
     renderSummaryStreaming(state, section);
@@ -1980,7 +2023,6 @@ function renderSummary(state) {
     return;
   }
 
-  const latest = state.summaries[0];
   const hasContent = Boolean(latest);
   if (!hasContent && !ai.isConfigured()) {
     section.append(configError(state));
@@ -2000,6 +2042,7 @@ function renderSummary(state) {
       <p class="meeting-summary-state__title">生成会议纪要</p>
       <p class="meeting-summary-state__text">${summaryMaterialText(state)}</p>`;
     const generate = h("button", "meeting-btn meeting-btn--primary", "生成纪要");
+    generate.disabled = Boolean(state.summaryTemplateSaving || templateUnavailable);
     generate.onclick = () => void generateSummary(state, {});
     empty.append(generate);
     if (state.summaryNotice) empty.append(h("p", "meeting-summary-state__notice", state.summaryNotice));
@@ -2012,26 +2055,37 @@ function renderSummary(state) {
   const metaText = h(
     "span",
     "meeting-summary-meta__text",
-    `${latest.generatedAt ? `生成于 ${formatClock(latest.generatedAt)}` : "已生成"}${latest.sources ? ` · ${latest.sources}` : ""}`,
+    `${latest.generatedAt ? `生成于 ${formatClock(latest.generatedAt)}` : "已生成"}${latest.basis?.templateId ? ` · ${latest.basis.templateName || state.plugin.summaryTemplates.get(latest.basis.templateId)?.name || "自定义模板"}` : ""}${latest.sources ? ` · ${latest.sources}` : ""}`,
   );
   const actions = h("div", "meeting-summary-actions");
   const regenerate = h("button", "meeting-link", "重新生成");
+  regenerate.disabled = Boolean(state.summaryTemplateSaving || templateUnavailable);
   regenerate.onclick = () => void regenerateSummary(state);
   const open = h("button", "meeting-link", "打开纪要文档");
   open.onclick = () => openChildDoc(state, "summary", latest.id);
   actions.append(regenerate, open);
   meta.append(metaText, actions);
-  section.append(meta);
+  section.insertBefore(meta, retainedEditor?.parentNode === section ? retainedEditor : null);
+  const inputs = h("div", "meeting-summary-inputs");
+  appendSummaryScope(state, inputs);
+  section.insertBefore(inputs, retainedEditor?.parentNode === section ? retainedEditor : null);
+  if (changes.length) {
+    const notice = h("div", "meeting-inline-notice", `${changes.join("、")}已更新，重新生成后生效。`);
+    notice.dataset.state = "outdated";
+    section.insertBefore(notice, retainedEditor?.parentNode === section ? retainedEditor : null);
+  }
   if (state.summaryNotice) {
-    section.append(h("p", "meeting-summary-state__notice", state.summaryNotice));
+    section.insertBefore(h("p", "meeting-summary-state__notice", state.summaryNotice), retainedEditor?.parentNode === section ? retainedEditor : null);
   }
   if (state.summaryEditorId !== latest.id) {
     state.summaryProtyle?.destroy();
+    state.summaryEditorElement?.remove();
     state.summaryProtyle = null;
     state.summaryEditorElement = h("div", "meeting-summary-editor");
     state.summaryEditorId = latest.id;
   }
-  section.append(state.summaryEditorElement);
+  state.summaryEditorElement.hidden = false;
+  if (state.summaryEditorElement.parentNode !== section) section.append(state.summaryEditorElement);
   if (!state.summaryProtyle) {
     state.summaryProtyle = new Protyle(state.plugin.app, state.summaryEditorElement, {
       blockId: latest.id,
@@ -2042,6 +2096,35 @@ function renderSummary(state) {
   } else {
     state.summaryProtyle.resize?.();
   }
+}
+
+async function selectSummaryTemplate(state, templateId) {
+  if (state.summaryTemplateSaving) throw new Error("正在保存模板选择，请稍后重试。");
+  const previous = state.summaryTemplateId;
+  if (!state.plugin.summaryTemplates.get(templateId)) throw new Error("模板已不可用，请重新选择。");
+  state.summaryTemplateId = templateId;
+  state.summaryNotice = "";
+  state.summaryTemplateSaving = true;
+  renderSummary(state);
+  try {
+    await api.setBlockAttrs(state.docId, { [meetingStore.ATTR.summaryTemplate]: state.summaryTemplateId });
+    state.meeting.summaryTemplate = state.summaryTemplateId;
+  } catch (error) {
+    state.summaryTemplateId = previous;
+    state.summaryNotice = "模板选择未能保存，请重试。";
+    throw new Error(state.summaryNotice);
+  } finally {
+    state.summaryTemplateSaving = false;
+    renderSummary(state);
+  }
+}
+
+function currentSummaryBasis(state) {
+  const template = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+  if (!template) return null;
+  return prompts.buildSummaryBasis(state.material, template, {
+    onlyNotes: state.summaryOnlyNotes, recordingIds: state.summarySelectedIds,
+  });
 }
 
 function summaryMaterialText(state) {
@@ -2079,8 +2162,8 @@ function appendSummaryScope(state, container) {
   container.append(scope);
   const incomplete = incompleteSummaryRecordings(state);
   if (incomplete.length) {
-    const warning = h("div", "meeting-summary-scope__note");
-    warning.append(h("p", "", "以下录音尚未转写完整，缺少的内容不会进入纪要："));
+    const warning = h("details", "meeting-summary-missing");
+    warning.append(h("summary", "", `${incomplete.length} 份录音转写未完整，仅使用已有内容。`));
     const list = h("ul", "");
     incomplete.forEach((item) => list.append(h("li", "", item)));
     warning.append(list);
@@ -2112,11 +2195,8 @@ function incompleteSummaryRecordings(state) {
 }
 
 function configError(state) {
-  const card = h("div", "meeting-summary-state");
-  card.innerHTML = `${icon("iconMeetingWarning", "meeting-summary-state__icon")}
-    <p class="meeting-summary-state__title">尚未配置 AI</p>
-    <p class="meeting-summary-state__text">纪要使用思源设置中的 AI 模型。配置模型后即可使用本场笔记与转写生成纪要。</p>`;
-  const open = h("button", "meeting-btn", "打开思源设置");
+  const card = h("div", "meeting-inline-notice", "配置思源 AI 后可生成纪要。");
+  const open = h("button", "meeting-link", "去配置");
   open.onclick = () => {
     try {
       openSetting(state.plugin.app);
@@ -2211,7 +2291,7 @@ function renderSummaryStreaming(state, section) {
 }
 
 async function generateSummary(state) {
-  if (state.summaryGenerating || state.summarySaving) return;
+  if (state.summaryGenerating || state.summarySaving || state.summaryTemplateSaving) return;
   if (!state.meeting?.isMeeting) {
     state.summaryError = "这篇文档不是会议文档，无法生成纪要";
     renderSummary(state);
@@ -2239,8 +2319,11 @@ async function generateSummary(state) {
     await refreshMaterial(state);
     const resolved = JSON.parse(JSON.stringify(ai.getEditingModel()));
     const budget = prompts.contextCharacterBudget(resolved?.model);
-    const system = prompts.buildSystemPrompt({ date: new Date() });
+    const template = state.plugin.summaryTemplates.get(state.summaryTemplateId);
+    if (!template) throw new Error("模板已不可用，请重新选择模板后再生成。");
+    const system = prompts.buildSystemPrompt({ date: new Date(), template });
     const user = state.material.userPrompt;
+    const basis = currentSummaryBasis(state);
     const characters = prompts.countNormalizedCharacters(`${system}\n${user}`);
     if (budget && characters > budget) {
       throw new Error(
@@ -2248,7 +2331,6 @@ async function generateSummary(state) {
       );
     }
     const sources = summarySourceText(state);
-    const incomplete = incompleteSummaryRecordings(state);
     const existing = state.summaries[0];
     const expectedFingerprint = existing ? sha256(state.summaryContent.trim()) : "";
     const edited = Boolean(existing && (!existing.fingerprint || existing.fingerprint !== expectedFingerprint));
@@ -2257,9 +2339,6 @@ async function generateSummary(state) {
       warnings.push(edited
         ? "当前纪要已被修改。重新生成会替换这份纪要，你的修改将丢失。"
         : "重新生成会替换这份纪要。");
-    }
-    if (incomplete.length) {
-      warnings.push(`以下内容不会完整进入本次纪要：${incomplete.join("；")}。`);
     }
     if (abort.signal.aborted) throw new Error("已取消生成");
     if (warnings.length) {
@@ -2286,7 +2365,7 @@ async function generateSummary(state) {
       },
     });
     if (abort.signal.aborted) throw new Error("已取消生成");
-    state.summaryDraft = { markdown: text, sources, generatedAt, expectedFingerprint, receipt: {} };
+    state.summaryDraft = { markdown: text, sources, generatedAt, expectedFingerprint, basis, receipt: {} };
     state.summarySaving = true;
     renderSummary(state);
     await saveSummaryDraft(state);
@@ -2309,12 +2388,19 @@ async function generateSummary(state) {
 async function saveSummaryDraft(state) {
   const draft = state.summaryDraft;
   const saved = await meetingStore.saveSummary(state.meeting, draft);
-  state.summaries = [{ id: saved.docId, generatedAt: draft.generatedAt, sources: draft.sources, fingerprint: saved.fingerprint }];
+  state.summaries = [{ id: saved.docId, generatedAt: draft.generatedAt, sources: draft.sources, fingerprint: saved.fingerprint, basis: draft.basis }];
+  state.summaryBasisInitialized = saved.docId;
   state.summaryDocId = saved.docId;
   state.summaryContent = saved.content;
   state.summaryNotice = saved.replaced ? "已替换纪要" : "纪要已保存";
   state.summaryStream = "";
   state.summaryDraft = null;
+  try {
+    await refreshMaterial(state);
+  } catch {
+    state.materialDirty = true;
+    state.summaryNotice = "纪要已保存，重新打开可刷新材料状态。";
+  }
 }
 
 async function retrySummarySave(state) {
@@ -2495,6 +2581,7 @@ function openSettings(plugin) {
         <h3>AI 纪要</h3>
         <p class="meeting-settings__hint">纪要使用思源设置中的 AI 模型；本插件不保存模型密钥。</p>
         <button class="b3-button b3-button--outline" type="button" data-action="open-ai">打开思源设置</button>
+        <button class="b3-button b3-button--outline" type="button" data-action="templates">管理纪要模板</button>
       </section>
     </div>
     <div class="b3-dialog__action meeting-settings__actions">
@@ -2515,6 +2602,9 @@ function openSettings(plugin) {
       showMessage("请打开思源设置 → AI", 5000);
     }
   };
+  element.querySelector('[data-action="templates"]').onclick = () => openTemplateManager({
+    store: plugin.summaryTemplates, confirm: confirmDialog,
+  });
   element.querySelector(".b3-button--cancel").onclick = () => dialog.destroy();
   element.querySelector('[data-action="save"]').onclick = async () => {
     const save = element.querySelector('[data-action="save"]');

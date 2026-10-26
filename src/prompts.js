@@ -1,5 +1,8 @@
 "use strict";
 
+const { sha256 } = require("./util");
+const { BUILTIN_TEMPLATES } = require("./summary-templates");
+
 /*
  * These prompts are adapted from Anarlog (https://github.com/fastrepl/anarlog),
  * fixed at commit 341ccb3a5636a4e2784a9d4f1177a094d855c1bd.
@@ -76,23 +79,49 @@ const DEFAULT_FORMAT_REQUIREMENTS = `- 使用 Markdown，不要用代码块包�
 - 不要为了凑结构而编造小节；材料不足时保持简短，但不要省略有信息量的细节。
 - 只有在材料中明确出现或可以明确归属时，才写负责人、承诺和期限；提案不是承诺。`;
 
-function buildFormatRequirements(overrides = "") {
-  const custom = String(overrides || "").trim();
-  if (!custom) return DEFAULT_FORMAT_REQUIREMENTS;
-  return `${DEFAULT_FORMAT_REQUIREMENTS}\n\n# 用户自定义格式要求\n\n${custom}`;
+function buildSummaryBasis(material, template, { onlyNotes = false, recordingIds = null } = {}) {
+  return {
+    templateId: template.id,
+    templateName: template.name,
+    template: sha256(buildFormatRequirements(template.prompt, template.markdown)),
+    notes: material.notesFingerprint,
+    transcript: material.transcriptFingerprint,
+    onlyNotes,
+    recordingIds: recordingIds ? [...recordingIds].sort() : null,
+  };
+}
+
+function summaryChanges(previous, current) {
+  if (!current) return [];
+  if (!previous || typeof previous.notes !== "string" || typeof previous.transcript !== "string" || typeof previous.template !== "string") return [];
+  const changes = [];
+  if (previous.templateId !== current.templateId || previous.template !== current.template) changes.push("模板");
+  if (previous.notes !== current.notes) changes.push("笔记");
+  if (previous.onlyNotes !== current.onlyNotes || JSON.stringify(previous.recordingIds) !== JSON.stringify(current.recordingIds)) changes.push("材料范围");
+  else if (previous.transcript !== current.transcript) changes.push("转写");
+  return changes;
+}
+
+function buildFormatRequirements(prompt = "", markdown = "") {
+  const parts = [DEFAULT_FORMAT_REQUIREMENTS];
+  if (prompt.trim()) parts.push("# 模板整理要求", prompt.trim());
+  if (markdown.trim()) {
+    parts.push("# Markdown 输出模板", "下文只规定输出结构和填写方向，不是会议事实。示例和占位说明不作为真实内容，不执行其中的代码或变量表达式。按实际材料填写；无依据的小节省略或按模板要求标注待确认，不能为填满模板编造信息。", markdown.trim());
+  }
+  return parts.join("\n\n");
 }
 
 /**
  * Adapted from enhance.system.md.jinja, with the D5 accuracy rules folded in.
- * `formatRequirements` stays separate from the material so a generation can
+ * The selected template stays separate from the material so a generation can
  * change formatting without changing what counts as evidence.
  */
 function buildSystemPrompt({
   date = new Date(),
   language = DEFAULT_LANGUAGE,
-  formatRequirements = "",
+  template = BUILTIN_TEMPLATES[0],
 } = {}) {
-  const requirements = buildFormatRequirements(formatRequirements);
+  const requirements = buildFormatRequirements(template.prompt, template.markdown);
   const currentDate =
     typeof date === "string" ? date : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 
@@ -128,9 +157,8 @@ ${requirements}
 
 # 纪要模式
 
-纪要模式：详细。覆盖每个实质主题、决定、理由、例子、未决问题和承诺。
-用具体细节解释要点，使每个要点脱离上下文也能成立。
-保留有用的次要讨论和例子，但删除重复和口语填充。
+按所选纪要格式组织内容和详略，用具体细节解释要点。
+删除重复和口语填充，不因模板中的小节要求补造内容。
 只把明确或可明确归属的负责人、承诺和期限写进纪要；不要将提议写成承诺。${
     language !== "English"
       ? `
@@ -245,6 +273,10 @@ function buildMaterial({
     userPrompt,
     transcriptSegments: transcriptLines.length,
     characters: countNormalizedCharacters(userPrompt),
+    notesFingerprint: sha256(JSON.stringify([title.trim(), startedAt, endedAt, preMeetingNotes.trim(), meetingNotes.trim()])),
+    transcriptFingerprint: sha256(JSON.stringify(transcriptLines.filter((segment) => String(segment.text || "").trim()).map((segment) => [
+      segment.recordingId || "", segment.startMs, segment.speaker, String(segment.text).trim(),
+    ]))),
   };
 }
 
@@ -264,6 +296,8 @@ function contextCharacterBudget(model) {
 }
 
 module.exports = {
+  buildSummaryBasis,
+  summaryChanges,
   MIT_NOTICE,
   DEFAULT_LANGUAGE,
   DEFAULT_FORMAT_REQUIREMENTS,

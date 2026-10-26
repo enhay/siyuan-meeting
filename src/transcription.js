@@ -59,7 +59,7 @@ class TranscriptionManager {
 
   async setState(meeting, recordingId, status, error = "", patch = {}) {
     await meetingStore.updateRecordingTranscription(meeting, recordingId, {
-      ...patch, transcriptionStatus: status, transcriptionError: error,
+      transcriptionIssue: "", ...patch, transcriptionStatus: status, transcriptionError: error,
     });
     this.notify(meeting, recordingId, status, error);
   }
@@ -82,6 +82,7 @@ class TranscriptionManager {
     const status = message.final && missing.length ? "incomplete" : message.status || "recording";
     const error = missing.length ? "部分转写未能写入会议，录音仍已保存；结束后可补齐缺口" : message.error || "";
     await this.setState(meeting, recordingId, status, error, {
+      transcriptionIssue: message.configurationRequired && !missing.length ? "configuration-required" : "",
       gaps, ...(message.meta ? { realtimeEnabled: Boolean(message.meta.realtimeEnabled) } : {}),
     });
     return { gaps, status, error };
@@ -161,7 +162,7 @@ class TranscriptionManager {
   async afterRecording(meeting, recording) {
     if (this.closing || recording.interrupted) return;
     if (!this.isConfigured()) {
-      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置");
+      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
       return;
     }
     if (recording.realtimeEnabled) {
