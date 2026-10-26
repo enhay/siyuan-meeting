@@ -1,0 +1,12 @@
+{
+  "name": "siyuan-meeting",
+  "author": "zhaohua",
+  "url": "",
+  "version": "0.0.1",
+  "minAppVersion": "3.8.7",
+  "backends": ["windows"],
+  "frontends": ["desktop"],
+  "displayName": {"default": "会议录音验证"},
+  "description": {"default": "隔离空间中的 Windows 录音能力验证，尚非正式会议插件。"},
+  "readme": {"default": "docs/reports/windows-probe.md"}
+}

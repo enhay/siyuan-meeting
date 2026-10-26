@@ -1,0 +1,9 @@
+{
+  "name": "siyuan-meeting",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "check": "node --check index.js && node --check probe/controller.js && node --check probe/pcm-worklet.js && node --check probe/storage.cjs && node --check probe/float.js",
+    "test": "node --test probe/storage.test.cjs"
+  }
+}

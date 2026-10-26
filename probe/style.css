@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+body { margin: 0; } main { padding: 24px; } h1 { font-size: 22px; }
+button, select { font: inherit; padding: 6px 10px; margin: 4px; }
+label { display: inline-block; margin: 6px; } #error { color: #ff403d; }
+#saved { overflow-wrap: anywhere; } section { border-top: 1px solid #8885; padding: 10px 0; }
+audio { display: block; width: 100%; } .floating { background: transparent; }
+#bar { display: flex; align-items: center; border-radius: 14px; height: 38px; margin: 4px;
+  background: rgba(219,217,209,.9); color: rgb(31,28,26); padding: 0 4px;
+  border: .5px solid #1f1c1a22; -webkit-app-region: drag; }
+#bar button { -webkit-app-region: no-drag; width: 30px; height: 30px; padding: 0; margin: 0; border: 0;
+  background: transparent; color: inherit; border-radius: 10px; }
+#bar button:hover { background: #1f1c1a12; } #label { font-size: 12px; flex: 1;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+@media (prefers-color-scheme: dark) { #bar { background: rgba(110,112,102,.9); color: white; } }
+button:focus-visible, select:focus-visible { outline: 2px solid #337dff; outline-offset: 2px; }

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; media-src 'self' blob:; worker-src 'self';">
+<title>会议录音验证</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<h1>会议录音验证</h1>
+<p>仅在空白测试空间使用合成材料。线上录音请戴耳机。关闭此窗口只隐藏界面，不结束录音。</p>
+<label>麦克风 <select id="microphone"><option value="">系统默认麦克风</option></select></label>
+<label><input id="online" type="checkbox" checked> 同时录制电脑声音</label>
+<p><button id="devices">刷新设备</button> <button id="start">开始验证录音</button>
+<button id="pause" disabled>暂停</button> <button id="stop" disabled>结束</button></p>
+<p id="status" role="status" aria-live="polite">未开始</p>
+<p><label>麦克风 <meter id="micLevel" min="0" max="1" value="0"></meter></label>
+<label>电脑声音 <meter id="systemLevel" min="0" max="1" value="0"></meter></label></p>
+<p id="error" role="alert"></p><p id="saved"></p>
+<p>录音持续追加到同一个 WAV 文件并每秒刷盘：双路录音左声道为麦克风，右声道为电脑声音。暂停不会写入静音。</p>
+<h2>本机已保存录音</h2><button id="refresh">重新检查已保存内容</button>
+<div id="recordings"></div>
+</main><script src="controller.js"></script></body></html>
