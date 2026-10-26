@@ -14,7 +14,10 @@ function isConfigured(config) {
 }
 
 function requireConfig(config) {
-  if (!isConfigured(config)) throw new Error("请先在会议设置中完善腾讯云配置");
+  if (!isConfigured(config)) {
+    const message = "请先在会议设置中完善腾讯云配置";
+    throw Object.assign(new Error(message), { code: "INVALID_CONFIGURATION", userMessage: message });
+  }
 }
 
 function engineForSampleRate(sampleRate) {
@@ -77,20 +80,20 @@ function serviceError(code, requestId = "") {
 
 function parseFlashResult(result, channels = 1) {
   if (!Array.isArray(result?.flash_result)) {
-    throw new Error("腾讯云返回的转写不完整，请稍后手动重试");
+    throw responseError("missing-result");
   }
   const segments = [];
   for (const track of result.flash_result) {
     const channel = track.channel_id;
     if (!Number.isInteger(channel) || channel < 0 || channel >= channels ||
         !Array.isArray(track.sentence_list)) {
-      throw new Error("腾讯云返回的转写不完整，请稍后手动重试");
+      throw responseError("invalid-channel");
     }
     const speakers = new Set(track.sentence_list.filter((sentence) => String(sentence.text || "").trim())
       .map((sentence) => Number(sentence.speaker_id ?? 0)));
     for (const sentence of track.sentence_list) {
       if (typeof sentence.text !== "string") {
-        throw new Error("腾讯云返回的转写不完整，请稍后手动重试");
+        throw responseError("invalid-sentence");
       }
       const text = sentence.text.trim();
       if (!text) continue;
@@ -99,7 +102,7 @@ function parseFlashResult(result, channels = 1) {
       const speaker = sentence.speaker_id ?? 0;
       if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs ||
           !Number.isInteger(speaker) || speaker < 0) {
-        throw new Error("腾讯云返回的转写不完整，请稍后手动重试");
+        throw responseError("invalid-timestamp");
       }
       const speakerLabel = channels === 2
         ? channel === 0 ? "我" : `其他参会者${speakers.size > 1 ? ` ${speaker + 1}` : ""}`
@@ -108,6 +111,11 @@ function parseFlashResult(result, channels = 1) {
     }
   }
   return segments.sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+}
+
+function responseError(responseIssue) {
+  const message = "腾讯云返回的转写不完整，请稍后手动重试";
+  return Object.assign(new Error(message), { code: "INVALID_RESPONSE", responseIssue, userMessage: message });
 }
 
 function aborted() {
@@ -133,7 +141,8 @@ async function flashRecognize(config) {
       data.readUInt32LE(40) !== data.length - 44 || data.readUInt32LE(4) !== data.length - 8 ||
       (data.length - 44) % (channels * 2) ||
       (data.length - 44) / (sampleRate * channels * 2) > MAX_DURATION_SECONDS) {
-    throw new Error("这段录音无法直接转写，请检查录音后重试");
+    const message = "这段录音无法直接转写，请检查录音后重试";
+    throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
   }
   if (signal?.aborted) throw aborted();
   const params = {
@@ -180,28 +189,37 @@ async function flashRecognize(config) {
         }
         chunks.push(chunk);
       });
-      response.on("aborted", () => finish(new Error("转写连接已断开，请检查网络后手动重试")));
-      response.on("error", () => finish(new Error("转写连接已断开，请检查网络后手动重试")));
+      const responseFailure = (code) => {
+        const message = "转写连接已断开，请检查网络后手动重试";
+        finish(Object.assign(new Error(message), { code, userMessage: message, httpStatus: response.statusCode, responseBytes: received }));
+      };
+      response.on("aborted", () => responseFailure("ECONNRESET"));
+      response.on("error", (cause) => responseFailure(cause.code));
       response.on("end", () => {
         try {
           const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
           if (result.code !== 0) throw serviceError(result.code, result.request_id);
           if (response.statusCode < 200 || response.statusCode >= 300) {
-            throw new Error("腾讯云暂时未能完成转写，请稍后手动重试");
+            throw Object.assign(new Error("腾讯云暂时未能完成转写，请稍后手动重试"), { responseIssue: "http-error" });
           }
           finish(null, parseFlashResult(result, channels));
         } catch (error) {
-          finish(error instanceof SyntaxError
-            ? new Error("腾讯云返回的转写不完整，请稍后手动重试") : error);
+          const failure = error instanceof SyntaxError ? responseError("invalid-json") : error;
+          failure.httpStatus = response.statusCode;
+          failure.responseBytes = received;
+          finish(failure);
         }
       });
     });
     request.on("timeout", () => {
+      const message = "转写等待时间过长，请检查网络后手动重试";
+      finish(Object.assign(new Error(message), { code: "ETIMEDOUT", userMessage: message }));
       request.destroy();
-      finish(new Error("转写等待时间过长，请检查网络后手动重试"));
     });
-    request.on("error", () => finish(signal?.aborted ? aborted()
-      : new Error("转写连接未完成，请检查网络后手动重试")));
+    request.on("error", (cause) => {
+      const message = "转写连接未完成，请检查网络后手动重试";
+      finish(signal?.aborted ? aborted() : Object.assign(new Error(message), { code: cause.code, userMessage: message }));
+    });
     request.on("finish", () => {
       if (!settled && !signal?.aborted) config.onUploadComplete?.();
     });

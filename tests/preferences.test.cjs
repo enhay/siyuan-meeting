@@ -41,3 +41,28 @@ test("device preference migration keeps browser choices and local service config
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("transcription diagnostics persist only allowed failure fields, excluding secrets, request content and error messages", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-diagnostics-"));
+  const controller = Object.create(MeetingController.prototype);
+  controller.storageRoot = dir;
+  try {
+    const error = Object.assign(new Error("private transcript and synthetic secret"), {
+      code: "ECONNRESET", httpStatus: 502, responseBytes: 80,
+      requestId: "8141f188-56cf-42b8-86d3-e26236ec2641",
+      request: { headers: { Authorization: "synthetic secret" }, body: "private audio" },
+      response: { text: "private transcript" },
+    });
+    controller.recordTranscriptionFailure({ meetingId: "meeting", recordingId: "recording", phase: "recognizing", error });
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "transcription-errors.jsonl"), "utf8"));
+    const { at, ...fields } = saved;
+    assert.ok(Number.isFinite(Date.parse(at)));
+    assert.deepEqual(fields, {
+      meetingId: "meeting", recordingId: "recording", phase: "recognizing", errorName: "Error",
+      code: "ECONNRESET", serviceCode: null, httpStatus: 502, responseBytes: 80,
+      requestId: error.requestId, responseIssue: "",
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

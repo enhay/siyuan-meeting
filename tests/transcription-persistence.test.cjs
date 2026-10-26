@@ -81,7 +81,7 @@ test("transcription acknowledges before IO, reports real work, and releases the 
   };
   const asset = deferred(), recognition = deferred(), saving = deferred(), requested = deferred(), writing = deferred();
   const meeting = { id: "meeting" }, recording = { recordingId: "recording", assetPath: "assets/synthetic.wav", channels: 1 };
-  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}) } });
+  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}), recordTranscriptionFailure() {} } });
   manager.isConfigured = () => true;
   const events = [], persisted = {};
   manager.subscribe((event) => events.push({ ...event, running: manager.isRunning(recording.recordingId) }));

@@ -161,6 +161,9 @@ class TranscriptionManager {
       outcome = { status: "done", error: "", progress: { ...progress, phase: "done" } };
       this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
     } catch (error) {
+      this.plugin.controller.recordTranscriptionFailure({
+        meetingId: meeting.id, recordingId: recording.recordingId, phase: progress.phase, error,
+      });
       // Service messages are translated by the client. Raw transport failures
       // never become a user-facing error or a reason to resubmit automatically.
       const message = signal.aborted

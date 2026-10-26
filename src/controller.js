@@ -41,6 +41,28 @@ function writeJson(file, value) {
 }
 
 class MeetingController {
+  recordTranscriptionFailure({ meetingId, recordingId, phase, error }) {
+    // Renderer stdout is discarded by the desktop host. Retain only diagnostic
+    // fields: request bodies, URLs, headers and error messages can contain secrets.
+    const code = String(error.code || "");
+    const diagnostic = {
+      at: new Date().toISOString(), meetingId, recordingId, phase,
+      errorName: ["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError", "AbortError"].includes(error.name) ? error.name : "Error",
+      code: /^(?:E[A-Z_0-9]{1,63}|CERT_[A-Z_]+|UNABLE_[A-Z_]+|DEPTH_[A-Z_]+|INVALID_RESPONSE|INVALID_AUDIO|INVALID_CONFIGURATION|TRANSCRIPT_CHANGED)$/.test(code) ? code : "",
+      serviceCode: Number.isInteger(error.serviceCode) ? error.serviceCode : null,
+      httpStatus: Number.isInteger(error.httpStatus) ? error.httpStatus : null,
+      responseBytes: Number.isSafeInteger(error.responseBytes) ? error.responseBytes : null,
+      requestId: /^[a-f0-9-]{16,64}$/i.test(String(error.requestId || "")) ? error.requestId : "",
+      responseIssue: ["missing-result", "invalid-channel", "invalid-sentence", "invalid-timestamp", "invalid-json", "http-error"].includes(error.responseIssue) ? error.responseIssue : "",
+    };
+    try {
+      fs.mkdirSync(this.storageRoot, { recursive: true, mode: 0o700 });
+      fs.appendFileSync(path.join(this.storageRoot, "transcription-errors.jsonl"), `${JSON.stringify(diagnostic)}\n`, { mode: 0o600 });
+    } catch {
+      console.warn("[siyuan-meeting] transcription diagnostic could not be saved");
+    }
+  }
+
   constructor(plugin) {
     this.plugin = plugin;
     this.events = new EventEmitter();
