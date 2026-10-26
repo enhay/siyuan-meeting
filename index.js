@@ -1515,8 +1515,10 @@ class MeetingController {
         });
         if (!sources.length) throw new Error("没有可采集的屏幕");
         callback({ video: sources[0], audio: "loopback" });
-      } catch (error) {
-        this.onCaptureError(error);
+      } catch {
+        this.onCaptureError(new Error(process.platform === "darwin"
+          ? "无法获取电脑声音，请在 macOS 系统设置的隐私与安全性中检查思源的屏幕与系统音频录制权限后重试。"
+          : "无法获取电脑声音，请检查系统录制权限后重试。"));
         callback({});
       }
     });
@@ -2057,6 +2059,7 @@ class MeetingController {
     if (this.floatWin && !this.floatWin.isDestroyed()) return this.floatWin;
     const { BrowserWindow } = remote;
     const win = new BrowserWindow({
+      ...(process.platform === "darwin" ? { type: "panel" } : {}),
       width: FLOAT_WIDTH,
       height: FLOAT_HEIGHT,
       useContentSize: true,
