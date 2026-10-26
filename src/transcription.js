@@ -19,6 +19,7 @@ class TranscriptionManager {
     this.jobs = new Map();
     this.status = new Map();
     this.errors = new Map();
+    this.progress = new Map();
     this.closing = false;
     this.persistenceGaps = new Map();
     this.deviceId = globalThis.localStorage?.getItem("siyuan-meeting.device") || crypto.randomUUID();
@@ -30,16 +31,17 @@ class TranscriptionManager {
     return () => this.events.off("change", listener);
   }
 
-  notify(meeting, recordingId, status, error = "") {
+  notify(meeting, recordingId, status, error = "", progress = null) {
     const key = `${meeting.id}:${recordingId}`;
     this.status.set(key, status);
     this.errors.set(key, error);
-    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error });
+    this.progress.set(key, progress);
+    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error, progress });
   }
 
   statusFor(meetingId, recordingId) {
     const key = `${meetingId}:${recordingId}`;
-    return { status: this.status.get(key) || "", error: this.errors.get(key) || "" };
+    return { status: this.status.get(key) || "", error: this.errors.get(key) || "", progress: this.progress.get(key) || null };
   }
 
   isRunning(recordingId) { return this.jobs.has(recordingId); }
@@ -57,11 +59,11 @@ class TranscriptionManager {
     return tencent.isConfigured(config);
   }
 
-  async setState(meeting, recordingId, status, error = "", patch = {}) {
+  async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null } = {}) {
     await meetingStore.updateRecordingTranscription(meeting, recordingId, {
       transcriptionIssue: "", ...patch, transcriptionStatus: status, transcriptionError: error,
     });
-    this.notify(meeting, recordingId, status, error);
+    if (publish) this.notify(meeting, recordingId, status, error, progress);
   }
 
   async onRealtime(meeting, recordingId, message) {
@@ -97,24 +99,35 @@ class TranscriptionManager {
     const { signal } = controller;
     this.jobs.set(recording.recordingId, controller);
     let persisted = false;
+    let outcome = { status: "incomplete", error: "", progress: null };
+    let progress = { phase: "preparing" };
+    this.notify(meeting, recording.recordingId, "processing", "", progress);
     try {
       const absolute = await api.resolveAssetPath(recording.assetPath);
-      if (!absolute) throw new Error("录音尚未同步到本机，请同步后重试");
+      if (!absolute) throw Object.assign(new Error("录音尚未同步到本机，请同步后重试"), { userMessage: "录音尚未同步到本机，请同步后重试" });
       const fingerprint = expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId);
-      await this.setState(meeting, recording.recordingId, "processing");
+      await this.setState(meeting, recording.recordingId, "processing", "", {}, { progress });
       const results = [];
       const ranges = gapsOnly ? recording.gaps || [] : [{}];
       if (!ranges.length) {
-        await this.setState(meeting, recording.recordingId, recording.transcriptionStatus || "incomplete");
+        outcome = { status: recording.transcriptionStatus || "incomplete", error: "", progress: null };
+        await this.setState(meeting, recording.recordingId, outcome.status, "", {}, { publish: false });
         return;
       }
       let requestIndex = 0;
-      for (const range of ranges) {
+      for (const [rangeIndex, range] of ranges.entries()) {
         for await (const part of wavParts(absolute, { ...range, signal })) {
           signal.throwIfAborted();
+          progress = { phase: "uploading", partIndex: part.partIndex + 1, partCount: part.partCount,
+            completedParts: part.partIndex, rangeIndex: rangeIndex + 1, rangeCount: ranges.length };
+          this.notify(meeting, recording.recordingId, "processing", "", progress);
           const segments = await tencent.flashRecognize({
             ...this.config(), data: part.data, channels: part.channels,
             sampleRate: part.sampleRate, signal,
+            onUploadComplete: () => {
+              progress = { ...progress, phase: "recognizing" };
+              this.notify(meeting, recording.recordingId, "processing", "", progress);
+            },
           });
           signal.throwIfAborted();
           const multipleSpeakers = new Set(segments.map((segment) => segment.speaker)).size > 1;
@@ -135,12 +148,17 @@ class TranscriptionManager {
               text: "从这里开始单独转写，说话人编号重新开始。" });
           }
           requestIndex++;
+          progress = { ...progress, phase: "preparing", completedParts: part.partIndex + 1 };
+          this.notify(meeting, recording.recordingId, "processing", "", progress);
         }
       }
       signal.throwIfAborted();
+      progress = { ...progress, phase: "saving" };
+      this.notify(meeting, recording.recordingId, "processing", "", progress);
       await meetingStore.writeTranscript(meeting, recording.recordingId, results, { append: gapsOnly, expectedFingerprint: fingerprint });
       persisted = true;
-      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] });
+      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+      outcome = { status: "done", error: "", progress: { ...progress, phase: "done" } };
       this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
     } catch (error) {
       // Service messages are translated by the client. Raw transport failures
@@ -149,13 +167,16 @@ class TranscriptionManager {
         ? "转写已中断，录音和已有文字已保留；可手动重试"
         : error.userMessage || (error.code === "TRANSCRIPT_CHANGED"
           ? "转写文字在处理期间被修改，已保留修改，请确认后重新转写"
+          : progress.phase === "saving" ? "识别已完成，但转写文字未能保存；录音和已有文字已保留，请检查思源后重试"
+          : progress.phase === "preparing" ? "未能读取录音或转写内容，请确认录音已同步后重新打开会议重试"
           : "这段转写未完成，录音和已有文字已保留；请检查网络与腾讯云设置后手动重试");
-      await this.setState(meeting, recording.recordingId, "incomplete", persisted
-        ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message).catch(() => {
-        this.notify(meeting, recording.recordingId, "incomplete", message);
-      });
+      outcome = { status: "incomplete", error: persisted
+        ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message,
+        progress: { ...progress, phase: "incomplete" } };
+      await this.setState(meeting, recording.recordingId, "incomplete", outcome.error, {}, { publish: false }).catch(() => {});
     } finally {
       this.jobs.delete(recording.recordingId);
+      this.notify(meeting, recording.recordingId, outcome.status, outcome.error, outcome.progress);
     }
   }
 

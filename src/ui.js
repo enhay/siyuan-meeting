@@ -109,7 +109,9 @@ function actualTimeFor(recording, startMs) {
   return formatClockSeconds(base + Number(startMs || 0) + offset);
 }
 
-function statusLabel(status) {
+function statusLabel(status, phase = "") {
+  const phases = { checking: "准备中", confirming: "待确认", preparing: "准备中", uploading: "发送中", recognizing: "等待结果", saving: "保存中" };
+  if (phases[phase]) return phases[phase];
   switch (status) {
     case "uploading":
       return "上传中";
@@ -131,9 +133,45 @@ function statusLabel(status) {
 function transcriptStatus(recording, transcriptSegments, manager, meetingId) {
   const live = manager?.statusFor(meetingId, recording.recordingId) || {};
   const status = live.status || recording.transcriptionStatus || "";
-  if (recording.transcriptionIssue === "configuration-required" && (!live.status || live.status === "incomplete")) return "";
+  if (recording.transcriptionIssue === "configuration-required" && (!live.status || live.status === "incomplete" && !live.progress)) return "";
   if (status) return status;
   return "";
+}
+
+function transcriptionTask(state, recording) {
+  const request = state.transcriptionRequests.get(recording.recordingId);
+  const live = state.plugin.transcription.statusFor(state.docId, recording.recordingId);
+  const status = request ? request.error ? "failed" : "processing"
+    : transcriptStatus(recording, state.transcript, state.plugin.transcription, state.docId);
+  return {
+    status,
+    phase: request?.phase || live.progress?.phase || status,
+    error: request ? request.error || "" : live.error || (recording.transcriptionIssue !== "configuration-required" ? recording.transcriptionError : "") || "",
+    progress: live.progress,
+    running: Boolean(request && !request.error) || state.plugin.transcription.isRunning(recording.recordingId),
+  };
+}
+
+function transcriptionTaskText(task) {
+  const messages = {
+    checking: "正在检查录音与已有转写…",
+    confirming: "等待你确认转写…",
+    preparing: "正在准备录音…",
+    uploading: "正在发送录音…",
+    recognizing: "等待识别结果…",
+    saving: "识别已完成，正在保存文字…",
+    done: "转写完成，文字已保存。",
+  };
+  const progress = task.progress;
+  const range = progress?.rangeCount > 1 ? `第 ${progress.rangeIndex} / ${progress.rangeCount} 处缺口 · ` : "";
+  const parts = progress?.partCount > 1 ? `已识别 ${progress.completedParts} / ${progress.partCount} 部分 · ` : "";
+  return `${range}${parts}${task.error || messages[task.phase] || statusLabel(task.status)}`;
+}
+
+function renderTranscriptionFeedback(state) {
+  if (state.destroyed) return;
+  renderViewStatus(state);
+  if (resolveMeetingView(state) === "transcript") renderTranscriptView(state);
 }
 
 function safeMarkdown(markdown) {
@@ -379,6 +417,7 @@ function mountMeetingTab(plugin, tab) {
     meeting: null,
     recordings: [],
     transcript: [],
+    transcriptionRequests: new Map(),
     summaries: [],
     summaryDocId: "",
     summaryContent: "",
@@ -472,8 +511,11 @@ function mountMeetingTab(plugin, tab) {
       recording.transcriptionStatus = event.status;
       recording.transcriptionError = event.error || "";
     }
+    renderTranscriptionFeedback(state);
+    if (event.status === "processing") return;
     state.materialDirty = true;
     void Promise.all([refreshRecordings(state), refreshTranscript(state)]).then(() => {
+      if (state.destroyed) return;
       if (resolveMeetingView(state) === "transcript") renderTranscriptView(state);
       if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
     }).catch((error) => showMessage(`刷新转写失败：${error.message}`, 5000, "error"));
@@ -1322,17 +1364,14 @@ function segmentCard(state, recording) {
   selectButton.type = "button";
   selectButton.setAttribute("aria-pressed", String(recording.recordingId === state.selectedRecordingId));
 
-  const status = transcriptStatus(
-    recording,
-    state.transcript,
-    state.plugin.transcription,
-    state.docId,
-  );
+  const task = transcriptionTask(state, recording);
+  const status = task.status;
+  card.dataset.state = status || "idle";
+  card.dataset.phase = task.phase || "idle";
   const top = h("span", "meeting-segment__top");
   const title = h("span", "meeting-segment__title", recordingTitle(recording.index));
-  const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status));
-  const liveStatus = state.plugin.transcription.statusFor(state.docId, recording.recordingId);
-  badge.title = liveStatus.error || recording.transcriptionError || "";
+  const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status, task.phase));
+  badge.title = task.error;
   top.append(title, badge);
 
   const meta = h(
@@ -1352,11 +1391,13 @@ function segmentCard(state, recording) {
 
   const actions = h("div", "meeting-segment__actions");
   const button = h("button", "meeting-btn meeting-btn--small", "");
-  const running = state.plugin.transcription.isRunning(recording.recordingId);
+  const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
   const fillGaps = recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length > 0;
-  button.textContent = running ? "正在转写" : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : "转写";
+  button.textContent = running ? `${statusLabel("processing", task.phase)}…`
+    : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : ["failed", "incomplete"].includes(status) ? "重试转写" : "转写";
   button.disabled = running || !recording.assetPath;
+  button.setAttribute("aria-busy", String(running));
   button.title = running ? "关闭思源或断网会中断转写，之后需手动重试" : "使用腾讯云转写服务";
   button.onclick = (event) => {
     event.stopPropagation();
@@ -1382,28 +1423,42 @@ function segmentCard(state, recording) {
 }
 
 async function startTranscription(state, recording, { gapsOnly = false } = {}) {
+  const recordingId = recording.recordingId;
+  const task = transcriptionTask(state, recording);
+  if (task.running) return;
+  if (!state.plugin.transcription.isConfigured()) {
+    openSettings(state.plugin);
+    return;
+  }
+  state.transcriptionRequests.set(recordingId, { phase: "checking" });
+  renderTranscriptionFeedback(state);
   try {
-    if (!state.plugin.transcription.isConfigured()) {
-      openSettings(state.plugin);
-      return;
-    }
     const { recordings } = await meetingStore.readRecordings(state.meeting);
     recording = recordings.find((item) => item.recordingId === recording.recordingId) || recording;
     const { segments } = await meetingStore.readTranscript(state.meeting);
     const hasText = segments.some((item) => item.recordingId === recording.recordingId);
     const fingerprint = await meetingStore.transcriptFingerprint(state.meeting, recording.recordingId);
     if (!gapsOnly && (hasText || recording.transcriptionStatus === "done")) {
+      state.transcriptionRequests.set(recordingId, { phase: "confirming" });
+      renderTranscriptionFeedback(state);
       const edited = !recording.transcriptionFingerprint || fingerprint !== recording.transcriptionFingerprint;
       const accepted = await confirmDialog("重新转写", edited
         ? "这段转写已被修改。重新转写会再次计费并替换现有转写，你的修改会丢失。"
         : "重新转写会再次计费，并替换这段录音的现有转写。", "重新转写");
       if (!accepted) return;
     } else if (recording.transcriptionStatus === "incomplete" && !gapsOnly) {
+      state.transcriptionRequests.set(recordingId, { phase: "confirming" });
+      renderTranscriptionFeedback(state);
       if (!await confirmDialog("重试转写", "上次转写未完成。重新提交可能再次计费，是否继续？", "继续转写")) return;
     }
+    if (state.destroyed) return;
+    state.transcriptionRequests.delete(recordingId);
     await state.plugin.transcription.start(state.meeting, recording, { gapsOnly, expectedFingerprint: fingerprint });
   } catch (error) {
-    showMessage(error.message, 7000, "error");
+    state.transcriptionRequests.set(recordingId, { phase: "failed", error: error.message });
+  } finally {
+    if (!state.transcriptionRequests.get(recordingId)?.error) state.transcriptionRequests.delete(recordingId);
+    renderTranscriptionFeedback(state);
   }
 }
 
@@ -1641,14 +1696,15 @@ function renderViewStatus(state) {
   const button = state.root.querySelector('[data-view="transcript"]');
   if (!button) return;
   const current = state.recordings.find((recording) => recording.recordingId === state.snapshot.recordingId);
+  const tasks = state.recordings.map((recording) => transcriptionTask(state, recording));
   const status = isLiveTranscript(state)
     ? !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
       : state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
       : state.snapshot.phase === "paused" ? "paused" : "recording"
-    : state.recordings.some((recording) => recording.transcriptionIssue !== "configuration-required" && (["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length))
-      ? "failed"
-      : state.recordings.some((recording) => ["uploading", "processing"].includes(recording.transcriptionStatus))
-        ? "processing" : current?.transcriptionStatus || "idle";
+    : tasks.some((task) => task.running || task.status === "processing") ? "processing"
+      : tasks.some((task) => ["failed", "incomplete"].includes(task.status)) ||
+        state.recordings.some((recording) => recording.transcriptionIssue !== "configuration-required" && recording.gaps?.length) ? "failed"
+        : current?.transcriptionIssue === "configuration-required" ? "idle" : current?.transcriptionStatus || "idle";
   button.dataset.state = status;
   button.title = status === "failed" ? "转写需要查看" : status === "processing" ? "正在转写" : status === "recording" ? "实时转写" : status === "off" ? "本段录音未进行实时转写" : status === "paused" ? "实时转写已暂停" : "转写";
   button.setAttribute("aria-label", button.title);
@@ -1787,44 +1843,37 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     section.append(notice);
   }
 
-  const pending = state.recordings.filter((recording) =>
-    ["uploading", "processing"].includes(
-      transcriptStatus(recording, state.transcript, state.plugin.transcription, state.docId),
-    ),
-  );
-  if (pending.length) {
-    const notice = h("div", "meeting-transcript-notice");
-    const list = h("div", "meeting-transcript-notice__list");
-    list.append(
-      h(
-        "div",
-        "meeting-transcript-notice__title",
-        `${pending.length} 段录音正在转写`,
-      ),
-    );
-    for (const recording of pending) {
-      const status = transcriptStatus(
-        recording,
-        state.transcript,
-        state.plugin.transcription,
-        state.docId,
-      );
-      list.append(
-        h(
-          "div",
-          "meeting-transcript-notice__row",
-          `${recordingTitle(recording.index)} · ${statusLabel(status)}`,
-        ),
-      );
+  let processing = false;
+  for (const recording of state.recordings) {
+    const task = transcriptionTask(state, recording);
+    const active = task.running || task.status === "processing";
+    const failed = ["failed", "incomplete"].includes(task.status) && task.error;
+    const completed = task.status === "done" && recording.recordingId === state.selectedRecordingId;
+    if (!active && !failed && !completed) continue;
+    processing ||= active;
+    const feedback = h("div", "meeting-transcription-feedback");
+    feedback.dataset.recordingId = recording.recordingId;
+    feedback.dataset.state = task.status;
+    feedback.dataset.phase = task.phase;
+    feedback.setAttribute("aria-busy", String(active));
+    feedback.setAttribute("role", failed ? "alert" : "status");
+    if (active) feedback.append(h("span", "meeting-spinner"));
+    feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
+    if (active && task.progress?.partCount > 1) {
+      const progress = document.createElement("progress");
+      progress.max = task.progress.partCount;
+      progress.value = task.progress.completedParts;
+      progress.setAttribute("aria-label", "已识别的录音部分");
+      feedback.append(progress);
     }
-    const hint = h(
-      "div",
-      "meeting-transcript-notice__hint",
-      "请保持思源打开并保持联网；中断后需手动重试，可能再次计费。",
-    );
-    list.append(hint);
-    notice.append(icon("iconMeetingTranscript"), list);
-    section.append(notice);
+    if (failed && !active) {
+      const retry = h("button", "meeting-link", "重试转写");
+      retry.onclick = () => void startTranscription(state, recording, {
+        gapsOnly: Boolean(recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length),
+      });
+      feedback.append(retry);
+    }
+    section.append(feedback);
   }
 
   for (const recording of state.recordings) {
@@ -1832,7 +1881,6 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       const ranges = recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、");
       if (configured) section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
     }
-    if (recording.transcriptionError && recording.transcriptionIssue !== "configuration-required") section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
   }
 
   if (!state.transcript.length) {
@@ -1840,7 +1888,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       emptyState(
         "iconMeetingTranscript",
         "尚无转写",
-        configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
+        processing ? "完成后，转写文字会显示在这里。" : configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
       ),
     );
     renderTranscriptTools(state);

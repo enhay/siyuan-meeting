@@ -22,10 +22,12 @@ test("oversized stereo WAV requests cover all original frames and gap uploads co
     for await (const part of wavParts(file)) {
       assert.ok(part.data.length <= 100000000);
       assert.equal(part.data.readUInt32LE(40), part.data.length - 44);
-      intervals.push([part.startMs, part.endMs]);
+      assert.equal(part.partIndex, intervals.length);
+      intervals.push([part.startMs, part.endMs, part.partCount]);
     }
     assert.equal(intervals[0][0], 0);
     assert.equal(intervals.at(-1)[1], readWavInfo(file).durationMs);
+    assert.ok(intervals.every((part) => part[2] === intervals.length));
     for (let i = 1; i < intervals.length; i++) assert.equal(intervals[i - 1][1], intervals[i][0]);
     for await (const gap of wavParts(file, { startMs: 1000, endMs: 1000.0625, channel: 1 })) {
       assert.equal(gap.data.readUInt16LE(22), 1);

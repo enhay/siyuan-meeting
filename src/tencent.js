@@ -202,6 +202,9 @@ async function flashRecognize(config) {
     });
     request.on("error", () => finish(signal?.aborted ? aborted()
       : new Error("转写连接未完成，请检查网络后手动重试")));
+    request.on("finish", () => {
+      if (!settled && !signal?.aborted) config.onUploadComplete?.();
+    });
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     else request.end(data);

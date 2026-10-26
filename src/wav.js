@@ -118,6 +118,7 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
   );
   const firstFrame = Math.round(start / 1000 * info.sampleRate);
   const finalFrame = Math.min(info.frames, Math.round(end / 1000 * info.sampleRate));
+  const partCount = Math.ceil((finalFrame - firstFrame) / framesPerPart);
   const handle = await fs.promises.open(file, "r");
   try {
     let partIndex = 0;
@@ -153,7 +154,7 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
       }
       checkAbort(signal);
       yield { data, startMs: frame * 1000 / info.sampleRate,
-        endMs: (frame + frames) * 1000 / info.sampleRate, channel, partIndex: partIndex++,
+        endMs: (frame + frames) * 1000 / info.sampleRate, channel, partIndex: partIndex++, partCount,
         channels: outputChannels, sampleRate: info.sampleRate };
     }
   } finally {

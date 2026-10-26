@@ -591,22 +591,11 @@
 .meeting-waveform { --meeting-wave-played: var(--b3-theme-on-background); --meeting-wave-muted: color-mix(in srgb, var(--b3-theme-on-background) 24%, transparent); }
 
 /* ---- transcript --------------------------------------------------------- */
-.meeting-transcript-notice {
-  display: flex;
-  gap: 8px;
-  padding: 8px 10px;
-  margin-bottom: 8px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--b3-theme-primary) 8%, var(--meeting-surface));
-  color: var(--meeting-muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-.meeting-transcript-notice .meeting-icon { width: 15px; height: 15px; margin-top: 1px; }
-.meeting-transcript-notice__list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.meeting-transcript-notice__title { font-weight: 600; color: var(--b3-theme-on-background); }
-.meeting-transcript-notice__row { font-variant-numeric: tabular-nums; }
-.meeting-transcript-notice__hint { margin-top: 2px; font-size: 11px; }
+.meeting-transcription-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 0 0 8px; padding: 4px 2px; color: var(--meeting-muted); font-size: 12px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.meeting-transcription-feedback[data-state="incomplete"],
+.meeting-transcription-feedback[data-state="failed"] { color: var(--meeting-error); }
+.meeting-transcription-feedback progress { width: 100px; height: 4px; accent-color: var(--b3-theme-primary); }
+.meeting-transcription-feedback .meeting-link { padding: 0; margin: 0; color: inherit; }
 .meeting-transcript-group { margin-bottom: 14px; }
 .meeting-transcript-group__title {
   display: flex;
