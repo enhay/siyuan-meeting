@@ -30,17 +30,20 @@ const ATTR = {
   recordingAsset: "custom-recording-asset",
   recordingEvents: "custom-recording-events",
   recordingInterrupted: "custom-recording-interrupted",
-  recordingTask: "custom-recording-task",
-  recordingTaskStatus: "custom-recording-task-status",
-  recordingTaskAt: "custom-recording-task-at",
-  recordingTaskError: "custom-recording-task-error",
+  transcriptionStatus: "custom-recording-transcription-status",
+  transcriptionError: "custom-recording-transcription-error",
+  transcriptionGaps: "custom-recording-transcription-gaps",
+  transcriptionFingerprint: "custom-recording-transcription-fingerprint",
+  realtimeEnabled: "custom-recording-realtime-enabled",
+  recordingDevice: "custom-recording-device",
   transcriptMeeting: "custom-transcript-meeting",
   transcriptRecording: "custom-transcript-recording",
   transcriptStart: "custom-transcript-start",
   transcriptEnd: "custom-transcript-end",
   transcriptSpeaker: "custom-transcript-speaker",
   transcriptChannel: "custom-transcript-channel",
-  summaryVersion: "custom-summary-version",
+  transcriptLabel: "custom-transcript-label",
+  transcriptNotice: "custom-transcript-notice",
   summaryGeneratedAt: "custom-summary-generated-at",
   summarySources: "custom-summary-sources",
   summaryFingerprint: "custom-summary-fingerprint",
@@ -101,7 +104,7 @@ async function createMeeting({ title, notebookId, mode = "offline" }) {
 }
 
 async function getMeeting(docId) {
-  if (!isBlockId(docId)) throw new Error("会议文档编号无效");
+  if (!isBlockId(docId)) throw new Error("无法找到这场会议，请从会议菜单重新打开");
   let row = await api.getDocMeta(docId);
   if (!row) {
     // SQL can lag right after createDocWithMd. The block tree is available
@@ -149,7 +152,7 @@ async function setSegmentCount(docId, count) {
 }
 
 async function markFirstRecorded(docId) {
-  if (!isBlockId(docId)) throw new Error("会议文档编号无效");
+  if (!isBlockId(docId)) throw new Error("无法找到这场会议，请从会议菜单重新打开");
   const now = new Date().toISOString();
   await api.setBlockAttrs(docId, { [ATTR.firstRecorded]: now });
   return now;
@@ -162,7 +165,7 @@ async function savePreNotes(docId, markdown) {
 }
 
 async function renameMeeting(docId, title) {
-  if (!isBlockId(docId)) throw new Error("会议文档编号无效");
+  if (!isBlockId(docId)) throw new Error("无法找到这场会议，请从会议菜单重新打开");
   return api.renameDoc(docId, title);
 }
 
@@ -188,8 +191,8 @@ async function ensureTranscriptDoc(meeting) {
   return id;
 }
 
-async function ensureSummaryDoc(meeting, version = 1) {
-  const title = version <= 1 ? "纪要" : `纪要（第 ${version} 版）`;
+async function ensureSummaryDoc(meeting) {
+  const title = "纪要";
   const id = await api.createDoc({
     notebookId: meeting.notebookId,
     parentID: meeting.id,
@@ -199,9 +202,8 @@ async function ensureSummaryDoc(meeting, version = 1) {
   await api.setBlockAttrs(id, {
     [ATTR.child]: "summary",
     [ATTR.parent]: meeting.id,
-    [ATTR.summaryVersion]: String(version),
   });
-  return { id, title, version };
+  return { id, title };
 }
 
 function eventsToAttr(events) {
@@ -223,43 +225,58 @@ function parseEvents(value) {
   }
 }
 
-async function appendRecording(meeting, { assetPath, meta, seconds, events = [] }) {
-  if (!isAssetPath(assetPath)) throw new Error("录音资源路径无效，已保留本机文件");
+// Recording ids are known before audio archival. Keep the block id returned by
+// the write so live sentence batches do not depend on the SQL index catching up.
+const recordingBlocks = new Map();
+
+async function ensureRecording(meeting, meta) {
+  const key = `${meeting.id}:${meta.recordingId}`;
+  if (recordingBlocks.has(key)) return recordingBlocks.get(key);
+  const { recordings } = await readRecordings(meeting);
+  const existing = recordings.find((item) => item.recordingId === meta.recordingId);
+  if (existing) {
+    recordingBlocks.set(key, existing.blockId);
+    return existing.blockId;
+  }
   const transcriptId = await ensureTranscriptDoc(meeting);
-  const recordingId = meta.recordingId || crypto.randomUUID();
-  const index = Number(meta.segmentNo || 0) + 1;
+  const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
   const attrs = {
-    [ATTR.recordingId]: recordingId,
-    [ATTR.recordingIndex]: String(index),
+    id,
+    [ATTR.recordingId]: meta.recordingId,
+    [ATTR.recordingIndex]: String(Number(meta.segmentNo || 0) + 1),
     [ATTR.recordingStarted]: meta.startedAt || new Date().toISOString(),
-    [ATTR.recordingDuration]: String(Math.max(0, Number(seconds) || 0)),
-    [ATTR.recordingSampleRate]: String(meta.sampleRate || 0),
+    [ATTR.recordingSampleRate]: String(meta.sampleRate || 16000),
     [ATTR.recordingChannels]: String(meta.channels || 1),
-    [ATTR.recordingAsset]: assetPath || "",
+    [ATTR.realtimeEnabled]: meta.realtimeEnabled ? "1" : "0",
+    [ATTR.recordingDevice]: meta.deviceId || "",
+    [ATTR.transcriptionStatus]: "recording",
+  };
+  const ial = Object.entries(attrs).map(([key, value]) => `${key}="${escapeIal(value)}"`).join(" ");
+  await api.prependMarkdownRaw(transcriptId, `录音正在保存，结束后可回听。\n{: ${ial}}\n`);
+  recordingBlocks.set(key, id);
+  return id;
+}
+
+async function appendRecording(meeting, { assetPath, meta, seconds, events = [] }) {
+  if (!isAssetPath(assetPath)) throw new Error("录音尚未保存到思源，已保留本机文件");
+  const recordingId = meta.recordingId || crypto.randomUUID();
+  const blockId = await ensureRecording(meeting, { ...meta, recordingId });
+  const savedAttrs = await api.getBlockAttrs(blockId);
+  await api.post("/api/block/updateBlock", {
+    id: blockId, dataType: "markdown",
+    data: `<audio controls="controls" src="${escapeIal(assetPath)}"></audio>`,
+  });
+  await api.setBlockAttrs(blockId, {
+    ...savedAttrs,
+    [ATTR.recordingId]: recordingId,
+    [ATTR.recordingAsset]: assetPath,
+    [ATTR.recordingDuration]: String(Math.max(0, Number(seconds) || 0)),
     [ATTR.recordingEvents]: eventsToAttr(events),
-  };
-  if (meta.interrupted) attrs[ATTR.recordingInterrupted] = "1";
-  const markdown = `<audio controls="controls" src="${escapeIal(assetPath)}"></audio>`;
-  const ial = Object.entries(attrs)
-    .map(([key, value]) => `${key}="${escapeIal(value)}"`)
-    .join(" ");
-  // Keep every segment's audio block at the top of the transcript document.
-  await api.prependMarkdownRaw(transcriptId, `${markdown}\n{: ${ial}}\n`);
-  const rows = await api.sql(
-    `SELECT b.id FROM blocks b
-      JOIN attributes a ON a.block_id=b.id AND a.name=${sqlString(ATTR.recordingId)} AND a.value=${sqlString(recordingId)}
-      WHERE b.parent_id=${sqlString(transcriptId)} LIMIT 1`,
-  );
-  return {
-    blockId: rows[0]?.id || "",
-    recordingId,
-    index,
-    transcriptId,
-    seconds,
-    assetPath,
-    meta,
-    events,
-  };
+    [ATTR.recordingInterrupted]: meta.interrupted ? "1" : "0",
+    ...(meta.interrupted ? { [ATTR.transcriptionStatus]: "incomplete", [ATTR.transcriptionError]: "录音意外中断，转写可能不完整，可手动重新转写" } : {}),
+  });
+  return { blockId, recordingId, index: Number(meta.segmentNo || 0) + 1,
+    transcriptId: await ensureTranscriptDoc(meeting), seconds, assetPath, meta, events };
 }
 
 async function readRecordings(meeting) {
@@ -281,10 +298,12 @@ async function readRecordings(meeting) {
         assetPath: isAssetPath(attrs[ATTR.recordingAsset]) ? attrs[ATTR.recordingAsset] : "",
         interrupted: attrs[ATTR.recordingInterrupted] === "1",
         events: parseEvents(attrs[ATTR.recordingEvents]),
-        taskId: attrs[ATTR.recordingTask] || "",
-        taskStatus: attrs[ATTR.recordingTaskStatus] || "",
-        taskAt: attrs[ATTR.recordingTaskAt] || "",
-        taskError: attrs[ATTR.recordingTaskError] || "",
+        transcriptionStatus: attrs[ATTR.transcriptionStatus] || "",
+        transcriptionError: attrs[ATTR.transcriptionError] || "",
+        transcriptionFingerprint: attrs[ATTR.transcriptionFingerprint] || "",
+        gaps: parseEvents(attrs[ATTR.transcriptionGaps]),
+        realtimeEnabled: attrs[ATTR.realtimeEnabled] === "1",
+        deviceId: attrs[ATTR.recordingDevice] || "",
       };
     })
     .filter((item) => item.recordingId)
@@ -306,7 +325,9 @@ async function readTranscript(meeting) {
         endMs: Number(attrs[ATTR.transcriptEnd] || 0) || 0,
         speaker: Number(attrs[ATTR.transcriptSpeaker] || 0) || 0,
         channel: Number(attrs[ATTR.transcriptChannel] || 0) || 0,
-        text: String(block.content || "").replace(/^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*[^：:]*[：:]\s*/u, ""),
+        speakerLabel: attrs[ATTR.transcriptLabel] || `说话人 ${Number(attrs[ATTR.transcriptSpeaker] || 0) + 1}`,
+        notice: attrs[ATTR.transcriptNotice] === "1",
+        text: String(block.content || "").replace(/^\[?\d{1,2}:\d{2}(?::\d{2})?\]?(?:\s+siyuan:\/\/plugins\/siyuan-meeting\/seek)?\s*[^：:]*[：:]\s*/u, ""),
       };
     })
     .filter((item) => item.text.trim())
@@ -333,65 +354,107 @@ function transcriptStamp(startMs) {
 }
 
 function transcriptLine(segment) {
-  const speaker = Number(segment.speaker || 0) + 1;
-  return `[${transcriptStamp(segment.startMs)}] 说话人 ${speaker}：${escapeMarkdownText(segment.text)}`;
+  const label = segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`;
+  return `[${transcriptStamp(segment.startMs)}](siyuan://plugins/siyuan-meeting/seek) ${escapeMarkdownText(label)}：${escapeMarkdownText(segment.text)}`;
 }
 
-async function deleteTranscriptFor(meeting, recordingId) {
+async function transcriptBlocks(meeting, recordingId) {
   const transcript = await findChild(meeting.id, "transcript");
-  if (!transcript) return;
-  const rows = await api.sql(
-    `SELECT b.id FROM blocks b
-      JOIN attributes a ON a.block_id=b.id AND a.name=${sqlString(ATTR.transcriptRecording)} AND a.value=${sqlString(recordingId)}
-      WHERE b.parent_id=${sqlString(transcript.id)}`,
-  );
-  await api.deleteBlocks(rows.map((row) => row.id));
+  if (!transcript) return [];
+  const blocks = await api.listBlocksWithAttr(transcript.id, ATTR.transcriptRecording);
+  return blocks.filter((block) => block.attrs[ATTR.transcriptRecording] === recordingId);
 }
 
-async function writeTranscript(meeting, recordingId, segments) {
+function blocksFingerprint(blocks) {
+  return sha256(JSON.stringify(blocks.map((block) => [block.id, block.markdown || block.content || ""]).sort((a, b) => a[0].localeCompare(b[0]))));
+}
+
+async function transcriptFingerprint(meeting, recordingId) {
+  return blocksFingerprint(await transcriptBlocks(meeting, recordingId));
+}
+
+async function writeTranscript(meeting, recordingId, segments, { append = false, expectedFingerprint } = {}) {
   const transcriptId = await ensureTranscriptDoc(meeting);
-  await deleteTranscriptFor(meeting, recordingId);
+  const previous = await transcriptBlocks(meeting, recordingId);
+  const { recordings } = await readRecordings(meeting);
+  const savedFingerprint = recordings.find((item) => item.recordingId === recordingId)?.transcriptionFingerprint;
+  const preserveEditedFingerprint = append && previous.length && (!savedFingerprint || savedFingerprint !== blocksFingerprint(previous));
+  if (expectedFingerprint !== undefined && blocksFingerprint(previous) !== expectedFingerprint) {
+    const error = new Error("转写文字已被修改，已保留修改");
+    error.code = "TRANSCRIPT_CHANGED";
+    throw error;
+  }
   const list = [...segments].sort((a, b) => a.startMs - b.startMs);
-  // Write paragraphs in batches: a two-hour meeting can produce thousands of
-  // sentences, and one request per sentence would make transcription crawl.
-  const batchSize = 200;
-  for (let offset = 0; offset < list.length; offset += batchSize) {
-    const batch = list.slice(offset, offset + batchSize);
-    const data = batch
-      .map((segment) => {
+  const addedIds = [];
+  try {
+    for (let offset = 0; offset < list.length; offset += 200) {
+      const data = list.slice(offset, offset + 200).map((segment) => {
+        const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
+        addedIds.push(id);
         const attrs = {
+          id,
           [ATTR.transcriptMeeting]: meeting.id,
           [ATTR.transcriptRecording]: recordingId,
           [ATTR.transcriptStart]: String(Math.max(0, Math.floor(segment.startMs || 0))),
           [ATTR.transcriptEnd]: String(Math.max(0, Math.floor(segment.endMs || 0))),
-          [ATTR.transcriptSpeaker]: String(Number(segment.speaker || 0) || 0),
+          [ATTR.transcriptSpeaker]: String(Number(segment.speaker || 0)),
+          [ATTR.transcriptChannel]: String(Number(segment.channel || 0)),
+          [ATTR.transcriptLabel]: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
+          [ATTR.transcriptNotice]: segment.notice ? "1" : "0",
         };
-        if (segment.channel !== undefined && segment.channel !== null && segment.channel !== "") {
-          attrs[ATTR.transcriptChannel] = String(segment.channel);
-        }
-        const ial = Object.entries(attrs)
-          .map(([key, value]) => `${key}="${escapeIal(value)}"`)
-          .join(" ");
+        const ial = Object.entries(attrs).map(([key, value]) => `${key}="${escapeIal(value)}"`).join(" ");
         return `${transcriptLine(segment)}\n{: ${ial}}`;
-      })
-      .join("\n\n");
-    await api.appendMarkdownRaw(transcriptId, data);
+      }).join("\n\n");
+      await api.appendMarkdownRaw(transcriptId, data);
+    }
+  } catch (error) {
+    await api.deleteBlocks(addedIds).catch(() => {});
+    throw error;
+  }
+  if (!append) {
+    // Check the exact old blocks again before removing them: the native editor
+    // stays editable while a long recognition request is in progress.
+    const oldIds = new Set(previous.map((block) => block.id));
+    const current = (await transcriptBlocks(meeting, recordingId)).filter((block) => oldIds.has(block.id));
+    if (blocksFingerprint(current) !== blocksFingerprint(previous)) {
+      await api.deleteBlocks(addedIds);
+      const error = new Error("转写文字已被修改，已保留修改");
+      error.code = "TRANSCRIPT_CHANGED";
+      throw error;
+    }
+    await api.deleteBlocks(previous.map((block) => block.id));
+  }
+  // A generated fingerprint lets the confirmation distinguish edited text.
+  if (!preserveEditedFingerprint) {
+    await updateRecordingTranscription(meeting, recordingId, {
+      transcriptionFingerprint: await transcriptFingerprint(meeting, recordingId),
+    });
   }
   return transcriptId;
 }
 
-async function updateRecordingTask(meeting, recordingId, taskId, status, error = "") {
-  const { recordings } = await readRecordings(meeting);
-  const target = recordings.find((item) => item.recordingId === recordingId);
-  if (!target?.blockId) throw new Error("找不到对应的录音段");
-  const attrs = {
-    [ATTR.recordingTaskStatus]: String(status || ""),
-    [ATTR.recordingTaskAt]: new Date().toISOString(),
-    [ATTR.recordingTaskError]: String(error || ""),
+async function updateRecordingTranscription(meeting, recordingId, patch) {
+  const key = `${meeting.id}:${recordingId}`;
+  let blockId = recordingBlocks.get(key);
+  if (!blockId) {
+    const { recordings } = await readRecordings(meeting);
+    blockId = recordings.find((item) => item.recordingId === recordingId)?.blockId;
+  }
+  if (!blockId) throw new Error("找不到对应的录音，请重新打开会议");
+  const fields = {
+    transcriptionStatus: ATTR.transcriptionStatus,
+    transcriptionError: ATTR.transcriptionError,
+    transcriptionFingerprint: ATTR.transcriptionFingerprint,
+    gaps: ATTR.transcriptionGaps,
+    realtimeEnabled: ATTR.realtimeEnabled,
   };
-  // A status-only update must not erase a task id that was already persisted.
-  if (taskId) attrs[ATTR.recordingTask] = String(taskId);
-  await api.setBlockAttrs(target.blockId, attrs);
+  const attrs = {};
+  for (const [name, value] of Object.entries(patch)) {
+    if (!fields[name]) continue;
+    attrs[fields[name]] = name === "gaps" ? JSON.stringify(value)
+      : name === "realtimeEnabled" ? (value ? "1" : "0") : String(value || "");
+  }
+  await api.setBlockAttrs(blockId, attrs);
 }
 
 async function readSummaries(meeting) {
@@ -400,53 +463,62 @@ async function readSummaries(meeting) {
     .map((child) => ({
       id: child.id,
       title: child.title,
-      version: Number(child.attrs[ATTR.summaryVersion] || 1) || 1,
       generatedAt: child.attrs[ATTR.summaryGeneratedAt] || "",
       sources: child.attrs[ATTR.summarySources] || "",
       fingerprint: child.attrs[ATTR.summaryFingerprint] || "",
-    }))
-    .sort((a, b) => a.version - b.version);
+    }));
 }
 
 async function readSummaryContent(docId) {
   return api.getDocMarkdown(docId);
 }
 
-async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), forceNew = false }) {
+async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "" }) {
   const content = String(markdown || "").trim();
   if (!content) throw new Error("纪要内容为空，未写入文档");
   const summaries = await readSummaries(meeting);
-  const latest = summaries[summaries.length - 1] || null;
+  if (summaries.length > 1) {
+    throw new Error("这场会议中有多份旧纪要。请先在思源中保留一份，再重新生成。");
+  }
+  const latest = summaries[0] || null;
   const currentContent = latest ? (await readSummaryContent(latest.id)).trim() : "";
   const currentHash = latest ? sha256(currentContent) : "";
-  const edited =
-    Boolean(latest) &&
-    (!latest.fingerprint || currentHash !== latest.fingerprint);
+  // Native editors remain usable while the model is generating. Do not erase
+  // edits made after the user confirmed the replacement.
+  if ((latest && currentHash !== expectedFingerprint) || (!latest && expectedFingerprint)) {
+    throw new Error("纪要在生成期间发生了修改，本次结果未覆盖原文。请确认现有内容后重新生成。");
+  }
 
   let target;
   let replaced = false;
   let oldBlocks = [];
-  if (!latest || forceNew || edited) {
-    const version = latest ? latest.version + 1 : 1;
-    target = await ensureSummaryDoc(meeting, version);
+  if (!latest) {
+    target = await ensureSummaryDoc(meeting);
   } else {
-    target = { id: latest.id, title: latest.title, version: latest.version };
+    target = { id: latest.id, title: latest.title };
     // Capture the old block ids and append the new content first. If the
     // append fails, the previous summary is still intact.
-    oldBlocks = (
-      await api.sql(`SELECT id FROM blocks WHERE parent_id=${sqlString(target.id)}`)
-    ).map((row) => row.id);
+    oldBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
     replaced = true;
   }
 
   await api.appendMarkdown(target.id, content);
-  if (oldBlocks.length) await api.deleteBlocks(oldBlocks);
+  if (oldBlocks.length) {
+    const currentBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
+    const oldIds = new Set(oldBlocks.map((block) => block.id));
+    const currentOld = currentBlocks.filter((block) => oldIds.has(block.id));
+    if (blocksFingerprint(currentOld) !== blocksFingerprint(oldBlocks)) {
+      // The new draft may remain beside the edits; never delete a user's edit
+      // merely to make a partially completed replacement look successful.
+      throw new Error("纪要在保存期间被修改，已保留修改和新生成的内容，请检查纪要文档。");
+    }
+    await api.deleteBlocks(oldBlocks.map((block) => block.id));
+  }
   const persisted = (await readSummaryContent(target.id)).trim();
   const fingerprint = sha256(persisted);
   await api.setBlockAttrs(target.id, {
     [ATTR.child]: "summary",
     [ATTR.parent]: meeting.id,
-    [ATTR.summaryVersion]: String(target.version),
     [ATTR.summaryGeneratedAt]: generatedAt,
     [ATTR.summarySources]: sources,
     [ATTR.summaryFingerprint]: fingerprint,
@@ -454,9 +526,7 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
 
   return {
     docId: target.id,
-    version: target.version,
     replaced,
-    editedPrevious: edited,
     content: persisted,
     generatedAt,
     sources,
@@ -479,11 +549,13 @@ module.exports = {
   findChild,
   ensureTranscriptDoc,
   ensureSummaryDoc,
+  ensureRecording,
   appendRecording,
   readRecordings,
   readTranscript,
   writeTranscript,
-  updateRecordingTask,
+  transcriptFingerprint,
+  updateRecordingTranscription,
   readSummaries,
   readSummaryContent,
   saveSummary,

@@ -8,6 +8,7 @@ const { pathToFileURL } = require("node:url");
 const remote = require("@electron/remote");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
+const tencent = require("./tencent");
 const { recover, finalizeInterrupted } = require("../capture/storage.cjs");
 const { clamp, isBlockId, isAssetPath } = require("./util");
 
@@ -70,6 +71,9 @@ class MeetingController {
     this.devicesResolve = null;
     this.devicesTimer = null;
     this.archiving = false;
+    this.realtimeWrite = Promise.resolve();
+    this.savingPromise = null;
+    this.shuttingDown = false;
     this.stopTimer = null;
     this.pendingRecoveries = [];
     this.dismissedRecoveries = new Set();
@@ -84,6 +88,7 @@ class MeetingController {
       error: "",
       needsAttention: "",
       notice: "",
+      realtimeNotice: "",
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -101,9 +106,9 @@ class MeetingController {
       deviceId: "",
       opacity: 0.9,
       notebookId: "",
-      publicBaseUrl: "",
-      engine: "16k_zh",
       tencentAppId: "",
+      realtimeTranscription: true,
+      autoTranscribe: false,
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
     remote.ipcMain.on(this.channel, this.ipcListener);
@@ -152,7 +157,9 @@ class MeetingController {
   async init() {
     try {
       const stored = JSON.parse(localStorage.getItem(PREF_KEY) || "{}");
-      this.prefs = { ...this.prefs, ...stored };
+      for (const key of Object.keys(this.prefs)) {
+        if (Object.hasOwn(stored, key)) this.prefs[key] = stored[key];
+      }
     } catch {
       // use defaults
     }
@@ -352,6 +359,8 @@ class MeetingController {
 
     this.setPrefs({});
     this.state.meeting = meeting;
+    this.state.recordingId = crypto.randomUUID();
+    this.state.realtimeNotice = "";
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -383,7 +392,12 @@ class MeetingController {
           storage: path.join(this.recordingRoot, meeting.meetingId),
           online: Boolean(online),
           deviceId,
+          realtime: {
+            enabled: this.prefs.realtimeTranscription !== false,
+            configured: this.plugin.transcription.isConfigured(),
+          },
           meta: {
+            recordingId: this.state.recordingId,
             meetingId: meeting.meetingId,
             docId: meeting.id,
             segmentNo: meeting.segments || 0,
@@ -575,12 +589,12 @@ class MeetingController {
         this.captureReady.then(() => true),
         new Promise((resolve) => setTimeout(() => resolve(false), 6000)),
       ]);
-      if (!ready) throw new Error("采集页在 6 秒内没有就绪");
+      if (!ready) throw new Error("录音未能启动，请重新打开会议后重试");
     } catch (error) {
       this.capture = null;
       this.captureReady = null;
       if (!capture.isDestroyed()) capture.destroy();
-      throw new Error(`无法加载录音采集页：${error.message}`);
+      throw new Error("无法启动录音，请重新加载插件后重试");
     }
     return capture;
   }
@@ -607,6 +621,20 @@ class MeetingController {
       }
     };
     if (senderId && senderId === idOf(this.capture)) {
+      if (message?.type === "realtime-sign") {
+        const reply = { type: "realtime-signed", requestId: message.requestId };
+        try {
+          if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
+              ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
+          reply.url = tencent.signRealtimeUrl(this.plugin.transcription.config(), {
+            voiceId: crypto.randomUUID(), sampleRate: 16000,
+          });
+        } catch {
+          reply.error = "实时转写暂时不可用，录音仍在保存。";
+        }
+        event.sender.send(this.channel, reply);
+        return;
+      }
       this.onCaptureMessage(message);
       return;
     }
@@ -631,9 +659,30 @@ class MeetingController {
       this.emit();
       return;
     }
+    if (message.type === "realtime") {
+      const meeting = this.state.meeting;
+      if (!meeting || message.recordingId !== this.state.recordingId) return;
+      this.state.realtimeNotice = message.error || "";
+      const capture = this.capture;
+      this.realtimeWrite = this.realtimeWrite.then(async () => {
+        const persisted = await this.plugin.transcription.onRealtime(meeting, message.recordingId, message);
+        if (persisted && Array.isArray(persisted.gaps) && capture && !capture.isDestroyed()) {
+          capture.webContents.send(this.channel, {
+            type: "realtime-persisted", recordingId: message.recordingId,
+            throughMs: message.throughMs, gaps: persisted.gaps,
+            status: persisted.status, error: persisted.error,
+          });
+        }
+      }).catch(() => {
+        this.state.realtimeNotice = "实时转写尚未全部写入会议文档，录音仍在保存；结束后可重新转写。";
+        this.emit();
+      });
+      this.emit();
+      return;
+    }
     if (message.type === "saved") {
       clearTimeout(this.stopTimer);
-      void this.onSaved(message);
+      this.savingPromise = this.onSaved(message);
       return;
     }
     if (message.type === "empty") {
@@ -737,6 +786,7 @@ class MeetingController {
     }
     if (message.peaks) this.savePeaks(payload.meta.recordingId, message.peaks);
     try {
+      await this.realtimeWrite;
       const result = await this.archiveSegment(payload);
       this.state.phase = "saved";
       this.state.savingStage = "";
@@ -747,6 +797,15 @@ class MeetingController {
       this.systemNotice = "";
       this.state.savedAt = Date.now();
       this.state.lastSaved = result;
+      if (!this.shuttingDown && meeting) {
+        void meetingStore.readRecordings(meeting).then(({ recordings }) => {
+          const recording = recordings.find((item) => item.recordingId === payload.meta.recordingId);
+          if (recording) return this.plugin.transcription.afterRecording(meeting, recording);
+        }).catch(() => {
+          this.state.realtimeNotice = "录音已保存，转写尚未完成；可在转写页手动继续。";
+          this.emit();
+        });
+      }
       this.state.hasStore = false;
       this.state.hasFrames = false;
       if (meeting) {
@@ -788,9 +847,9 @@ class MeetingController {
 
   async archiveSegment({ file, meta, seconds, events, meetingDocId }) {
     if (!meetingDocId) throw new Error("录音没有关联的会议文档");
-    if (!isBlockId(meetingDocId)) throw new Error("录音关联的会议文档编号无效");
+    if (!isBlockId(meetingDocId)) throw new Error("无法找到录音关联的会议，请重新打开会议");
     const meeting = await meetingStore.getMeeting(meetingDocId);
-    if (!meeting.isMeeting) throw new Error("会议文档缺少会议属性");
+    if (!meeting.isMeeting) throw new Error("这篇文档不是会议，请从会议菜单打开");
     // The local recording.json is the durable record. It may already contain
     // an archived asset from an earlier failed attempt.
     const diskMeta = this.recordingMeta(file);
@@ -798,7 +857,7 @@ class MeetingController {
     const recordingId = meta.recordingId || path.basename(path.dirname(file)) || crypto.randomUUID();
     const existing = await meetingStore.readRecordings(meeting);
     const already = existing.recordings.find((item) => item.recordingId === recordingId);
-    if (already) {
+    if (already?.assetPath) {
       // A retry after a crash may happen after the block was written but before
       // the local "archived" marker. Do not create a duplicate audio block.
       this.markArchived(file, already.assetPath || meta.asset);
@@ -816,8 +875,8 @@ class MeetingController {
     if (!assetPath) {
       const succMap = await api.insertLocalAssets([file], meeting.id);
       assetPath = succMap[baseName] || Object.values(succMap)[0];
-      if (!assetPath) throw new Error("思源没有返回资源路径");
-      if (!isAssetPath(assetPath)) throw new Error("思源返回的录音资源路径无效");
+      if (!assetPath) throw new Error("思源未能保存录音，已保留本机文件");
+      if (!isAssetPath(assetPath)) throw new Error("录音尚未保存到思源，已保留本机文件");
       try {
         this.persistRecordingMeta(file, { asset: assetPath });
       } catch {
@@ -827,7 +886,8 @@ class MeetingController {
     const requestedSegment = Number.isFinite(Number(meta.segmentNo)) ? Number(meta.segmentNo) : 0;
     // Use the actual block count when the synced counter is stale, so two
     // segments can never share the same display index.
-    const segmentNo = Math.max(requestedSegment, existing.recordings.length);
+    const segmentNo = already ? Math.max(0, already.index - 1)
+      : Math.max(requestedSegment, existing.recordings.length);
     const appended = await meetingStore.appendRecording(meeting, {
       assetPath,
       meta: { ...meta, recordingId, segmentNo, startedAt: meta.startedAt },
@@ -998,6 +1058,23 @@ class MeetingController {
     if (item.meta?.phase !== "saved") finalizeInterrupted(dir);
     const repaired = recover(this.recordingRoot).find((entry) => entry.dir === dir);
     if (!repaired) throw new Error("恢复后无法读取录音文件");
+    if (repaired.meta.realtimeEnabled) {
+      const meeting = await meetingStore.getMeeting(repaired.meta.docId);
+      const gaps = Array.isArray(repaired.meta.realtimeGaps) ? [...repaired.meta.realtimeGaps] : [];
+      const through = Number(repaired.meta.realtimeThroughMs || 0);
+      const endMs = repaired.seconds * 1000;
+      if (endMs > through) {
+        for (let channel = 0; channel < repaired.meta.channels; channel++) {
+          gaps.push({ startMs: through, endMs, channel });
+        }
+      }
+      await this.plugin.transcription.onRealtime(meeting, repaired.meta.recordingId, {
+        meta: repaired.meta, gaps, status: "incomplete", final: true,
+        error: "录音曾中断，转写可能不完整；请检查后手动补齐。",
+      }).catch(() => {
+        this.state.realtimeNotice = "已保留录音，转写恢复未完成；请手动重新转写。";
+      });
+    }
     const result = await this.archiveSegment({
       file: repaired.file,
       meta: { ...repaired.meta, interrupted: Boolean(item.interrupted) },
@@ -1161,6 +1238,7 @@ class MeetingController {
   }
 
   async shutdown() {
+    this.shuttingDown = true;
     clearTimeout(this.floatTimer);
     clearTimeout(this.savedTimer);
     clearTimeout(this.retryTimer);
@@ -1173,7 +1251,8 @@ class MeetingController {
         } catch {
           // the continuously written file remains recoverable
         }
-        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await this.realtimeWrite;
+        if (this.savingPromise) await this.savingPromise;
       }
       if (!this.capture.isDestroyed()) this.capture.destroy();
     }

@@ -111,8 +111,10 @@ function statusLabel(status) {
   switch (status) {
     case "uploading":
       return "上传中";
-    case "queued":
-      return "排队中";
+    case "recording":
+      return "实时转写中";
+    case "incomplete":
+      return "转写未完成";
     case "processing":
       return "识别中";
     case "done":
@@ -126,9 +128,9 @@ function statusLabel(status) {
 
 function transcriptStatus(recording, transcriptSegments, manager, meetingId) {
   const live = manager?.statusFor(meetingId, recording.recordingId) || {};
-  const status = live.status || recording.taskStatus || "";
+  const status = live.status || recording.transcriptionStatus || "";
   if (status) return status;
-  return transcriptSegments.some((item) => item.recordingId === recording.recordingId) ? "done" : "";
+  return "";
 }
 
 function safeMarkdown(markdown) {
@@ -358,8 +360,8 @@ function mountMeetingTab(plugin, tab) {
     summaries: [],
     summaryDocId: "",
     summaryContent: "",
-    summaryVersion: 0,
     summaryGenerating: false,
+    summarySaving: false,
     summaryStream: "",
     summaryError: "",
     summaryNotice: "",
@@ -431,23 +433,16 @@ function mountMeetingTab(plugin, tab) {
     if (state.destroyed || event.meetingId !== docId) return;
     const recording = state.recordings.find((item) => item.recordingId === event.recordingId);
     if (recording) {
-      recording.taskStatus = event.status;
-      recording.taskError = event.error || "";
+      recording.transcriptionStatus = event.status;
+      recording.transcriptionError = event.error || "";
     }
     const recordingsSection = state.root.querySelector('[data-section="recordings"]');
     if (recordingsSection) renderRecordings(state, recordingsSection);
-    if (event.status === "done") {
-      state.materialDirty = true;
-      void refreshTranscript(state).then(() => {
-        if (resolveMeetingView(state) === "transcript") renderTranscriptView(state);
-        if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
-      });
-    }
-    if (event.error && event.status === "failed") {
-      showMessage(`转写失败：${event.error}`, 8000, "error");
-    } else if (event.error && ["processing", "queued"].includes(event.status)) {
-      showMessage(`转写查询暂时失败，可稍后继续查询：${event.error}`, 8000, "error");
-    }
+    state.materialDirty = true;
+    void Promise.all([refreshRecordings(state), refreshTranscript(state)]).then(() => {
+      if (resolveMeetingView(state) === "transcript") renderTranscriptView(state);
+      if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
+    }).catch(() => {});
   });
   onCleanup(unsubscribeTranscription);
 
@@ -599,7 +594,7 @@ function mountMeetingTab(plugin, tab) {
       renderChrome(state, field, action);
       renderMeetingView(state);
       renderBanners(state);
-      plugin.transcription.resumePending(state.meeting);
+      await plugin.transcription.resumePending(state.meeting);
       const pendingSeek = plugin.controller.consumeSeek(docId);
       if (pendingSeek) {
         await applySeekToMeeting(state, pendingSeek).catch((error) =>
@@ -827,12 +822,22 @@ function renderBanners(state) {
     snapshot.saveFailed ? 1 : 0,
     snapshot.error || "",
     snapshot.needsAttention || "",
+    snapshot.realtimeNotice || "",
     snapshot.hasStore ? 1 : 0,
     snapshot.phase || "",
   ].join("|");
   if (state.bannerSignature === signature) return;
   state.bannerSignature = signature;
   container.replaceChildren();
+
+  if (snapshot.realtimeNotice && snapshot.meeting?.id === state.docId) {
+    const banner = h("div", "meeting-banner");
+    banner.append(h("span", "", snapshot.realtimeNotice));
+    const settings = h("button", "meeting-banner__action", "会议设置");
+    settings.onclick = () => openSettings(state.plugin);
+    banner.append(settings);
+    container.append(banner);
+  }
 
   if (recovery) {
     const banner = h("div", "meeting-banner meeting-banner--warning");
@@ -1068,11 +1073,9 @@ async function refreshSummaries(state) {
   const latest = state.summaries[0];
   if (latest) {
     state.summaryDocId = latest.id;
-    state.summaryVersion = latest.version;
     state.summaryContent = await meetingStore.readSummaryContent(latest.id);
   } else {
     state.summaryDocId = "";
-    state.summaryVersion = 0;
     state.summaryContent = "";
   }
   renderSummary(state);
@@ -1094,7 +1097,7 @@ async function refreshMaterial(state) {
     .filter((segment) => !selected || selected.has(segment.recordingId))
     .map((segment) => ({
       startMs: segment.startMs,
-      speaker: `说话人 ${Number(segment.speaker || 0) + 1}`,
+      speaker: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
       text: segment.text,
     }));
   let preMeetingNotes = state.meeting?.preNotes || "";
@@ -1187,7 +1190,7 @@ function segmentCard(state, recording) {
   const title = h("span", "meeting-segment__title", recordingTitle(recording.index));
   const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status));
   const liveStatus = state.plugin.transcription.statusFor(state.docId, recording.recordingId);
-  badge.title = liveStatus.error || recording.taskError || "";
+  badge.title = liveStatus.error || recording.transcriptionError || "";
   top.append(title, badge);
 
   const meta = h(
@@ -1208,39 +1211,23 @@ function segmentCard(state, recording) {
   const actions = h("div", "meeting-segment__actions");
   const button = h("button", "meeting-btn meeting-btn--small", "");
   const running = state.plugin.transcription.isRunning(recording.recordingId);
-  if (running) {
-    button.textContent = status === "uploading" ? "上传中" : "识别中";
-    button.disabled = true;
-    button.title = "任务编号已保存，可关闭思源后继续查询";
-  } else if (status === "uploading") {
-    button.textContent = "上传中";
-    button.disabled = true;
-  } else if (["queued", "processing"].includes(status)) {
-    button.textContent = "继续查询";
-    button.onclick = (event) => {
+  const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
+  const fillGaps = recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length > 0;
+  button.textContent = running ? "正在转写" : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : "转写";
+  button.disabled = running || !recording.assetPath;
+  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试" : "使用腾讯云转写服务";
+  button.onclick = (event) => {
+    event.stopPropagation();
+    void startTranscription(state, recording, { gapsOnly: fillGaps });
+  };
+  if (fillGaps && hasText) {
+    const redo = h("button", "meeting-link", "重新转写整段");
+    redo.disabled = running || !recording.assetPath;
+    redo.onclick = (event) => {
       event.stopPropagation();
       void startTranscription(state, recording);
     };
-  } else if (status === "failed") {
-    button.textContent = "重试";
-    button.onclick = (event) => {
-      event.stopPropagation();
-      void startTranscription(state, recording);
-    };
-  } else if (status === "done") {
-    button.textContent = "重新转写";
-    button.onclick = (event) => {
-      event.stopPropagation();
-      void startTranscription(state, recording);
-    };
-  } else {
-    button.textContent = "转写";
-    button.disabled = !recording.assetPath;
-    button.title = recording.assetPath ? "使用腾讯云录音文件识别" : "归档后才能转写";
-    button.onclick = (event) => {
-      event.stopPropagation();
-      void startTranscription(state, recording);
-    };
+    actions.append(redo);
   }
   actions.append(button);
   card.append(top, meta, actions);
@@ -1258,9 +1245,27 @@ function segmentCard(state, recording) {
   return card;
 }
 
-async function startTranscription(state, recording) {
+async function startTranscription(state, recording, { gapsOnly = false } = {}) {
   try {
-    await state.plugin.transcription.start(state.meeting, recording);
+    if (!state.plugin.transcription.isConfigured()) {
+      openSettings(state.plugin);
+      return;
+    }
+    const { recordings } = await meetingStore.readRecordings(state.meeting);
+    recording = recordings.find((item) => item.recordingId === recording.recordingId) || recording;
+    const { segments } = await meetingStore.readTranscript(state.meeting);
+    const hasText = segments.some((item) => item.recordingId === recording.recordingId);
+    const fingerprint = await meetingStore.transcriptFingerprint(state.meeting, recording.recordingId);
+    if (!gapsOnly && (hasText || recording.transcriptionStatus === "done")) {
+      const edited = !recording.transcriptionFingerprint || fingerprint !== recording.transcriptionFingerprint;
+      const accepted = await confirmDialog("重新转写", edited
+        ? "这段转写已被修改。重新转写会再次计费并替换现有转写，你的修改会丢失。"
+        : "重新转写会再次计费，并替换这段录音的现有转写。", "重新转写");
+      if (!accepted) return;
+    } else if (recording.transcriptionStatus === "incomplete" && !gapsOnly) {
+      if (!await confirmDialog("重试转写", "上次转写未完成。重新提交可能再次计费，是否继续？", "继续转写")) return;
+    }
+    await state.plugin.transcription.start(state.meeting, recording, { gapsOnly, expectedFingerprint: fingerprint });
   } catch (error) {
     showMessage(error.message, 7000, "error");
   }
@@ -1478,7 +1483,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   section.append(header);
 
   const pending = state.recordings.filter((recording) =>
-    ["queued", "processing", "uploading"].includes(
+    ["processing"].includes(
       transcriptStatus(recording, state.transcript, state.plugin.transcription, state.docId),
     ),
   );
@@ -1510,11 +1515,27 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     const hint = h(
       "div",
       "meeting-transcript-notice__hint",
-      "可以关闭思源；重新打开后会继续查询已有任务，不会重复提交。",
+      "请保持思源打开并保持联网；中断后需手动重试，可能再次计费。",
     );
     list.append(hint);
     notice.append(icon("iconMeetingTranscript"), list);
     section.append(notice);
+  }
+
+  if (!state.plugin.transcription.isConfigured()) {
+    const notice = h("div", "meeting-transcript-notice");
+    notice.append(h("span", "", "尚未配置腾讯云转写服务，录音仍可正常保存。"));
+    const settings = h("button", "meeting-link", "会议设置");
+    settings.onclick = () => openSettings(state.plugin);
+    notice.append(settings);
+    section.append(notice);
+  }
+  for (const recording of state.recordings) {
+    if (recording.gaps?.length) {
+      const ranges = recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、");
+      section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
+    }
+    if (recording.transcriptionError) section.append(h("p", "meeting-transcript-notice", `${recordingTitle(recording.index)}：${recording.transcriptionError}`));
   }
 
   if (!state.transcript.length) {
@@ -1567,7 +1588,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       const speaker = h(
         "span",
         `meeting-transcript-speaker speaker-${Number(segment.speaker || 0) % SPEAKER_COLORS}`,
-        `说话人 ${Number(segment.speaker || 0) + 1}`,
+        segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
       );
       const text = h("span", "meeting-transcript-text", segment.text);
       body.append(speaker, text);
@@ -1587,23 +1608,6 @@ function renderSummary(state) {
   section.replaceChildren();
   const header = h("div", "meeting-view-header");
   header.innerHTML = `<span class="meeting-view-title">纪要</span>`;
-  if (state.summaries.length > 1) {
-    const select = document.createElement("select");
-    select.className = "meeting-version-select";
-    select.setAttribute("aria-label", "纪要版本");
-    for (const summary of state.summaries) {
-      select.add(new Option(`第 ${summary.version} 版`, summary.id, false, summary.id === state.summaryDocId));
-    }
-    select.onchange = async () => {
-      const target = state.summaries.find((item) => item.id === select.value);
-      if (!target) return;
-      state.summaryDocId = target.id;
-      state.summaryVersion = target.version;
-      state.summaryContent = await meetingStore.readSummaryContent(target.id);
-      renderSummary(state);
-    };
-    header.append(select);
-  }
   section.append(header);
 
   if (state.summaryGenerating) {
@@ -1619,11 +1623,15 @@ function renderSummary(state) {
     const retry = h("button", "meeting-btn", "重试");
     retry.onclick = () => void generateSummary(state, {});
     error.append(retry);
+    appendSummaryScope(state, error);
+    const settings = h("button", "meeting-link", "打开思源 AI 设置");
+    settings.onclick = () => openSetting(state.plugin.app);
+    error.append(settings);
     section.append(error);
     return;
   }
 
-  const latest = state.summaries.find((item) => item.id === state.summaryDocId) || state.summaries[state.summaries.length - 1];
+  const latest = state.summaries[0];
   const hasContent = Boolean(latest);
   if (!hasContent && !ai.isConfigured()) {
     section.append(configError(state));
@@ -1634,6 +1642,10 @@ function renderSummary(state) {
   const overBudget = Boolean(budget && material && material.characters > budget);
 
   if (!hasContent) {
+    if (!budget) {
+      section.append(capacityError(state, material?.characters || 0, 0));
+      return;
+    }
     if (overBudget) {
       section.append(capacityError(state, material.characters, budget));
       return;
@@ -1720,6 +1732,38 @@ function appendSummaryScope(state, container) {
     scope.append(h("span", "meeting-summary-scope__note", `已选择 ${state.summarySelectedIds.length} 段录音`));
   }
   container.append(scope);
+  const incomplete = incompleteSummaryRecordings(state);
+  if (incomplete.length) {
+    const warning = h("div", "meeting-summary-scope__note");
+    warning.append(h("p", "", "以下录音尚未转写完整，缺少的内容不会进入纪要："));
+    const list = h("ul", "");
+    incomplete.forEach((item) => list.append(h("li", "", item)));
+    warning.append(list);
+    container.append(warning);
+  }
+}
+
+function incompleteSummaryRecordings(state) {
+  if (state.summaryOnlyNotes) return [];
+  const selected = state.summarySelectedIds ? new Set(state.summarySelectedIds) : null;
+  const recordedText = new Set(state.transcript.map((segment) => segment.recordingId));
+  const items = state.recordings
+    .filter((recording) => !selected || selected.has(recording.recordingId))
+    .filter((recording) => recording.transcriptionStatus !== "done" || recording.gaps?.length)
+    .map((recording) => {
+      const gaps = (recording.gaps || []).map((gap) =>
+        `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}`,
+      );
+      const reason = gaps.length
+        ? `缺少 ${gaps.join("、")} 的转写`
+        : recordedText.has(recording.recordingId) ? "转写尚未完成" : "尚无转写";
+      return `${recordingTitle(recording.index)}：${reason}`;
+    });
+  if (state.snapshot.meeting?.id === state.docId &&
+      ["preparing", "recording", "paused", "saving"].includes(state.snapshot.phase)) {
+    items.push("当前录音尚未结束，只会使用本次生成前已保存的转写。");
+  }
+  return items;
 }
 
 function configError(state) {
@@ -1742,8 +1786,16 @@ function configError(state) {
 function capacityError(state, characters, budget) {
   const card = h("div", "meeting-summary-state");
   card.innerHTML = `${icon("iconMeetingWarning", "meeting-summary-state__icon")}
-    <p class="meeting-summary-state__title">材料超出模型容量</p>
-    <p class="meeting-summary-state__text">当前材料约 ${characters} 字，超过所用模型约 ${budget} 字的安全上限。不会静默截断材料。</p>`;
+    <p class="meeting-summary-state__title">${budget ? "材料超出模型容量" : "尚不清楚模型能处理多少内容"}</p>
+    <p class="meeting-summary-state__text">${budget
+      ? `当前材料约 ${characters} 字，超过所用模型约 ${budget} 字的处理范围。请选择较少的录音段，或只用笔记生成。`
+      : "请在思源 AI 设置中填写所选模型的上下文容量，再生成纪要。"}</p>`;
+  if (!budget) {
+    const settings = h("button", "meeting-btn", "打开思源设置");
+    settings.onclick = () => openSetting(state.plugin.app);
+    card.append(settings);
+    return card;
+  }
   const notesOnly = h("button", "meeting-btn", "只用笔记");
   notesOnly.onclick = () => {
     state.summaryOnlyNotes = true;
@@ -1805,12 +1857,12 @@ function openRecordingSelection(state) {
 
 function renderSummaryStreaming(state, section) {
   const meta = h("div", "meeting-summary-meta");
-  meta.innerHTML = `<span class="meeting-summary-meta__text">正在整理会议内容…</span>`;
-  const cancel = h("button", "meeting-link", "取消");
-  cancel.onclick = () => {
-    state.summaryAbort?.abort();
-  };
-  meta.append(cancel);
+  meta.append(h("span", "meeting-summary-meta__text", state.summarySaving ? "正在保存纪要…" : "正在整理会议内容…"));
+  if (!state.summarySaving) {
+    const cancel = h("button", "meeting-link", "取消");
+    cancel.onclick = () => state.summaryAbort?.abort();
+    meta.append(cancel);
+  }
   section.append(meta);
   const content = h("div", "meeting-summary-content meeting-summary-content--streaming");
   if (state.summaryStream.trim()) {
@@ -1821,7 +1873,7 @@ function renderSummaryStreaming(state, section) {
   section.append(content);
 }
 
-async function generateSummary(state, { forceNew = false } = {}) {
+async function generateSummary(state) {
   if (state.summaryGenerating) return;
   if (!state.meeting?.isMeeting) {
     state.summaryError = "这篇文档不是会议文档，无法生成纪要";
@@ -1841,20 +1893,58 @@ async function generateSummary(state, { forceNew = false } = {}) {
   const abort = new AbortController();
   state.summaryAbort = abort;
   try {
+    await refreshRecordings(state);
     await refreshTranscript(state);
+    await refreshSummaries(state);
+    if (state.summaries.length > 1) {
+      throw new Error("这场会议中有多份旧纪要。请先在思源中保留一份，再重新生成。");
+    }
     await refreshMaterial(state);
-    const budget = prompts.contextCharacterBudget(ai.getEditingModel()?.model);
-    if (budget && state.material.characters > budget) {
-      throw new Error(
-        `材料约 ${state.material.characters} 字，超过模型约 ${budget} 字的安全上限。请只用笔记或选择录音段。`,
-      );
+    const resolved = JSON.parse(JSON.stringify(ai.getEditingModel()));
+    const budget = prompts.contextCharacterBudget(resolved?.model);
+    if (!budget) {
+      throw new Error("尚不清楚所选模型能处理多少内容。请在思源 AI 设置中填写模型的上下文容量，再生成纪要。");
     }
     const system = prompts.buildSystemPrompt({ date: new Date() });
     const user = state.material.userPrompt;
+    const characters = prompts.countNormalizedCharacters(`${system}\n${user}`);
+    if (characters > budget) {
+      throw new Error(
+        `本次内容约 ${characters} 字，超过所选模型约 ${budget} 字的处理范围。请只用笔记或选择较少的录音段。`,
+      );
+    }
+    const sources = summarySourceText(state);
+    const incomplete = incompleteSummaryRecordings(state);
+    const existing = state.summaries[0];
+    const expectedFingerprint = existing ? sha256(state.summaryContent.trim()) : "";
+    const edited = Boolean(existing && (!existing.fingerprint || existing.fingerprint !== expectedFingerprint));
+    const warnings = [];
+    if (existing) {
+      warnings.push(edited
+        ? "当前纪要已被修改。重新生成会替换这份纪要，你的修改将丢失。"
+        : "重新生成会替换这份纪要。");
+    }
+    if (incomplete.length) {
+      warnings.push(`以下内容不会完整进入本次纪要：${incomplete.join("；")}。`);
+    }
+    if (abort.signal.aborted) throw new Error("已取消生成");
+    if (warnings.length) {
+      const confirmed = await confirmDialog(
+        existing ? "重新生成纪要" : "使用已有材料生成纪要",
+        warnings.join("\n\n"),
+        existing ? "替换纪要" : "使用已有材料生成",
+      );
+      if (!confirmed) {
+        state.summaryNotice = "已取消生成，未修改纪要";
+        return;
+      }
+    }
+    if (abort.signal.aborted) throw new Error("已取消生成");
     const generatedAt = new Date().toISOString();
     const text = await ai.streamSummary({
       system,
       user,
+      resolved,
       signal: abort.signal,
       onDelta: (_delta, full) => {
         state.summaryStream = full;
@@ -1862,34 +1952,33 @@ async function generateSummary(state, { forceNew = false } = {}) {
       },
     });
     if (abort.signal.aborted) throw new Error("已取消生成");
-    const sources = summarySourceText(state);
+    state.summarySaving = true;
+    renderSummary(state);
     const saved = await meetingStore.saveSummary(state.meeting, {
       markdown: text,
       sources,
       generatedAt,
-      forceNew,
+      expectedFingerprint,
     });
     state.summaries = await meetingStore.readSummaries(state.meeting);
     if (!state.summaries.some((item) => item.id === saved.docId)) {
-      state.summaries.push({ id: saved.docId, version: saved.version, generatedAt, sources });
+      state.summaries.push({ id: saved.docId, generatedAt, sources, fingerprint: saved.fingerprint });
     }
     state.summaryDocId = saved.docId;
-    state.summaryVersion = saved.version;
     state.summaryContent = saved.content;
-    state.summaryNotice = saved.replaced
-      ? "已原位替换未改动的纪要"
-      : saved.version > 1
-        ? `已另存为第 ${saved.version} 版，旧版保留`
-        : "";
+    state.summaryNotice = saved.replaced ? "已替换纪要" : "";
     state.summaryStream = "";
   } catch (error) {
-    if (abort.signal.aborted || String(error.message).includes("已取消")) {
+    if (state.summarySaving) {
+      state.summaryError = error.message;
+    } else if (abort.signal.aborted || String(error.message).includes("已取消")) {
       state.summaryNotice = "已取消生成，未写入任何内容";
     } else {
       state.summaryError = error.message;
     }
   } finally {
     state.summaryGenerating = false;
+    state.summarySaving = false;
     state.summaryAbort = null;
     renderSummary(state);
   }
@@ -1914,19 +2003,7 @@ function summarySourceText(state) {
 }
 
 async function regenerateSummary(state) {
-  const latest = state.summaries.find((item) => item.id === state.summaryDocId);
-  if (!latest) return generateSummary(state, { forceNew: true });
-  const current = await meetingStore.readSummaryContent(latest.id);
-  const edited = latest.fingerprint && sha256(current.trim()) !== latest.fingerprint;
-  const ok = await confirmDialog(
-    "重新生成纪要",
-    edited
-      ? "当前纪要已被修改。重新生成会另存为新一版，旧版保留。"
-      : "当前纪要生成后未改动，重新生成会原位替换。",
-    edited ? "另存新版本" : "原位替换",
-  );
-  if (!ok) return;
-  await generateSummary(state, { forceNew: false });
+  await generateSummary(state);
 }
 
 function openChildDoc(state, kind, docId = "") {
@@ -2036,24 +2113,25 @@ function openSettings(plugin) {
         </label>
       </section>
       <section>
-        <h3>腾讯云录音文件识别</h3>
-        <p class="meeting-settings__hint">密钥写入思源「密钥和变量」，只存在本机，不进入会随思源同步的插件数据目录。留空表示不修改已保存的密钥。</p>
+        <h3>腾讯云转写</h3>
+        <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你配置的腾讯云服务；密钥留空表示不修改。</p>
+        <label class="meeting-settings__row"><span>AppId</span>
+          <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
+        </label>
         <label class="meeting-settings__row"><span>SecretId</span>
           <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
         </label>
         <label class="meeting-settings__row"><span>SecretKey</span>
           <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
         </label>
-        <label class="meeting-settings__row"><span>公网音频前缀</span>
-          <input class="b3-text-field" name="publicBaseUrl" value="${escapeHtml(prefs.publicBaseUrl || "")}" placeholder="例如 https://media.example.com">
+        <label class="meeting-settings__row"><span>实时转写</span>
+          <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">腾讯云长音频需要一个可访问的 URL。若音频超过 5 MB，请填写能把思源 assets 目录映射到公网的地址前缀；留空时只尝试 5 MB 以内的直接上传。</p>
-        <label class="meeting-settings__row"><span>识别引擎</span>
-          <select class="b3-select" name="engine">
-            <option value="16k_zh"${prefs.engine === "16k_zh" ? " selected" : ""}>16k_zh（普通话）</option>
-            <option value="8k_zh"${prefs.engine === "8k_zh" ? " selected" : ""}>8k_zh（电话音质）</option>
-          </select>
+        <p class="meeting-settings__hint">从下一段录音开始生效。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
+        <label class="meeting-settings__row"><span>结束后自动转写</span>
+          <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
         </label>
+        <p class="meeting-settings__hint">线上实时转写只补齐缺口；关闭实时转写时，结束后转写整段。</p>
       </section>
       <section>
         <h3>AI 纪要</h3>
@@ -2094,8 +2172,9 @@ function openSettings(plugin) {
         notebookId: value("notebook"),
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,
-        publicBaseUrl: value("publicBaseUrl").trim(),
-        engine: value("engine"),
+        tencentAppId: value("appId").trim(),
+        realtimeTranscription: element.querySelector('[name="realtime"]').checked,
+        autoTranscribe: element.querySelector('[name="autoTranscribe"]').checked,
       });
       showMessage("设置已保存", 3000);
       dialog.destroy();

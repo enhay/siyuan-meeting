@@ -8,15 +8,23 @@ async function post(endpoint, payload = {}) {
   try {
     response = await fetchSyncPost(endpoint.startsWith("/api/") ? endpoint : `/api/${endpoint}`, payload);
   } catch (error) {
-    throw new Error(`思源请求失败：${error.message}`);
+    throw new Error("无法连接思源，请检查思源是否正常运行后重试");
   }
   if (!response || response.code !== 0) {
-    throw new Error(response?.msg || "思源未能完成此操作");
+    const error = new Error("思源未能保存或读取会议内容，请重新打开会议后重试");
+    error.serviceMessage = response?.msg || "";
+    error.code = response?.code;
+    console.warn("Meeting document request failed", { endpoint, code: response?.code });
+    throw error;
   }
   return response.data;
 }
 
 async function sql(stmt) {
+  // SiYuan commits document blocks before updating its SQL index. Every query
+  // on the write/read path must observe those writes before deciding to create
+  // another child document or replace existing blocks.
+  await post("/api/sqlite/flushTransaction");
   return (await post("/api/query/sql", { stmt })) || [];
 }
 
@@ -62,7 +70,7 @@ async function createDoc({ notebookId, title, parentID = "", markdown = "", id =
   try {
     return await post("/api/filetree/createDocWithMd", payload);
   } catch (error) {
-    if (!/exist|already|重复|存在/i.test(error.message)) throw error;
+    if (!/exist|already|重复|存在/i.test(error.serviceMessage || error.message)) throw error;
     payload.path = `${docPath} (${new Date().toISOString().slice(11, 19).replaceAll(":", "")})`;
     return post("/api/filetree/createDocWithMd", payload);
   }
@@ -118,7 +126,7 @@ async function deleteBlocks(ids) {
       await post("/api/block/deleteBlock", { id });
     } catch (error) {
       // A block deleted concurrently is not an error for our replacement flow.
-      if (!/not found|不存在/i.test(error.message)) throw error;
+      if (!/not found|不存在/i.test(error.serviceMessage || error.message)) throw error;
     }
   }
 }
@@ -210,20 +218,20 @@ async function listChildDocs(parentID, kind = "") {
       ${kindJoin}
       WHERE b.type='d'
       GROUP BY b.id
-      ORDER BY b.created ASC`,
+      ORDER BY b.created ASC, b.id ASC LIMIT -1`,
   );
   return rows.map((row) => ({ id: row.id, title: row.content, attrs: parseIal(row.ial) }));
 }
 
 async function listBlocksWithAttr(parentID, attrName) {
   const rows = await sql(
-    `SELECT b.id, b.type, b.content, b.ial, b.created
+    `SELECT b.id, b.type, b.content, b.markdown, b.ial, b.created
       FROM blocks b JOIN attributes a ON a.block_id=b.id AND a.name=${sqlString(attrName)}
       WHERE b.parent_id=${sqlString(parentID)}
       GROUP BY b.id
-      ORDER BY b.created ASC`,
+      ORDER BY b.created ASC, b.id ASC LIMIT -1`,
   );
-  return rows.map((row) => ({ id: row.id, type: row.type, content: row.content, attrs: parseIal(row.ial) }));
+  return rows.map((row) => ({ id: row.id, type: row.type, content: row.content, markdown: row.markdown, attrs: parseIal(row.ial) }));
 }
 
 async function getBlockInfo(id) {

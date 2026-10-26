@@ -97,7 +97,7 @@ class RecordingStore {
     const pcm = wav(samples, this.meta.sampleRate, this.meta.channels).subarray(44);
     const offset = 44 + this.meta.frames * this.meta.channels * 2;
     if (offset + pcm.length - 8 > 0xffffffff) {
-      throw new Error("本段已达到 WAV 文件大小上限，请结束后另建录音段");
+      throw new Error("这段录音已达到保存上限，请结束后补录");
     }
     let written = 0;
     while (written < pcm.length) {
@@ -123,7 +123,7 @@ class RecordingStore {
   }
 
   addEvent(event) {
-    this.meta.events.push({ ...event, at: new Date().toISOString() });
+    this.meta.events.push({ ...event, at: event.at || new Date().toISOString() });
     if (this.meta.events.length > 500) this.meta.events = this.meta.events.slice(-500);
     this.save();
   }
@@ -192,7 +192,7 @@ function readRecording(dir) {
   }
   try {
     const bytes = fs.statSync(file).size - 44;
-    if (bytes < 0) throw new Error("音频文件头不完整");
+    if (bytes < 0) throw new Error("录音文件不完整，已保留原文件");
     const frames = Math.floor(bytes / (2 * meta.channels));
     return { dir, file, meta, peaks, seconds: frames / meta.sampleRate };
   } catch (error) {

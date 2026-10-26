@@ -124,12 +124,20 @@ function textFromResponsesJson(data) {
     .join("");
 }
 
+function serviceFailure(status = 0) {
+  if (status === 401 || status === 403) return new Error("AI 服务未接受当前配置。请检查思源中的 AI 账号与访问权限。");
+  if (status === 429) return new Error("AI 服务暂时无法继续处理。请检查可用额度，或稍后重试。");
+  if (status === 413) return new Error("本次会议内容超出 AI 服务的处理范围。请选择较少的录音段后重试。");
+  return new Error("AI 服务未能完成本次纪要。请检查网络和思源 AI 设置后重试。");
+}
+
 /**
  * Make a streaming chat request with Node's http stack. The SiYuan renderer is
  * an http origin; Node avoids browser CORS while keeping provider credentials
  * inside the local process.
  */
 function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
+  if (signal?.aborted) return Promise.reject(new Error("已取消生成"));
   return new Promise((resolve, reject) => {
     const url = new URL(urlString);
     const transport = url.protocol === "http:" ? http : https;
@@ -150,6 +158,7 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
         let buffer = "";
         let full = "";
         let truncated = false;
+        let completed = false;
         const finish = () => {
           if (truncated) {
             const note =
@@ -161,20 +170,12 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
         };
 
         if (status < 200 || status >= 300) {
-          const chunks = [];
-          response.on("data", (chunk) => chunks.push(chunk));
+          response.resume();
           response.on("end", () => {
-            const raw = Buffer.concat(chunks).toString("utf8");
-            let message = raw.slice(0, 1200);
-            try {
-              const parsed = JSON.parse(raw);
-              message = parsed?.error?.message || parsed?.message || message;
-            } catch {
-              // keep the raw body
-            }
-            reject(new Error(`AI 请求失败（${status}）：${message}`));
+            console.warn("Meeting AI request failed", { status });
+            reject(serviceFailure(status));
           });
-          response.on("error", reject);
+          response.on("error", () => reject(serviceFailure()));
           return;
         }
 
@@ -190,6 +191,10 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
           response.on("end", () => {
             try {
               const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              if (data?.error || data?.status === "failed") {
+                reject(serviceFailure());
+                return;
+              }
               const text =
                 textFromOpenAIJson(data) || textFromAnthropicJson(data) || textFromResponsesJson(data);
               truncated =
@@ -198,11 +203,11 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
                 data?.status === "incomplete";
               emit(text);
               resolve(finish());
-            } catch (error) {
-              reject(new Error(`AI 返回内容无法解析：${error.message}`));
+            } catch {
+              reject(new Error("AI 返回的内容无法读取，请稍后重试。"));
             }
           });
-          response.on("error", reject);
+          response.on("error", () => reject(serviceFailure()));
           return;
         }
 
@@ -215,41 +220,60 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
             buffer = buffer.slice(newline + 1);
             if (!line || !line.startsWith("data:")) continue;
             const data = line.slice(5).trim();
-            if (!data || data === "[DONE]") continue;
+            if (!data) continue;
+            if (data === "[DONE]") {
+              completed = true;
+              continue;
+            }
             let event;
             try {
               event = JSON.parse(data);
             } catch {
               continue;
             }
-            if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+            if (event.error || event.type === "error" || event.type === "response.failed") {
+              response.destroy();
+              reject(serviceFailure());
+              return;
+            }
+            if (event.type === "message_stop") {
+              completed = true;
+            } else if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
               emit(event.delta.text);
             } else if (event.type === "message_delta" && event.delta?.stop_reason === "max_tokens") {
               truncated = true;
             } else if (event.type === "response.output_text.delta") {
               emit(event.delta);
             } else if (event.type === "response.completed" || event.type === "response.incomplete") {
+              completed = true;
               if (!full && event.response) emit(textFromResponsesJson(event.response));
               if (event.response?.status === "incomplete") truncated = true;
             } else {
               const choice = event.choices?.[0];
+              if (choice?.finish_reason) completed = true;
               if (choice?.finish_reason === "length") truncated = true;
               const text = choice?.delta?.content;
               if (typeof text === "string") emit(text);
             }
           }
         });
-        response.on("end", () => resolve(finish()));
-        response.on("error", reject);
+        response.on("end", () => {
+          if (!completed) {
+            reject(new Error("AI 连接在纪要完成前中断，本次内容尚未保存。请重新生成。"));
+            return;
+          }
+          resolve(finish());
+        });
+        response.on("error", () => reject(serviceFailure()));
       },
     );
 
     const abort = () => request.destroy(new Error("已取消生成"));
     signal?.addEventListener("abort", abort, { once: true });
-    request.on("timeout", () => request.destroy(new Error("AI 请求超时")));
-    request.on("error", (error) => {
+    request.on("timeout", () => request.destroy(new Error("AI 服务长时间未响应，请稍后重试。")));
+    request.on("error", () => {
       signal?.removeEventListener("abort", abort);
-      reject(error);
+      reject(signal?.aborted ? new Error("已取消生成") : serviceFailure());
     });
     request.on("close", () => signal?.removeEventListener("abort", abort));
     request.write(body);
@@ -266,18 +290,14 @@ async function kernelCompletion(system, user, { signal, onDelta } = {}) {
       body: JSON.stringify({ msg }),
       signal,
     });
-    if (!response.ok) throw new Error(`AI 请求失败（${response.status}）`);
+    if (!response.ok) throw serviceFailure(response.status);
     const data = await response.json();
-    if (data.code !== 0) throw new Error(data.msg || "AI 请求失败");
+    if (data.code !== 0) throw serviceFailure();
     return String(data.data || "");
   };
   // The kernel's editor endpoint keeps a conversation cache. Clear it so a
   // meeting summary cannot inherit an unrelated editor conversation.
-  try {
-    await send("Clear context");
-  } catch {
-    // A clear failure should not hide the real request error.
-  }
+  await send("Clear context");
   const text = await send(`${system}\n\n${user}`);
   if (!text.trim()) throw new Error("AI 没有返回内容，请检查思源 AI 配置");
   onDelta?.(text, text);
@@ -288,8 +308,8 @@ async function kernelCompletion(system, user, { signal, onDelta } = {}) {
  * Stream a summary. Returns the complete text. Callers are responsible for
  * persisting the result only after this promise resolves.
  */
-async function streamSummary({ system, user, signal, onDelta }) {
-  const resolved = getEditingModel();
+async function streamSummary({ system, user, signal, onDelta, resolved = getEditingModel() }) {
+  if (signal?.aborted) throw new Error("已取消生成");
   if (!resolved) throw new Error("尚未配置 AI：请在思源设置中配置 AI 模型");
   const { provider, editing } = resolved;
   const protocol = String(provider.protocol || "").toLowerCase();

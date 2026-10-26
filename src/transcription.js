@@ -1,42 +1,15 @@
 "use strict";
 
-const fs = require("node:fs");
+const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const tencent = require("./tencent");
-
-const POLL_INTERVAL = 5000;
-const MAX_POLL_MS = 45 * 60 * 1000;
+const { wavParts } = require("./wav");
+const { mergeGaps } = require("../capture/realtime.cjs");
 
 function secret(plugin, name) {
-  try {
-    const value = plugin.getSecret?.(name);
-    if (value) return value;
-  } catch {
-    // fall through to the config snapshot
-  }
-  return (
-    window.siyuan?.config?.secrets?.items?.find((item) => item?.name === name)?.value || ""
-  );
-}
-
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new Error("已取消"));
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", abort);
-      resolve();
-    }, ms);
-    const abort = () => {
-      clearTimeout(timer);
-      reject(new Error("已取消"));
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-  });
+  return plugin.getSecret?.(name) || globalThis.window?.siyuan?.config?.secrets?.items?.find((item) => item?.name === name)?.value || "";
 }
 
 class TranscriptionManager {
@@ -46,6 +19,10 @@ class TranscriptionManager {
     this.jobs = new Map();
     this.status = new Map();
     this.errors = new Map();
+    this.closing = false;
+    this.persistenceGaps = new Map();
+    this.deviceId = globalThis.localStorage?.getItem("siyuan-meeting.device") || crypto.randomUUID();
+    globalThis.localStorage?.setItem("siyuan-meeting.device", this.deviceId);
   }
 
   subscribe(listener) {
@@ -54,10 +31,10 @@ class TranscriptionManager {
   }
 
   notify(meeting, recordingId, status, error = "") {
-    const key = `${meeting?.id || ""}:${recordingId}`;
+    const key = `${meeting.id}:${recordingId}`;
     this.status.set(key, status);
     this.errors.set(key, error);
-    this.events.emit("change", { meetingId: meeting?.id, recordingId, status, error });
+    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error });
   }
 
   statusFor(meetingId, recordingId) {
@@ -65,172 +42,157 @@ class TranscriptionManager {
     return { status: this.status.get(key) || "", error: this.errors.get(key) || "" };
   }
 
-  isRunning(recordingId) {
-    return this.jobs.has(recordingId);
-  }
+  isRunning(recordingId) { return this.jobs.has(recordingId); }
 
   config() {
     return {
+      appId: String(this.plugin.controller.getPrefs().tencentAppId || "").trim(),
       secretId: secret(this.plugin, "meeting.tencent.secretId"),
       secretKey: secret(this.plugin, "meeting.tencent.secretKey"),
-      region: "ap-shanghai",
     };
   }
 
-  async sourceFor(recording) {
-    if (!recording.assetPath) throw new Error("这段录音还没有归档到思源资源，无法转写");
-    const base = String(this.plugin.controller.getPrefs().publicBaseUrl || "").trim().replace(/\/+$/, "");
-    if (base) {
-      return {
-        sourceType: 0,
-        url: `${base}/${String(recording.assetPath).replace(/^\/+/, "")}`,
-      };
-    }
-    const absolute = await api.resolveAssetPath(recording.assetPath);
-    if (!absolute) throw new Error("无法解析录音文件位置");
-    const stat = fs.statSync(absolute);
-    if (stat.size > 5 * 1024 * 1024) {
-      throw new Error(
-        "这段录音超过腾讯云 5 MB 直传上限。请在会议设置中填写可访问的音频地址前缀，或改用较短录音。",
-      );
-    }
-    return { sourceType: 1, data: fs.readFileSync(absolute) };
+  isConfigured() {
+    const config = this.config();
+    return tencent.isConfigured(config);
   }
 
-  async start(meeting, recording) {
-    if (!meeting?.id || !recording?.recordingId) throw new Error("没有可转写的录音段");
-    if (this.jobs.has(recording.recordingId)) return;
-    const config = this.config();
-    if (!config.secretId || !config.secretKey) {
-      throw new Error("请先在会议设置中填写腾讯云 SecretId 和 SecretKey");
+  async setState(meeting, recordingId, status, error = "", patch = {}) {
+    await meetingStore.updateRecordingTranscription(meeting, recordingId, {
+      ...patch, transcriptionStatus: status, transcriptionError: error,
+    });
+    this.notify(meeting, recordingId, status, error);
+  }
+
+  async onRealtime(meeting, recordingId, message) {
+    const key = `${meeting.id}:${recordingId}`;
+    if (message.meta) await meetingStore.ensureRecording(meeting, { ...message.meta, recordingId, deviceId: this.deviceId });
+    if (message.segments?.length) {
+      try {
+        await meetingStore.writeTranscript(meeting, recordingId, message.segments, { append: true });
+      } catch {
+        this.persistenceGaps.set(key, mergeGaps([
+          ...(this.persistenceGaps.get(key) || []),
+          ...message.segments.map(({ startMs, endMs, channel }) => ({ startMs, endMs, channel })),
+        ]));
+      }
     }
+    const missing = this.persistenceGaps.get(key) || [];
+    const gaps = mergeGaps([...(message.gaps || []), ...missing]);
+    const status = message.final && missing.length ? "incomplete" : message.status || "recording";
+    const error = missing.length ? "部分转写未能写入会议，录音仍已保存；结束后可补齐缺口" : message.error || "";
+    await this.setState(meeting, recordingId, status, error, {
+      gaps, ...(message.meta ? { realtimeEnabled: Boolean(message.meta.realtimeEnabled) } : {}),
+    });
+    return { gaps, status, error };
+  }
+
+  async start(meeting, recording, { gapsOnly = false, expectedFingerprint } = {}) {
+    if (!meeting?.id || !recording?.recordingId) throw new Error("没有可转写的录音");
+    if (this.closing || this.jobs.has(recording.recordingId)) return;
+    if (!this.isConfigured()) throw new Error("请先在会议设置中配置腾讯云转写服务");
+    if (!recording.assetPath) throw new Error("录音保存完成后才能转写");
     const controller = new AbortController();
+    const { signal } = controller;
     this.jobs.set(recording.recordingId, controller);
-    const taskKey = `siyuan-meeting.tencentTask.${recording.recordingId}`;
-    let activeTaskId = ["done", "failed"].includes(recording.taskStatus)
-      ? "" : recording.taskId || localStorage.getItem(taskKey) || "";
+    let persisted = false;
     try {
-      // A task id already accepted by Tencent must be polled, never submitted
-      // again. This also covers a restart before resumePending runs.
-      if (activeTaskId) {
-        this.notify(meeting, recording.recordingId, recording.taskStatus);
-        await meetingStore.updateRecordingTask(meeting, recording.recordingId, activeTaskId, "processing");
-        await this.poll(meeting, recording.recordingId, activeTaskId, controller.signal);
+      const absolute = await api.resolveAssetPath(recording.assetPath);
+      if (!absolute) throw new Error("录音尚未同步到本机，请同步后重试");
+      const fingerprint = expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId);
+      await this.setState(meeting, recording.recordingId, "processing");
+      const results = [];
+      const ranges = gapsOnly ? recording.gaps || [] : [{}];
+      if (!ranges.length) {
+        await this.setState(meeting, recording.recordingId, recording.transcriptionStatus || "incomplete");
         return;
       }
-      this.notify(meeting, recording.recordingId, "uploading");
-      const source = await this.sourceFor(recording);
-      const sampleRate = Number(recording.sampleRate || 16000);
-      const preferred = String(this.plugin.controller.getPrefs().engine || "");
-      const compatible =
-        (preferred.startsWith("16k") && sampleRate >= 16000) ||
-        (preferred.startsWith("8k") && sampleRate >= 8000);
-      const engine = compatible ? preferred : tencent.engineForSampleRate(sampleRate);
-      const created = await tencent.createRecTask({
-        ...config,
-        engine,
-        channels: recording.channels === 2 ? 2 : 1,
-        ...source,
-      });
-      const taskId = String(created?.TaskId || "");
-      if (!taskId) throw new Error("腾讯云没有返回任务编号");
-      activeTaskId = taskId;
-      // Keep the accepted id across a failed block write and an app restart.
-      localStorage.setItem(taskKey, taskId);
-      await meetingStore.updateRecordingTask(meeting, recording.recordingId, taskId, "queued");
-      this.notify(meeting, recording.recordingId, "queued");
-      await this.poll(meeting, recording.recordingId, taskId, controller.signal);
-    } catch (error) {
-      if (String(error.message) !== "已取消") {
-        if (activeTaskId && error.retryable !== false) {
-          // The task is still valid. A query timeout or network failure must
-          // not turn into a new billable submission on "retry".
-          await meetingStore
-            .updateRecordingTask(meeting, recording.recordingId, activeTaskId, "processing", error.message)
-            .catch(() => {});
-          this.notify(meeting, recording.recordingId, "processing", error.message);
-        } else {
-          await meetingStore
-            .updateRecordingTask(meeting, recording.recordingId, "", "failed", error.message)
-            .catch(() => {});
-          this.notify(meeting, recording.recordingId, "failed", error.message);
+      let requestIndex = 0;
+      for (const range of ranges) {
+        for await (const part of wavParts(absolute, { ...range, signal })) {
+          signal.throwIfAborted();
+          const segments = await tencent.flashRecognize({
+            ...this.config(), data: part.data, channels: part.channels,
+            sampleRate: part.sampleRate, signal,
+          });
+          signal.throwIfAborted();
+          const multipleSpeakers = new Set(segments.map((segment) => segment.speaker)).size > 1;
+          for (const segment of segments) {
+            const channel = range.channel ?? segment.channel;
+            results.push({
+              ...segment, channel,
+              startMs: part.startMs + segment.startMs,
+              endMs: Math.min(part.endMs, part.startMs + segment.endMs),
+              speakerLabel: recording.channels === 2
+                ? channel === 0 ? "我" : (part.channels === 2 ? segment.speakerLabel : `其他参会者${multipleSpeakers ? ` ${Number(segment.speaker || 0) + 1}` : ""}`)
+                : segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
+            });
+          }
+          if (requestIndex > 0 || gapsOnly) {
+            results.push({ startMs: part.startMs, endMs: part.startMs, speaker: 0,
+              channel: range.channel ?? 0, speakerLabel: "说明", notice: true,
+              text: "从这里开始单独转写，说话人编号重新开始。" });
+          }
+          requestIndex++;
         }
       }
+      signal.throwIfAborted();
+      await meetingStore.writeTranscript(meeting, recording.recordingId, results, { append: gapsOnly, expectedFingerprint: fingerprint });
+      persisted = true;
+      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] });
+      this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
+    } catch (error) {
+      // Service messages are translated by the client. Raw transport failures
+      // never become a user-facing error or a reason to resubmit automatically.
+      const message = signal.aborted
+        ? "转写已中断，录音和已有文字已保留；可手动重试"
+        : error.userMessage || (error.code === "TRANSCRIPT_CHANGED"
+          ? "转写文字在处理期间被修改，已保留修改，请确认后重新转写"
+          : "这段转写未完成，录音和已有文字已保留；请检查网络与腾讯云设置后手动重试");
+      await this.setState(meeting, recording.recordingId, "incomplete", persisted
+        ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message).catch(() => {
+        this.notify(meeting, recording.recordingId, "incomplete", message);
+      });
     } finally {
       this.jobs.delete(recording.recordingId);
     }
   }
 
-  async poll(meeting, recordingId, taskId, signal, startedAt = Date.now()) {
-    const config = this.config();
-    while (!signal.aborted) {
-      if (Date.now() - startedAt > MAX_POLL_MS) {
-        throw new Error("转写查询超时；任务编号已保存，稍后可以继续查询");
-      }
-      const response = await tencent.describeTaskStatus(config, taskId);
-      const status = tencent.normalizeStatus(response);
-      if (status === "done") {
-        const segments = tencent.parseResult(response.Result);
-        if (!segments.length) {
-          const error = new Error("转写完成但没有识别到文字");
-          error.retryable = false;
-          throw error;
-        }
-        await meetingStore.writeTranscript(meeting, recordingId, segments);
-        await meetingStore.updateRecordingTask(meeting, recordingId, taskId, "done");
-        this.notify(meeting, recordingId, "done");
-        return;
-      }
-      if (status === "failed") {
-        const message =
-          response?.Error?.Message || response?.StatusStr || "腾讯云转写失败";
-        await meetingStore.updateRecordingTask(meeting, recordingId, taskId, "failed");
-        this.notify(meeting, recordingId, "failed", message);
-        return;
-      }
-      await meetingStore.updateRecordingTask(meeting, recordingId, taskId, status);
-      this.notify(meeting, recordingId, status);
-      await sleep(POLL_INTERVAL, signal);
+  async afterRecording(meeting, recording) {
+    if (this.closing || recording.interrupted) return;
+    if (!this.isConfigured()) {
+      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置");
+      return;
     }
-    throw new Error("已取消");
+    if (recording.realtimeEnabled) {
+      if (recording.channels === 1) return this.start(meeting, recording);
+      if (!recording.gaps?.length && recording.transcriptionStatus === "done") return;
+      if (this.plugin.controller.getPrefs().autoTranscribe && recording.gaps?.length) {
+        return this.start(meeting, recording, { gapsOnly: true });
+      }
+    } else if (this.plugin.controller.getPrefs().autoTranscribe) {
+      return this.start(meeting, recording);
+    }
   }
 
-  cancel(recordingId) {
-    this.jobs.get(recordingId)?.abort();
-    this.jobs.delete(recordingId);
-  }
-
-  /**
-   * Picking up a completed task after restart must not create a second billable
-   * task. Only tasks that already have an id are polled.
-   */
-  resumePending(meeting) {
+  async resumePending(meeting) {
     if (!meeting?.id) return;
-    const controller = this.config();
-    if (!controller.secretId || !controller.secretKey) return;
-    void meetingStore
-      .readRecordings(meeting)
-      .then(({ recordings }) => {
-        for (const recording of recordings) {
-          if (
-            recording.taskId &&
-            ["queued", "processing"].includes(recording.taskStatus) &&
-            !this.jobs.has(recording.recordingId)
-          ) {
-            const abort = new AbortController();
-            this.jobs.set(recording.recordingId, abort);
-            this.notify(meeting, recording.recordingId, recording.taskStatus);
-            void this.poll(meeting, recording.recordingId, recording.taskId, abort.signal)
-              .catch((error) => {
-                if (String(error.message) !== "已取消") {
-                  this.notify(meeting, recording.recordingId, "failed", error.message);
-                }
-              })
-              .finally(() => this.jobs.delete(recording.recordingId));
-          }
-        }
-      })
-      .catch(() => {});
+    const { recordings } = await meetingStore.readRecordings(meeting);
+    for (const recording of recordings) {
+      if (this.jobs.has(recording.recordingId)) continue;
+      if (recording.deviceId !== this.deviceId) continue;
+      const active = this.plugin.controller.snapshot?.();
+      if (active?.recordingId === recording.recordingId && this.plugin.controller.isBusy()) continue;
+      if (["recording", "processing"].includes(recording.transcriptionStatus)) {
+        await this.setState(meeting, recording.recordingId, "incomplete", "上次转写未完成，可手动重试；不会自动再次计费");
+      }
+    }
+  }
+
+  cancel(recordingId) { this.jobs.get(recordingId)?.abort(); }
+  shutdown() {
+    this.closing = true;
+    for (const job of this.jobs.values()) job.abort();
   }
 }
 

@@ -4,6 +4,8 @@ const { ipcRenderer } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 const { RecordingStore } = require("./storage.cjs");
+const { RealtimeTranscriber } = require("./realtime.cjs");
+const crypto = require("node:crypto");
 
 const channel = new URLSearchParams(location.search).get("channel");
 const CAPTURE_RATE = 16000;
@@ -11,6 +13,8 @@ const SIGNAL_TIMEOUT = 15000;
 
 let phase = "idle";
 let store = null;
+let realtime = null;
+const signRequests = new Map();
 let context = null;
 let processor = null;
 let streams = [];
@@ -35,6 +39,50 @@ function send(message) {
   ipcRenderer.send(channel, message);
 }
 
+function requestRealtimeUrl(audioChannel) {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID();
+    const timer = setTimeout(() => {
+      signRequests.delete(requestId);
+      reject(new Error("实时转写连接未能建立"));
+    }, 6000);
+    signRequests.set(requestId, { resolve, reject, timer });
+    send({ type: "realtime-sign", requestId, recordingId: store?.recordingId, audioChannel });
+  });
+}
+
+ipcRenderer.on(channel, (_event, message) => {
+  if (message?.type === "realtime-persisted") {
+    if (!store || message.recordingId !== store.recordingId) return;
+    const throughMs = Number(message.throughMs);
+    if (!Number.isFinite(throughMs) || throughMs < Number(store.meta.realtimeThroughMs || 0) ||
+        throughMs > elapsedMs() || !Array.isArray(message.gaps)) return;
+    store.meta.realtimeGaps = message.gaps;
+    store.meta.realtimeStatus = message.status;
+    store.meta.realtimeError = message.error || "";
+    store.meta.realtimeThroughMs = throughMs;
+    // The next audio append or phase change persists this acknowledgment.
+    // Do not overwrite the host's archive marker after the audio file closes.
+    return;
+  }
+  if (message?.type !== "realtime-signed") return;
+  const pending = signRequests.get(message.requestId);
+  if (!pending) return;
+  signRequests.delete(message.requestId);
+  clearTimeout(pending.timer);
+  if (message.url) pending.resolve(message.url);
+  else pending.reject(new Error("实时转写连接未能建立"));
+});
+
+function realtimeUpdate(update) {
+  if (!store) return;
+  send({ type: "realtime", recordingId: store.recordingId, throughMs: elapsedMs(), meta: {
+    recordingId: store.recordingId, startedAt: store.meta.startedAt,
+    segmentNo: store.meta.segmentNo, sampleRate: store.meta.sampleRate,
+    channels: store.meta.channels, realtimeEnabled: store.meta.realtimeEnabled,
+  }, ...update });
+}
+
 function elapsedMs() {
   return store ? (store.meta.frames / store.meta.sampleRate) * 1000 : 0;
 }
@@ -56,7 +104,19 @@ function sendState() {
 }
 
 function fail(error, { keepStore = true } = {}) {
-  errorMessage = error?.message || String(error);
+  const reasons = {
+    ENOSPC: "磁盘空间不足，录音已停止；请腾出空间后保存已录部分",
+    EACCES: "无法写入录音文件，请检查文件夹权限后保存已录部分",
+    EPERM: "无法写入录音文件，请检查文件夹权限后保存已录部分",
+    NotAllowedError: "录音权限未获允许，请在系统设置中允许麦克风和电脑声音访问后重试",
+    NotFoundError: "找不到录音设备，请连接麦克风后重试",
+    NotReadableError: "无法读取录音设备，请检查设备是否被占用后重试",
+  };
+  errorMessage = reasons[error?.code] || reasons[error?.name] ||
+    (error?.code || error?.name && error.name !== "Error"
+      ? "录音未能继续，请检查设备和可用磁盘空间；已保存的部分仍可恢复"
+      : error?.message || "录音未能继续，已保存的部分仍可恢复");
+  realtime?.abort();
   stopTracks();
   if (context) {
     void context.close().catch(() => {});
@@ -99,7 +159,7 @@ async function openStreams() {
       const system = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       if (!system.getAudioTracks().length) {
         for (const track of system.getTracks()) track.stop();
-        throw new Error("电脑声音没有音轨；线上模式不会降级为仅麦克风。请检查系统音频权限。");
+        throw new Error("无法录制电脑声音，请检查系统权限后重试。");
       }
       for (const video of system.getVideoTracks()) video.stop();
       next.push(system);
@@ -167,7 +227,7 @@ async function connect() {
   await context.resume();
   if (context.sampleRate !== CAPTURE_RATE) {
     throw new Error(
-      `当前设备无法以 ${CAPTURE_RATE} Hz 打开音频（实际 ${context.sampleRate} Hz）。请检查系统音频设备，避免录制无法直接交给腾讯云识别的文件。`,
+      "当前设备无法按会议录音要求采集声音，请更换麦克风或检查系统声音设置。",
     );
   }
   try {
@@ -200,11 +260,27 @@ async function connect() {
       meta: { ...options.meta, startedAt: new Date().toISOString() },
     });
   }
+  if (!realtime) {
+    store.meta.realtimeEnabled = Boolean(options.realtime?.enabled);
+    store.meta.realtimeGaps = [];
+    store.meta.realtimeStatus = store.meta.realtimeEnabled ? "incomplete" : "none";
+    store.meta.realtimeError = "";
+    store.meta.realtimeThroughMs = 0;
+    realtime = new RealtimeTranscriber({
+      sampleRate: store.meta.sampleRate, channels,
+      enabled: Boolean(options.realtime?.enabled), configured: Boolean(options.realtime?.configured),
+      requestUrl: requestRealtimeUrl, emit: realtimeUpdate,
+    });
+    realtime.report();
+    store.save();
+  } else {
+    realtime.resume();
+  }
   if (store.meta.channels !== channels) {
-    throw new Error("录音声道数发生变化，请结束本段后重新开始");
+    throw new Error("录音设备的声音输入发生变化，请结束本段后重新开始");
   }
   if (store.meta.sampleRate !== context.sampleRate) {
-    throw new Error("采样率发生变化，请结束本段后重新开始");
+    throw new Error("录音设备的声音设置发生变化，请结束本段后重新开始");
   }
 
   const merger = context.createChannelMerger(channels);
@@ -239,7 +315,12 @@ async function connect() {
     }
     if (!data.samples) return;
     try {
+      const audioStartMs = elapsedMs();
       store.append(data.samples, nextWallStart, [data.rms?.[0] || 0, data.rms?.[1] || 0]);
+      // Network availability never owns recording or local-save success.
+      try { realtime?.push(data.samples, audioStartMs); } catch {
+        realtime?.abort();
+      }
       processor.port.postMessage("ack");
       nextWallStart += (data.frames / context.sampleRate) * 1000;
       lastLevels = [data.rms?.[0] || 0, data.rms?.[1] || 0];
@@ -342,6 +423,8 @@ async function perform(action, nextOptions) {
       }
       options = { ...nextOptions, meta: { ...(nextOptions?.meta || {}) } };
       online = Boolean(options.online);
+      realtime?.abort();
+      realtime = null;
       store = null;
       lastLevels = [0, 0];
       lastPeaks = [0, 0];
@@ -356,9 +439,13 @@ async function perform(action, nextOptions) {
       sendState();
     } else if (action === "pause") {
       if (!["recording", "preparing"].includes(phase) || !store) return;
+      const pauseStartedAt = new Date().toISOString();
       phase = "paused";
+      lastLevels = [0, 0];
+      sendState();
       await disconnect();
-      store.addEvent({ type: "pause", elapsedMs: elapsedMs() });
+      store.addEvent({ type: "pause", elapsedMs: elapsedMs(), at: pauseStartedAt });
+      await realtime?.pause();
       store.phase("paused");
       lastLevels = [0, 0];
       sendState();
@@ -383,6 +470,7 @@ async function perform(action, nextOptions) {
       silentSystemChunks = 0;
       sendState();
       await disconnect();
+      await realtime?.pause();
       if (wasPaused) {
         phase = "paused";
         sendState();
@@ -405,6 +493,7 @@ async function perform(action, nextOptions) {
       phase = "saving";
       sendState();
       await disconnect();
+      await realtime?.finish();
       store.addEvent({ type: "stop", elapsedMs: elapsedMs() });
       store.phase("saved");
       const seconds = store.meta.frames / store.meta.sampleRate;
@@ -451,6 +540,15 @@ navigator.mediaDevices?.addEventListener("devicechange", () => {
     needsAttention = "设备列表已变化，请确认两路声音仍正常";
     sendState();
   }
+});
+
+window.addEventListener("beforeunload", () => {
+  realtime?.abort();
+  for (const pending of signRequests.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error("录音已结束"));
+  }
+  signRequests.clear();
 });
 
 send({ type: "ready" });

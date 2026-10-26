@@ -8,36 +8,41 @@ Module._load = function (name, ...args) {
   return originalLoad.call(this, name, ...args);
 };
 const store = require("../src/meeting-store");
-const tencent = require("../src/tencent");
 const { TranscriptionManager } = require("../src/transcription");
 Module._load = originalLoad;
 
-test("retry after task-id persistence failure resumes the accepted cloud task", async () => {
-  const memory = new Map();
-  global.localStorage = { getItem: key => memory.get(key), setItem: (key, value) => memory.set(key, value) };
-  const oldUpdate = store.updateRecordingTask, oldCreate = tencent.createRecTask;
-  let submissions = 0, writes = 0, persisted;
+test("restart marks interrupted local requests incomplete without submitting or changing another device", async () => {
+  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}) } });
+  const oldRead = store.readRecordings, oldUpdate = store.updateRecordingTranscription;
+  const updates = [];
   try {
-    tencent.createRecTask = async () => ({ TaskId: String(++submissions) });
-    store.updateRecordingTask = async (_meeting, _recording, taskId, status) => {
-      if (++writes === 1) throw new Error("block write failed");
-      persisted = { taskId, status };
-    };
-    const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}) } });
-    manager.config = () => ({ secretId: "synthetic", secretKey: "synthetic" });
-    manager.sourceFor = async () => ({ sourceType: 1, data: Buffer.alloc(0) });
-    const polled = [];
-    manager.poll = async (_meeting, _recording, taskId) => polled.push(taskId);
-    const recording = { recordingId: "synthetic-recording", sampleRate: 16000, channels: 1 };
-    await manager.start({ id: "meeting" }, recording);
-    assert.equal(persisted.taskId, "1");
-    await manager.start({ id: "meeting" }, recording);
-    assert.deepEqual(polled, ["1"]);
-    assert.equal(persisted.taskId, "1");
-    assert.equal(submissions, 1);
-  } finally {
-    store.updateRecordingTask = oldUpdate;
-    tencent.createRecTask = oldCreate;
-    delete global.localStorage;
-  }
+    store.readRecordings = async () => ({ recordings: [
+      { recordingId: "mine", deviceId: manager.deviceId, transcriptionStatus: "processing" },
+      { recordingId: "other", deviceId: "other-device", transcriptionStatus: "recording" },
+    ] });
+    store.updateRecordingTranscription = async (_meeting, id, patch) => updates.push({ id, status: patch.transcriptionStatus });
+    manager.start = () => assert.fail("restart must never submit paid recognition");
+    await manager.resumePending({ id: "meeting" });
+    assert.deepEqual(updates, [{ id: "mine", status: "incomplete" }]);
+  } finally { store.readRecordings = oldRead; store.updateRecordingTranscription = oldUpdate; }
+});
+
+test("post-recording policy distinguishes offline speakers, online gaps and disabled realtime", async () => {
+  const prefs = { autoTranscribe: false };
+  const manager = new TranscriptionManager({ controller: { getPrefs: () => prefs } });
+  manager.isConfigured = () => true;
+  const jobs = [];
+  manager.start = async (_meeting, recording, options) => jobs.push({ id: recording.recordingId, gapsOnly: options?.gapsOnly || false });
+  const meeting = { id: "meeting" };
+  const offline = { recordingId: "offline", channels: 1, realtimeEnabled: true };
+  const online = { recordingId: "online", channels: 2, realtimeEnabled: true, gaps: [{ channel: 1, startMs: 10, endMs: 20 }] };
+  const disabled = { recordingId: "disabled", channels: 1, realtimeEnabled: false };
+  await manager.afterRecording(meeting, offline);
+  await manager.afterRecording(meeting, online);
+  await manager.afterRecording(meeting, disabled);
+  assert.deepEqual(jobs, [{ id: "offline", gapsOnly: false }]);
+  prefs.autoTranscribe = true;
+  await manager.afterRecording(meeting, online);
+  await manager.afterRecording(meeting, disabled);
+  assert.deepEqual(jobs.slice(1), [{ id: "online", gapsOnly: true }, { id: "disabled", gapsOnly: false }]);
 });

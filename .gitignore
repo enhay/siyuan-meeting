@@ -1,2 +1,5 @@
 .scratch/
 .DS_Store
+.superpowers/
+.impeccable/
+docs/reports/*.zip

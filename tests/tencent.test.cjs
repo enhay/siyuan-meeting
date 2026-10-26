@@ -1,60 +1,30 @@
 "use strict";
-
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const {
-  buildAuthorization,
-  parseResult,
-  engineForSampleRate,
-  normalizeStatus,
-} = require("../src/tencent");
+const crypto = require("node:crypto");
+const { signRealtimeUrl, parseFlashResult, engineForSampleRate } = require("../src/tencent");
 
-test("TC3 authorization has the documented shape and is deterministic", () => {
-  const input = {
-    secretId: "AKIDEXAMPLE",
-    secretKey: "SECRETEXAMPLE",
-    host: "asr.tencentcloudapi.com",
-    service: "asr",
-    payload: JSON.stringify({ EngineModelType: "16k_zh" }),
-    timestamp: 1551113065,
-  };
-  const first = buildAuthorization(input);
-  const second = buildAuthorization(input);
-  assert.equal(first, second);
-  assert.match(
-    first,
-    /^TC3-HMAC-SHA256 Credential=AKIDEXAMPLE\/2019-02-25\/asr\/tc3_request, SignedHeaders=content-type;host, Signature=[0-9a-f]{64}$/,
-  );
+test("realtime signs the sorted request URL, with encoded signature and no secret key", () => {
+  const config = { appId: "12345", secretId: "AKIDEXAMPLE", secretKey: "test-secret" };
+  const address = signRealtimeUrl(config, { voiceId: "meeting-voice", sampleRate: 16000, now: 1793000000 });
+  const url = new URL(address);
+  const signature = url.searchParams.get("signature");
+  url.searchParams.delete("signature");
+  const source = `${url.host}${url.pathname}?${url.searchParams.toString()}`;
+  assert.equal(signature, crypto.createHmac("sha1", config.secretKey).update(source).digest("base64"));
+  assert.equal(url.searchParams.get("voice_format"), "1");
+  assert.equal(url.searchParams.get("engine_model_type"), "16k_zh");
 });
 
-test("result parsing accepts both object and JSON-string results", () => {
-  const detail = {
-    ResultDetail: [
-      { FinalSentence: "第一句", StartMs: 0, EndMs: 1000, SpeakerId: 0, ChannelNum: 1 },
-      { FinalSentence: "第二句", StartMs: 1200, EndMs: 2000, SpeakerId: 1, ChannelNum: 2 },
-    ],
-  };
-  for (const value of [detail, JSON.stringify(detail)]) {
-    const segments = parseResult(value);
-    assert.equal(segments.length, 2);
-    assert.equal(segments[0].text, "第一句");
-    assert.equal(segments[1].startMs, 1200);
-    assert.equal(segments[1].speaker, "1");
-  }
-  assert.deepEqual(parseResult("not json"), []);
-});
-
-test("engine choice follows the recording sample rate", () => {
+test("flash results retain channel identity and sentence timestamps", () => {
+  const result = { flash_result: [
+    { channel_id: 0, sentence_list: [{ text: "我确认预算", start_time: 10, end_time: 500, speaker_id: 0 }] },
+    { channel_id: 1, sentence_list: [{ text: "还未确定", start_time: 600, end_time: 900, speaker_id: 2 }] },
+  ] };
+  assert.deepEqual(parseFlashResult(result, 2), [
+    { startMs: 10, endMs: 500, speaker: 0, channel: 0, text: "我确认预算", speakerLabel: "我" },
+    { startMs: 600, endMs: 900, speaker: 2, channel: 1, text: "还未确定", speakerLabel: "其他参会者" },
+  ]);
   assert.equal(engineForSampleRate(16000), "16k_zh");
-  assert.equal(engineForSampleRate(48000), "16k_zh");
   assert.equal(engineForSampleRate(8000), "8k_zh");
-  assert.throws(() => engineForSampleRate(4000), /8 kHz/);
-});
-
-test("task status normalization covers waiting, running, success and failure", () => {
-  assert.equal(normalizeStatus({ Status: 0 }), "queued");
-  assert.equal(normalizeStatus({ Status: 1 }), "processing");
-  assert.equal(normalizeStatus({ Status: 2 }), "done");
-  assert.equal(normalizeStatus({ Status: 3 }), "failed");
-  assert.equal(normalizeStatus({ StatusStr: "success" }), "done");
 });

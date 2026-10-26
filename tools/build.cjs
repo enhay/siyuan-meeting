@@ -25,7 +25,7 @@ function collect(dir) {
 }
 
 collect("src");
-files.push("capture/storage.cjs");
+files.push("capture/storage.cjs", "capture/realtime.cjs");
 files.sort();
 
 const moduleTable = files

@@ -111,6 +111,10 @@ module.exports = class MeetingPlugin extends Plugin {
       const target = detail?.event?.target;
       const protyle = detail?.protyle;
       if (!target || !protyle) return;
+      const link = target.closest?.('[data-type="a"], a');
+      const href = link?.getAttribute("data-href") || link?.getAttribute("href");
+      if (href !== "siyuan://plugins/siyuan-meeting/seek") return;
+      detail.event.preventDefault?.();
       const rootId = protyle.block?.rootID || protyle.protyle?.block?.rootID;
       const blockElement = target.closest?.("[data-node-id]");
       const blockId = blockElement?.getAttribute("data-node-id");
@@ -292,7 +296,7 @@ module.exports = class MeetingPlugin extends Plugin {
       this.eventBus.off("click-editorcontent", this.onClickEditorContent);
     }
     try {
-      this.transcription?.jobs?.forEach((controller) => controller.abort());
+      this.transcription?.shutdown();
     } catch {
       // jobs may already be gone
     }
