@@ -69,3 +69,30 @@ test("a lost realtime acknowledgement becomes an audio-relative gap while pause 
     for (const name of ["setTimeout", "clearTimeout", "setInterval", "clearInterval"]) global[name] = originals[name];
   }
 });
+
+test("cleanup after a confirmed realtime finish preserves completion", async () => {
+  const reports = [];
+  class Socket {
+    constructor() {
+      this.readyState = 1;
+      this.bufferedAmount = 0;
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ code: 0 }) }));
+    }
+    send(data) {
+      const result = typeof data === "string"
+        ? { code: 0, final: 1 }
+        : { code: 0, result: { slice_type: 2, index: 0, start_time: 0, end_time: 200, voice_text_str: "确认内容" } };
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify(result) }));
+    }
+    close() { this.readyState = 3; }
+  }
+  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 2,
+    enabled: true, configured: true, requestUrl: async () => "wss://synthetic",
+    WebSocket: Socket, emit: report => reports.push(report) });
+  realtime.push(new Float32Array(3200 * 2), 0);
+  await realtime.finish();
+  assert.equal(reports.at(-1).status, "done");
+  realtime.abort();
+  assert.equal(reports.at(-1).status, "done");
+  assert.deepEqual(reports.at(-1).gaps, []);
+});

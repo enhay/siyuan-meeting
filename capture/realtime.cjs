@@ -228,6 +228,7 @@ class RealtimeTranscriber {
     this.gaps = [];
     this.error = enabled && !configured ? "尚未配置腾讯云，实时转写没有进行；录音仍在保存，可在会议设置中配置。" : "";
     this.lastReport = 0;
+    this.finished = false;
     this.resume();
   }
 
@@ -299,10 +300,13 @@ class RealtimeTranscriber {
 
   async finish() {
     await this.pause();
+    this.finished = true;
     this.report([], true);
   }
 
   abort() {
+    if (this.finished) return;
+    this.finished = true;
     if (this.enabled) {
       this.configured = false;
       this.error = this.error || "实时转写已中断，录音仍可保存；结束后可以补齐转写。";
