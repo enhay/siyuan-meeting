@@ -5,6 +5,7 @@ const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
 const ai = require("./ai");
+const { findTranscriptMatches, playbackSegments } = require("./transcript-view");
 const {
   formatDuration,
   formatClock,
@@ -330,14 +331,33 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
+    <div class="meeting-source-info">
+      <span data-field="source"></span>
+      <span class="meeting-levels" data-field="levels" hidden>
+        <label>麦克风 <meter min="0" max="1" value="0" data-field="mic-level" aria-label="麦克风音量"></meter></label>
+        <label data-field="speaker-level-label">电脑声音 <meter min="0" max="1" value="0" data-field="speaker-level" aria-label="电脑声音音量"></meter></label>
+      </span>
+    </div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
     <div class="meeting-body">
       <div class="meeting-editor" data-field="editor" role="tabpanel" id="${viewId}-notes-panel" aria-labelledby="${viewId}-notes-tab"></div>
       <section class="meeting-view meeting-view--summary" data-view-content="summary" role="tabpanel" id="${viewId}-summary-panel" aria-labelledby="${viewId}-summary-tab" hidden></section>
       <section class="meeting-view meeting-view--transcript" data-view-content="transcript" role="tabpanel" id="${viewId}-transcript-panel" aria-labelledby="${viewId}-transcript-tab" hidden>
-        <div class="meeting-recordings-section" data-section="recordings"></div>
-        <div class="meeting-transcript-section" data-section="transcript"></div>
+        <div class="meeting-transcript-tools">
+          <label class="meeting-search meeting-transcript-search">${icon("iconMeetingSearch")}<input type="search" data-field="transcript-search" aria-label="搜索转写内容" placeholder="搜索转写内容"></label>
+          <span class="meeting-search-count" data-field="search-count" role="status" aria-live="polite"></span>
+          <button type="button" class="meeting-icon-btn" data-action="previous-match" aria-label="上一处匹配" title="上一处（Shift+Enter）">↑</button>
+          <button type="button" class="meeting-icon-btn" data-action="next-match" aria-label="下一处匹配" title="下一处（Enter）">↓</button>
+          <button type="button" class="meeting-btn" data-action="follow" aria-pressed="true">跟随播放</button>
+          <button type="button" class="meeting-btn" data-action="edit-transcript">编辑转写</button>
+        </div>
+        <div class="meeting-player-section" data-section="player"></div>
+        <div class="meeting-transcript-reader" data-field="transcript-reader" tabindex="0" aria-label="转写阅读区">
+          <div class="meeting-recordings-section" data-section="recordings"></div>
+          <div class="meeting-transcript-section" data-section="transcript"></div>
+        </div>
+        <div class="meeting-transcript-native-editor" data-field="transcript-editor" hidden></div>
       </section>
     </div>`;
   tab.element.replaceChildren(root);
@@ -363,6 +383,7 @@ function mountMeetingTab(plugin, tab) {
     summaryGenerating: false,
     summarySaving: false,
     summaryStream: "",
+    summaryDraft: null,
     summaryError: "",
     summaryNotice: "",
     summaryOnlyNotes: false,
@@ -371,6 +392,16 @@ function mountMeetingTab(plugin, tab) {
     material: null,
     materialDirty: true,
     selectedRecordingId: "",
+    transcriptEditing: false,
+    transcriptProtyle: null,
+    transcriptQuery: "",
+    transcriptMatches: [],
+    activeMatch: -1,
+    followPlayback: true,
+    followLive: true,
+    transcriptRows: [],
+    playbackKey: "",
+    transcriptScrollTop: 0,
     peaks: null,
     playbackRate: 1,
     audio: new Audio(),
@@ -436,13 +467,11 @@ function mountMeetingTab(plugin, tab) {
       recording.transcriptionStatus = event.status;
       recording.transcriptionError = event.error || "";
     }
-    const recordingsSection = state.root.querySelector('[data-section="recordings"]');
-    if (recordingsSection) renderRecordings(state, recordingsSection);
     state.materialDirty = true;
     void Promise.all([refreshRecordings(state), refreshTranscript(state)]).then(() => {
       if (resolveMeetingView(state) === "transcript") renderTranscriptView(state);
       if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
-    }).catch(() => {});
+    }).catch((error) => showMessage(`刷新转写失败：${error.message}`, 5000, "error"));
   });
   onCleanup(unsubscribeTranscription);
 
@@ -483,6 +512,7 @@ function mountMeetingTab(plugin, tab) {
     }
     if (cmd === "transactions") {
       markMaterialDirty();
+      refreshNativeTranscript();
     }
   };
   plugin.eventBus.on("ws-main", onWs);
@@ -518,6 +548,61 @@ function mountMeetingTab(plugin, tab) {
   action("pause").addEventListener("click", () => void togglePause(state));
   action("stop").addEventListener("click", () => void stopMeeting(state));
   action("more").addEventListener("click", () => openMoreMenu(state));
+  const reader = field("transcript-reader");
+  reader.addEventListener("scroll", () => {
+    if (reader.scrollTop < state.transcriptScrollTop - 1) {
+      if (isLiveTranscript(state)) state.followLive = false;
+      else state.followPlayback = false;
+      renderTranscriptTools(state);
+    }
+    state.transcriptScrollTop = reader.scrollTop;
+  });
+  field("transcript-search").addEventListener("input", (event) => {
+    state.transcriptQuery = event.target.value;
+    state.activeMatch = -1;
+    if (state.transcriptQuery.trim()) state.followPlayback = state.followLive = false;
+    renderTranscript(state);
+    navigateTranscriptMatch(state, 0);
+  });
+  field("transcript-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      navigateTranscriptMatch(state, event.shiftKey ? -1 : 1);
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.target.value = state.transcriptQuery = "";
+      renderTranscript(state);
+      reader.focus();
+    }
+  });
+  action("previous-match").onclick = () => navigateTranscriptMatch(state, -1);
+  action("next-match").onclick = () => navigateTranscriptMatch(state, 1);
+  action("follow").onclick = () => {
+    const live = isLiveTranscript(state);
+    if (live) state.followLive = !state.followLive;
+    else state.followPlayback = !state.followPlayback;
+    state.playbackKey = "";
+    renderTranscriptTools(state);
+    if (live && state.followLive) scrollTranscriptTo(state, reader.scrollHeight);
+    else updatePlaybackTranscript(state);
+  };
+  action("edit-transcript").onclick = () => void toggleTranscriptEditor(state);
+  root.addEventListener("keydown", (event) => {
+    if (resolveMeetingView(state) !== "transcript" || state.transcriptEditing) return;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      event.stopPropagation();
+      field("transcript-search").focus();
+      field("transcript-search").select();
+    } else if (event.code === "Space" && !event.ctrlKey && !event.metaKey && !event.altKey &&
+        !event.target.closest('button, input, select, textarea, summary, a, [contenteditable="true"]') &&
+        !isLiveTranscript(state) && state.audio.getAttribute("src")) {
+      event.preventDefault();
+      if (state.audio.paused) void playAudio(state);
+      else state.audio.pause();
+    }
+  });
   action("open-doc").addEventListener("click", () => {
     void api.openDoc(plugin.app, docId).catch((error) => showMessage(error.message, 5000, "error"));
   });
@@ -539,6 +624,7 @@ function mountMeetingTab(plugin, tab) {
   state.audio.addEventListener("play", () => updatePlayer(state));
   state.audio.addEventListener("pause", () => updatePlayer(state));
   state.audio.addEventListener("ended", () => updatePlayer(state));
+  state.audio.addEventListener("loadedmetadata", () => updatePlayer(state));
   state.audio.addEventListener("error", () => {
     if (state.audio.getAttribute("src")) {
       showMessage("无法播放这段录音，资源可能尚未同步到本机", 5000, "error");
@@ -554,6 +640,11 @@ function mountMeetingTab(plugin, tab) {
       void safeRefreshMaterial(state);
     }
   }, 500);
+  const refreshNativeTranscript = debounce(() => {
+    if (state.destroyed || !state.meeting || state.transcriptEditing) return;
+    void refreshTranscript(state).catch((error) => showMessage(`刷新转写失败：${error.message}`, 5000, "error"));
+  }, 500);
+  onCleanup(() => refreshNativeTranscript.cancel());
 
   void initialize();
 
@@ -617,6 +708,7 @@ function mountMeetingTab(plugin, tab) {
       }
     });
     clearTimeout(state.searchTimer);
+    state.waveObserver?.disconnect();
     try {
       state.audio.pause();
       state.audio.src = "";
@@ -627,6 +719,7 @@ function mountMeetingTab(plugin, tab) {
     clearTimeout(state.streamTimer);
     try {
       state.summaryProtyle?.destroy();
+      state.transcriptProtyle?.destroy();
       state.protyle?.destroy();
     } catch {
       // editor may already be destroyed by SiYuan
@@ -756,6 +849,16 @@ function renderChrome(state, field, action) {
   );
   stopButton.disabled = phase === "saving";
 
+  const online = live ? snapshot.online : state.mode === "online";
+  const deviceId = live ? snapshot.deviceId : state.micDeviceId;
+  const deviceName = state.devices.find((device) => device.deviceId === deviceId)?.label || "系统默认麦克风";
+  rootSetText(field("source"), `${online ? "麦克风 + 电脑声音" : "仅麦克风"} · ${deviceName}`);
+  field("source").title = field("source").textContent;
+  field("levels").hidden = !live || !["recording", "paused"].includes(phase);
+  field("speaker-level-label").hidden = !online;
+  field("mic-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[0] || 0)) * 6) : 0;
+  field("speaker-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[1] || 0)) * 6) : 0;
+  renderViewStatus(state);
   renderHint(state, field);
   renderBanners(state);
 }
@@ -1009,27 +1112,41 @@ function renderTranscriptView(state) {
   const transcript = state.root.querySelector('[data-section="transcript"]');
   const active = state.snapshot.meeting?.id === state.docId &&
     ["preparing", "recording", "paused", "saving"].includes(state.snapshot.phase);
+  const player = state.root.querySelector('[data-section="player"]');
+  if (player) player.hidden = active || state.transcriptEditing;
   if (recordings) {
     recordings.hidden = active;
     if (!active) renderRecordings(state, recordings);
     else state.audio.pause();
   }
   if (transcript) renderTranscript(state, transcript);
+  renderTranscriptTools(state);
+  state.transcriptProtyle?.resize?.();
 }
 
 async function applySeekToMeeting(state, seek) {
+  if (isLiveTranscript(state)) {
+    showMessage("本场录音结束保存后可回听", 3000);
+    return;
+  }
   if (!state.recordings.some((item) => item.recordingId === seek.recordingId)) {
     await refreshRecordings(state);
   }
   if (!state.recordings.some((item) => item.recordingId === seek.recordingId)) return;
+  if (state.transcriptEditing) {
+    state.transcriptEditing = false;
+    state.materialDirty = true;
+  }
   state.selectedRecordingId = seek.recordingId;
   state.ui.view = "transcript";
   saveUiState(state.docId, state.ui);
   renderMeetingView(state);
   const play = () => {
+    if (state.destroyed || state.audio.dataset.recordingId !== seek.recordingId || isLiveTranscript(state)) return;
     try {
       state.audio.currentTime = Math.max(0, Number(seek.startMs || 0) / 1000);
-      void state.audio.play();
+      state.playbackKey = "";
+      void playAudio(state);
     } catch {
       // the asset may not be playable on this device
     }
@@ -1058,14 +1175,16 @@ async function refreshRecordings(state) {
     state.selectedRecordingId = recordings[recordings.length - 1]?.recordingId || "";
   }
   const section = state.root.querySelector('[data-section="recordings"]');
-  if (section) renderRecordings(state, section);
+  if (section && !isLiveTranscript(state) && !state.transcriptEditing) renderRecordings(state, section);
+  renderViewStatus(state);
 }
 
 async function refreshTranscript(state) {
   const { segments } = await meetingStore.readTranscript(state.meeting);
   state.transcript = segments;
   const section = state.root.querySelector('[data-section="transcript"]');
-  if (section) renderTranscript(state, section);
+  if (section && resolveMeetingView(state) === "transcript" && !state.transcriptEditing) renderTranscript(state, section);
+  renderViewStatus(state);
 }
 
 async function refreshSummaries(state) {
@@ -1145,6 +1264,10 @@ async function refreshAfterSave(state) {
 
 function renderRecordings(state, section = state.root.querySelector('[data-section="recordings"]')) {
   if (!section) return;
+  const playerSection = state.root.querySelector('[data-section="player"]');
+  state.waveObserver?.disconnect();
+  state.player = null;
+  playerSection?.replaceChildren();
   section.replaceChildren();
   const header = h("div", "meeting-view-header");
   header.innerHTML = `<span class="meeting-view-title">录音段</span><span class="meeting-view-count">${state.recordings.length}</span>`;
@@ -1169,16 +1292,16 @@ function renderRecordings(state, section = state.root.querySelector('[data-secti
   section.append(list);
 
   const selected = state.recordings.find((item) => item.recordingId === state.selectedRecordingId);
-  if (selected) section.prepend(playerView(state, selected));
+  if (selected && playerSection && !isLiveTranscript(state) && !state.transcriptEditing) playerSection.append(playerView(state, selected));
 }
 
 function segmentCard(state, recording) {
   const card = h("div", "meeting-segment");
   card.dataset.recordingId = recording.recordingId;
-  card.tabIndex = 0;
-  card.setAttribute("role", "button");
   card.classList.toggle("is-selected", recording.recordingId === state.selectedRecordingId);
-  card.setAttribute("aria-pressed", String(recording.recordingId === state.selectedRecordingId));
+  const selectButton = h("button", "meeting-segment__select");
+  selectButton.type = "button";
+  selectButton.setAttribute("aria-pressed", String(recording.recordingId === state.selectedRecordingId));
 
   const status = transcriptStatus(
     recording,
@@ -1186,7 +1309,7 @@ function segmentCard(state, recording) {
     state.plugin.transcription,
     state.docId,
   );
-  const top = h("div", "meeting-segment__top");
+  const top = h("span", "meeting-segment__top");
   const title = h("span", "meeting-segment__title", recordingTitle(recording.index));
   const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status));
   const liveStatus = state.plugin.transcription.statusFor(state.docId, recording.recordingId);
@@ -1194,7 +1317,7 @@ function segmentCard(state, recording) {
   top.append(title, badge);
 
   const meta = h(
-    "div",
+    "span",
     "meeting-segment__meta",
     `${recordingRange(recording)} · ${formatDuration(Number(recording.seconds || 0) * 1000, {
       alwaysHours: Number(recording.seconds || 0) >= 3600,
@@ -1230,18 +1353,12 @@ function segmentCard(state, recording) {
     actions.append(redo);
   }
   actions.append(button);
-  card.append(top, meta, actions);
-  const select = () => {
+  selectButton.append(top, meta);
+  card.append(selectButton, actions);
+  selectButton.onclick = () => {
     state.selectedRecordingId = recording.recordingId;
     renderRecordings(state);
   };
-  card.addEventListener("click", select);
-  card.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      select();
-    }
-  });
   return card;
 }
 
@@ -1298,7 +1415,7 @@ function playerView(state, recording) {
   play.innerHTML = icon("iconMeetingPlay");
   play.onclick = () => {
     if (!state.audio.getAttribute("src")) return;
-    if (state.audio.paused) void state.audio.play();
+    if (state.audio.paused) void playAudio(state);
     else state.audio.pause();
   };
   row.append(play);
@@ -1306,8 +1423,22 @@ function playerView(state, recording) {
   const wave = h("div", "meeting-player__wave");
   const canvas = document.createElement("canvas");
   canvas.className = "meeting-waveform";
-  canvas.setAttribute("aria-label", "录音波形，可点击定位");
+  canvas.setAttribute("aria-hidden", "true");
   wave.append(canvas);
+  const seek = document.createElement("input");
+  seek.type = "range";
+  seek.className = "meeting-player__seek";
+  seek.min = "0";
+  seek.max = String(Math.max(1, Number(recording.seconds || 0) * 1000));
+  seek.step = "100";
+  seek.value = "0";
+  seek.setAttribute("aria-label", "回听位置");
+  seek.oninput = () => {
+    state.audio.currentTime = Number(seek.value) / 1000;
+    state.playbackKey = "";
+    updatePlayer(state);
+  };
+  wave.append(seek);
   const marks = h("div", "meeting-wave-marks");
   wave.append(marks);
   row.append(wave);
@@ -1327,7 +1458,7 @@ function playerView(state, recording) {
   meta.append(times, rate);
   row.append(meta);
   wrapper.append(row);
-  state.player = { play, canvas, times, marks, recording };
+  state.player = { play, canvas, times, marks, recording, seek };
   wrapper.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     openPlayerMenu(state, event, recording);
@@ -1337,6 +1468,12 @@ function playerView(state, recording) {
     layoutWaveform(state);
     updatePlayer(state);
   });
+  state.waveObserver = new ResizeObserver(() => {
+    if (state.player?.canvas !== canvas) return;
+    layoutWaveform(state);
+    updatePlayer(state);
+  });
+  state.waveObserver.observe(wave);
   return wrapper;
 }
 
@@ -1385,16 +1522,6 @@ function layoutWaveform(state) {
   canvas.height = Math.round(height * dpr);
   canvas.style.height = `${height}px`;
   drawWaveform(state, 0);
-
-  canvas.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
-    const rect = canvas.getBoundingClientRect();
-    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    if (Number.isFinite(state.audio.duration) && state.audio.duration > 0) {
-      state.audio.currentTime = fraction * state.audio.duration;
-      updatePlayer(state);
-    }
-  });
 
   const marks = player.marks;
   marks.replaceChildren();
@@ -1469,11 +1596,147 @@ function updatePlayer(state) {
   const playing = !state.audio.paused;
   player.play.innerHTML = playing ? icon("iconMeetingPause") : icon("iconMeetingPlay");
   player.play.setAttribute("aria-label", playing ? "暂停录音" : "播放录音");
+  player.seek.disabled = !state.audio.getAttribute("src") || total <= 0;
+  player.seek.max = String(Math.max(1, total * 1000));
+  player.seek.value = String(current * 1000);
+  player.seek.setAttribute("aria-valuetext", `${formatDuration(current * 1000)} / ${formatDuration(total * 1000)}`);
   drawWaveform(state, progress);
+  updatePlaybackTranscript(state);
+}
+
+async function playAudio(state) {
+  try {
+    await state.audio.play();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    if (!state.destroyed) showMessage("无法播放这段录音，请确认资源已同步到本机", 5000, "error");
+  }
+}
+
+function isLiveTranscript(state) {
+  return state.snapshot.meeting?.id === state.docId &&
+    ["preparing", "recording", "paused", "saving"].includes(state.snapshot.phase);
+}
+
+function renderViewStatus(state) {
+  const button = state.root.querySelector('[data-view="transcript"]');
+  if (!button) return;
+  const current = state.recordings.find((recording) => recording.recordingId === state.snapshot.recordingId);
+  const status = isLiveTranscript(state)
+    ? state.snapshot.realtimeNotice || current?.transcriptionError ? "failed"
+      : !state.snapshot.realtimeEnabled || !state.snapshot.realtimeConfigured ? "off"
+      : state.snapshot.phase === "paused" ? "paused" : "recording"
+    : state.recordings.some((recording) => ["failed", "incomplete"].includes(recording.transcriptionStatus) || recording.gaps?.length)
+      ? "failed"
+      : state.recordings.some((recording) => ["uploading", "processing"].includes(recording.transcriptionStatus))
+        ? "processing" : current?.transcriptionStatus || "idle";
+  button.dataset.state = status;
+  button.title = status === "failed" ? "转写需要查看" : status === "processing" ? "正在转写" : status === "recording" ? "实时转写" : status === "off" ? "本段录音未进行实时转写" : status === "paused" ? "实时转写已暂停" : "转写";
+  button.setAttribute("aria-label", button.title);
+}
+
+function renderTranscriptTools(state) {
+  const editing = state.transcriptEditing;
+  const live = isLiveTranscript(state);
+  const find = (name) => state.root.querySelector(`[data-action="${name}"]`);
+  state.root.querySelector('[data-field="transcript-reader"]').hidden = editing;
+  state.root.querySelector('[data-field="transcript-editor"]').hidden = !editing;
+  state.root.querySelector('[data-section="player"]').hidden = editing || live;
+  state.root.querySelector('[data-field="transcript-search"]').disabled = editing;
+  const edit = find("edit-transcript");
+  edit.textContent = editing ? "完成编辑" : "编辑转写";
+  edit.setAttribute("aria-pressed", String(editing));
+  edit.disabled = !editing && !state.transcript.length;
+  const count = state.transcriptMatches.length;
+  const search = Boolean(state.transcriptQuery.trim());
+  state.root.querySelector('[data-field="search-count"]').textContent = search ? `${count ? state.activeMatch + 1 : 0} / ${count}` : "";
+  find("previous-match").disabled = find("next-match").disabled = editing || !count;
+  const follow = find("follow");
+  follow.textContent = live ? "跟随最新" : "跟随播放";
+  follow.setAttribute("aria-pressed", String(live ? state.followLive : state.followPlayback));
+  follow.disabled = editing || search;
+  follow.title = search ? "清空搜索后可跟随" : live ? "向上阅读会暂停跟随，点击可恢复" : "播放时跟随当前段落，向上阅读会暂停跟随";
+}
+
+function scrollTranscriptTo(state, top) {
+  const reader = state.root.querySelector('[data-field="transcript-reader"]');
+  reader.scrollTop = Math.max(0, top);
+  state.transcriptScrollTop = reader.scrollTop;
+}
+
+function revealTranscriptNode(state, node) {
+  const reader = state.root.querySelector('[data-field="transcript-reader"]');
+  const rect = node.getBoundingClientRect();
+  const bounds = reader.getBoundingClientRect();
+  if (rect.top >= bounds.top && rect.bottom <= bounds.bottom) return;
+  scrollTranscriptTo(state, reader.scrollTop + rect.top - bounds.top - Math.max(0, (reader.clientHeight - rect.height) / 2));
+}
+
+function updatePlaybackTranscript(state) {
+  const active = new Set(playbackSegments(state.transcript, state.audio.dataset.recordingId, state.audio.currentTime * 1000).map((segment) => segment.blockId));
+  for (const row of state.transcriptRows) row.node.dataset.playbackCurrent = String(active.has(row.segment.blockId));
+  const key = Array.from(active).join(":");
+  if (key !== state.playbackKey && !state.audio.paused && state.followPlayback && !state.transcriptQuery.trim() &&
+      resolveMeetingView(state) === "transcript" && !state.transcriptEditing) {
+    const row = state.transcriptRows.find((item) => active.has(item.segment.blockId));
+    if (row) revealTranscriptNode(state, row.node);
+  }
+  state.playbackKey = key;
+}
+
+function navigateTranscriptMatch(state, direction) {
+  const matches = state.transcriptMatches;
+  if (!matches.length) return;
+  state.activeMatch = (Math.max(0, state.activeMatch) + direction + matches.length) % matches.length;
+  const marks = state.root.querySelectorAll("[data-search-match]");
+  marks.forEach((mark, index) => { mark.dataset.searchCurrent = String(index === state.activeMatch); });
+  const node = marks[state.activeMatch];
+  if (node) revealTranscriptNode(state, node);
+  renderTranscriptTools(state);
+}
+
+async function toggleTranscriptEditor(state) {
+  const button = state.root.querySelector('[data-action="edit-transcript"]');
+  button.disabled = true;
+  try {
+    if (state.transcriptEditing) {
+      await refreshTranscript(state);
+      state.transcriptEditing = false;
+      state.materialDirty = true;
+    } else {
+      const blockId = await meetingStore.ensureTranscriptDoc(state.meeting);
+      if (state.destroyed) return;
+      state.audio.pause();
+      state.transcriptEditing = true;
+      if (!state.transcriptProtyle) {
+        state.transcriptProtyle = new Protyle(state.plugin.app, state.root.querySelector('[data-field="transcript-editor"]'), {
+          blockId, mode: "wysiwyg", action: ["cb-get-all"],
+          render: { background: false, title: false, gutter: true, breadcrumb: false, scroll: true },
+        });
+      }
+    }
+    renderTranscriptView(state);
+  } catch (error) {
+    showMessage(`切换转写编辑失败：${error.message}`, 5000, "error");
+  } finally {
+    renderTranscriptTools(state);
+  }
 }
 
 function renderTranscript(state, section = state.root.querySelector('[data-section="transcript"]')) {
   if (!section) return;
+  const reader = state.root.querySelector('[data-field="transcript-reader"]');
+  const scrollTop = reader.scrollTop;
+  const previousMatch = state.transcriptMatches[state.activeMatch];
+  state.transcriptMatches = findTranscriptMatches(state.transcript, state.transcriptQuery);
+  const matchesByBlock = new Map();
+  state.transcriptMatches.forEach((match, index) => {
+    if (!matchesByBlock.has(match.blockId)) matchesByBlock.set(match.blockId, []);
+    matchesByBlock.get(match.blockId).push({ ...match, index });
+  });
+  const retained = previousMatch ? state.transcriptMatches.findIndex((match) => match.blockId === previousMatch.blockId && match.start === previousMatch.start) : -1;
+  state.activeMatch = state.transcriptMatches.length ? Math.max(0, retained) : -1;
+  state.transcriptRows = [];
   section.replaceChildren();
   const header = h("div", "meeting-view-header");
   header.innerHTML = `<span class="meeting-view-title">转写</span><span class="meeting-view-count">${state.transcript.length}</span>`;
@@ -1482,8 +1745,24 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   header.append(open);
   section.append(header);
 
+  const live = isLiveTranscript(state);
+  if (live) {
+    const phase = state.snapshot.phase;
+    const hasCurrentText = state.transcript.some((segment) => segment.recordingId === state.snapshot.recordingId);
+    const message = phase === "preparing" ? "正在准备录音，开始后将在这里显示实时转写。"
+      : phase === "saving" ? "正在保存录音与已有转写，完成后可以回听。"
+      : !state.snapshot.realtimeEnabled ? "本段录音未开启实时转写，结束保存后可以手动转写。"
+      : !state.snapshot.realtimeConfigured ? "本段录音开始时尚未配置转写服务，录音仍在保存。可在会议设置中配置，下一段录音开始生效。"
+      : state.snapshot.realtimeNotice ? state.snapshot.realtimeNotice
+      : phase === "paused" ? "录音已暂停，继续后会接着显示实时转写。"
+      : hasCurrentText ? "正在实时转写，已确认的句子会持续显示。" : "已开启实时转写，正在等待第一句话。";
+    const notice = h("div", "meeting-transcript-notice", message);
+    notice.setAttribute("role", "status");
+    section.append(notice);
+  }
+
   const pending = state.recordings.filter((recording) =>
-    ["processing"].includes(
+    ["uploading", "processing"].includes(
       transcriptStatus(recording, state.transcript, state.plugin.transcription, state.docId),
     ),
   );
@@ -1522,7 +1801,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     section.append(notice);
   }
 
-  if (!state.plugin.transcription.isConfigured()) {
+  if (!live && !state.plugin.transcription.isConfigured()) {
     const notice = h("div", "meeting-transcript-notice");
     notice.append(h("span", "", "尚未配置腾讯云转写服务，录音仍可正常保存。"));
     const settings = h("button", "meeting-link", "会议设置");
@@ -1539,13 +1818,14 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   }
 
   if (!state.transcript.length) {
-    section.append(
+    if (!live) section.append(
       emptyState(
         "iconMeetingTranscript",
         "尚无转写",
         "选择上方录音段并点击「转写」，使用已配置的腾讯云服务。",
       ),
     );
+    renderTranscriptTools(state);
     return;
   }
 
@@ -1563,6 +1843,8 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     group.append(title);
     for (const segment of segments) {
       const row = h("div", "meeting-transcript-row");
+      row.dataset.blockId = segment.blockId;
+      state.transcriptRows.push({ segment, node: row });
       const seek = h(
         "button",
         "meeting-transcript-time",
@@ -1570,38 +1852,90 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       );
       seek.type = "button";
       const actual = actualTimeFor(recording, segment.startMs);
-      seek.title = `${actual ? `${actual} · ` : ""}点击回听`;
+      seek.disabled = live || !recording.assetPath;
+      seek.title = live ? "结束保存后可回听" : `${actual ? `${actual} · ` : ""}点击回听`;
       seek.onclick = () => {
-        state.selectedRecordingId = recording.recordingId;
-        state.ui.view = "transcript";
-        saveUiState(state.docId, state.ui);
-        renderMeetingView(state);
-        const audio = state.audio;
-        const play = () => {
-          audio.currentTime = Math.max(0, Number(segment.startMs || 0) / 1000);
-          void audio.play();
-        };
-        if (audio.readyState > 0) play();
-        else audio.addEventListener("loadedmetadata", play, { once: true });
+        void applySeekToMeeting(state, { recordingId: recording.recordingId, startMs: segment.startMs });
       };
       const body = h("div", "meeting-transcript-body");
       const speaker = h(
-        "span",
+        "button",
         `meeting-transcript-speaker speaker-${Number(segment.speaker || 0) % SPEAKER_COLORS}`,
         segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
       );
-      const text = h("span", "meeting-transcript-text", segment.text);
+      speaker.type = "button";
+      speaker.disabled = live || Boolean(segment.notice);
+      speaker.title = "重命名本场会议中的同名标签";
+      speaker.onclick = () => renameTranscriptSpeaker(state, segment);
+      const text = h("span", "meeting-transcript-text");
+      let offset = 0;
+      for (const match of matchesByBlock.get(segment.blockId) || []) {
+        text.append(document.createTextNode(segment.text.slice(offset, match.start)));
+        const mark = h("mark", "", segment.text.slice(match.start, match.end));
+        mark.dataset.searchMatch = String(match.index);
+        mark.dataset.searchCurrent = String(match.index === state.activeMatch);
+        text.append(mark);
+        offset = match.end;
+      }
+      text.append(document.createTextNode(segment.text.slice(offset)));
       body.append(speaker, text);
       row.append(seek, body);
       group.append(row);
     }
     section.append(group);
   }
+  state.playbackKey = "";
+  renderTranscriptTools(state);
+  if (!state.transcriptEditing) {
+    if (live && state.followLive && !state.transcriptQuery.trim()) scrollTranscriptTo(state, reader.scrollHeight);
+    else scrollTranscriptTo(state, scrollTop);
+    updatePlaybackTranscript(state);
+  }
+}
+
+function renameTranscriptSpeaker(state, segment) {
+  const label = segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`;
+  const count = state.transcript.filter((item) => !item.notice && item.speakerLabel === label).length;
+  const dialog = new Dialog({
+    title: "重命名说话人", width: "440px",
+    content: `<div class="b3-dialog__content meeting-rename-speaker">
+      <p>修改本场会议中所有「${escapeHtml(label)}」标签，共 ${count} 处。请确认这些标签属于你要修改的说话人。</p>
+      <label>新的名称 <input class="b3-text-field" aria-label="新的说话人名称" value="${escapeHtml(label)}"></label>
+      <p data-field="error" role="alert"></p>
+      <div class="meeting-confirm__actions"><button type="button" class="b3-button b3-button--cancel">取消</button><button type="button" class="b3-button" data-action="save">保存名称</button></div>
+    </div>`,
+  });
+  const input = dialog.element.querySelector("input");
+  const save = dialog.element.querySelector('[data-action="save"]');
+  dialog.element.querySelector(".b3-button--cancel").onclick = () => dialog.destroy();
+  const submit = async () => {
+    if (save.disabled) return;
+    save.disabled = true;
+    try {
+      await meetingStore.renameTranscriptSpeaker(state.meeting, label, input.value);
+      state.materialDirty = true;
+      await refreshTranscript(state);
+      dialog.destroy();
+    } catch (error) {
+      dialog.element.querySelector('[data-field="error"]').textContent = error.message;
+      await refreshTranscript(state).catch(() => {});
+      save.disabled = false;
+    }
+  };
+  save.onclick = () => void submit();
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); void submit(); }
+  });
+  input.focus();
+  input.select();
 }
 
 function renderSummary(state) {
   const section = state.root.querySelector('[data-view-content="summary"]');
   if (!section) return;
+  const summaryTab = state.root.querySelector('[data-view="summary"]');
+  summaryTab.dataset.state = state.summaryError ? "failed" : state.summaryGenerating || state.summarySaving ? "processing" : "idle";
+  summaryTab.setAttribute("aria-label", state.summaryError ? "纪要需要查看" : state.summarySaving ? "正在保存纪要" : state.summaryGenerating ? "正在生成纪要" : "纪要");
   // Keep the native editor alive through material refreshes; replacing it
   // while typing would lose focus and pending edits.
   state.summaryEditorElement?.remove();
@@ -1610,7 +1944,7 @@ function renderSummary(state) {
   header.innerHTML = `<span class="meeting-view-title">纪要</span>`;
   section.append(header);
 
-  if (state.summaryGenerating) {
+  if (state.summaryGenerating || state.summarySaving) {
     renderSummaryStreaming(state, section);
     return;
   }
@@ -1618,16 +1952,31 @@ function renderSummary(state) {
   if (state.summaryError) {
     const error = h("div", "meeting-summary-state");
     error.innerHTML = `${icon("iconMeetingWarning", "meeting-summary-state__icon")}
-      <p class="meeting-summary-state__title">纪要生成失败</p>
+      <p class="meeting-summary-state__title">${state.summaryDraft ? "纪要尚未保存完成" : "纪要生成失败"}</p>
       <p class="meeting-summary-state__text">${escapeHtml(state.summaryError)}</p>`;
-    const retry = h("button", "meeting-btn", "重试");
-    retry.onclick = () => void generateSummary(state, {});
+    error.setAttribute("role", "alert");
+    const retry = h("button", "meeting-btn", state.summaryDraft ? "重试保存" : "重新生成");
+    retry.onclick = () => void (state.summaryDraft ? retrySummarySave(state) : generateSummary(state));
     error.append(retry);
-    appendSummaryScope(state, error);
-    const settings = h("button", "meeting-link", "打开思源 AI 设置");
-    settings.onclick = () => openSetting(state.plugin.app);
-    error.append(settings);
+    if (state.summaryDraft) {
+      const copy = h("button", "meeting-btn", "复制生成结果");
+      copy.onclick = () => void copySummaryDraft(state);
+      const check = h("button", "meeting-link", "查看纪要文档");
+      check.onclick = () => openChildDoc(state, "summary");
+      error.append(copy, check, h("p", "meeting-summary-state__text", "本页保留了本次生成结果。重试保存不会再次调用 AI，也不会覆盖之后的人工修改。"));
+    }
+    if (!state.summaryDraft) {
+      appendSummaryScope(state, error);
+      const settings = h("button", "meeting-link", "打开思源 AI 设置");
+      settings.onclick = () => openSetting(state.plugin.app);
+      error.append(settings);
+    }
     section.append(error);
+    if (state.summaryDraft) {
+      const draft = h("div", "meeting-summary-content");
+      draft.innerHTML = safeMarkdown(state.summaryDraft.markdown);
+      section.append(draft);
+    }
     return;
   }
 
@@ -1874,7 +2223,7 @@ function renderSummaryStreaming(state, section) {
 }
 
 async function generateSummary(state) {
-  if (state.summaryGenerating) return;
+  if (state.summaryGenerating || state.summarySaving) return;
   if (!state.meeting?.isMeeting) {
     state.summaryError = "这篇文档不是会议文档，无法生成纪要";
     renderSummary(state);
@@ -1952,22 +2301,10 @@ async function generateSummary(state) {
       },
     });
     if (abort.signal.aborted) throw new Error("已取消生成");
+    state.summaryDraft = { markdown: text, sources, generatedAt, expectedFingerprint, receipt: {} };
     state.summarySaving = true;
     renderSummary(state);
-    const saved = await meetingStore.saveSummary(state.meeting, {
-      markdown: text,
-      sources,
-      generatedAt,
-      expectedFingerprint,
-    });
-    state.summaries = await meetingStore.readSummaries(state.meeting);
-    if (!state.summaries.some((item) => item.id === saved.docId)) {
-      state.summaries.push({ id: saved.docId, generatedAt, sources, fingerprint: saved.fingerprint });
-    }
-    state.summaryDocId = saved.docId;
-    state.summaryContent = saved.content;
-    state.summaryNotice = saved.replaced ? "已替换纪要" : "";
-    state.summaryStream = "";
+    await saveSummaryDraft(state);
   } catch (error) {
     if (state.summarySaving) {
       state.summaryError = error.message;
@@ -1981,6 +2318,42 @@ async function generateSummary(state) {
     state.summarySaving = false;
     state.summaryAbort = null;
     renderSummary(state);
+  }
+}
+
+async function saveSummaryDraft(state) {
+  const draft = state.summaryDraft;
+  const saved = await meetingStore.saveSummary(state.meeting, draft);
+  state.summaries = [{ id: saved.docId, generatedAt: draft.generatedAt, sources: draft.sources, fingerprint: saved.fingerprint }];
+  state.summaryDocId = saved.docId;
+  state.summaryContent = saved.content;
+  state.summaryNotice = saved.replaced ? "已替换纪要" : "纪要已保存";
+  state.summaryStream = "";
+  state.summaryDraft = null;
+}
+
+async function retrySummarySave(state) {
+  if (!state.summaryDraft || state.summarySaving || state.summaryGenerating) return;
+  state.summarySaving = true;
+  state.summaryError = "";
+  state.summaryStream = state.summaryDraft.markdown;
+  renderSummary(state);
+  try {
+    await saveSummaryDraft(state);
+  } catch (error) {
+    state.summaryError = error.message;
+  } finally {
+    state.summarySaving = false;
+    renderSummary(state);
+  }
+}
+
+async function copySummaryDraft(state) {
+  try {
+    await navigator.clipboard.writeText(state.summaryDraft.markdown);
+    showMessage("生成结果已复制", 3000);
+  } catch {
+    showMessage("未能复制，请在下方选中生成结果后复制", 5000, "error");
   }
 }
 

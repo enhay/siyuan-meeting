@@ -89,6 +89,8 @@ class MeetingController {
       needsAttention: "",
       notice: "",
       realtimeNotice: "",
+      realtimeEnabled: false,
+      realtimeConfigured: false,
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -186,8 +188,10 @@ class MeetingController {
     } catch {
       // private mode or storage disabled
     }
-    if (patch.mode) this.state.online = patch.mode === "online";
-    if (typeof patch.deviceId === "string") this.state.deviceId = patch.deviceId;
+    if (!this.isBusy()) {
+      if (patch.mode) this.state.online = patch.mode === "online";
+      if (typeof patch.deviceId === "string") this.state.deviceId = patch.deviceId;
+    }
     this.emit();
   }
 
@@ -361,6 +365,8 @@ class MeetingController {
     this.state.meeting = meeting;
     this.state.recordingId = crypto.randomUUID();
     this.state.realtimeNotice = "";
+    this.state.realtimeEnabled = this.prefs.realtimeTranscription !== false;
+    this.state.realtimeConfigured = this.plugin.transcription.isConfigured();
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -393,8 +399,8 @@ class MeetingController {
           online: Boolean(online),
           deviceId,
           realtime: {
-            enabled: this.prefs.realtimeTranscription !== false,
-            configured: this.plugin.transcription.isConfigured(),
+            enabled: this.state.realtimeEnabled,
+            configured: this.state.realtimeConfigured,
           },
           meta: {
             recordingId: this.state.recordingId,

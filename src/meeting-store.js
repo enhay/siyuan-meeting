@@ -335,6 +335,36 @@ async function readTranscript(meeting) {
   return { transcriptId: transcript.id, segments };
 }
 
+async function renameTranscriptSpeaker(meeting, oldLabel, nextLabel) {
+  const label = String(nextLabel || "").trim();
+  if (!label || /[\r\n：:]/u.test(label)) throw new Error("名称不能为空，也不能包含换行或冒号");
+  if (label === oldLabel) return;
+  const transcript = await findChild(meeting.id, "transcript");
+  if (!transcript) throw new Error("还没有转写内容");
+  const blocks = (await api.listBlocksWithAttr(transcript.id, ATTR.transcriptLabel))
+    .filter((block) => block.attrs[ATTR.transcriptLabel] === oldLabel && block.attrs[ATTR.transcriptNotice] !== "1");
+  for (const block of blocks) {
+    const source = await api.post("/api/block/getBlockKramdown", { id: block.id });
+    const attrs = await api.getBlockAttrs(block.id);
+    if (attrs[ATTR.transcriptLabel] !== oldLabel || attrs[ATTR.transcriptMeeting] !== meeting.id) {
+      throw new Error("转写在改名期间发生了修改，已停止改名。请检查后重试。");
+    }
+    const raw = String(source.kramdown || "");
+    const prefix = /^(\[[^\n]+?\]\(siyuan:\/\/plugins\/siyuan-meeting\/seek\)\s+)([^\n]*?)([：:])/u;
+    const match = prefix.exec(raw);
+    if (!match || match[2] !== escapeMarkdownText(oldLabel)) {
+      throw new Error("部分说话人标签已在文档中修改，请在编辑转写中检查后再改名。");
+    }
+    // Rewrite just the label and its attribute in the native source. Rebuilding
+    // the paragraph from plain text would erase manual emphasis and links.
+    const data = raw.replace(prefix, (_all, stamp, _old, colon) => `${stamp}${escapeMarkdownText(label)}${colon}`)
+      .replace(/(\n\{:[^\n]*custom-transcript-label=")[^"]*(")/u, (_all, before, after) => `${before}${escapeIal(label)}${after}`);
+    const current = await api.post("/api/block/getBlockKramdown", { id: block.id });
+    if (current.kramdown !== raw) throw new Error("转写在改名期间发生了修改，已停止改名。请检查后重试。");
+    await api.post("/api/block/updateBlock", { id: block.id, dataType: "markdown", data });
+  }
+}
+
 function escapeMarkdownText(value) {
   return String(value || "")
     .replaceAll("&", "&amp;")
@@ -473,7 +503,7 @@ async function readSummaryContent(docId) {
   return api.getDocMarkdown(docId);
 }
 
-async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "" }) {
+async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {} }) {
   const content = String(markdown || "").trim();
   if (!content) throw new Error("纪要内容为空，未写入文档");
   const summaries = await readSummaries(meeting);
@@ -483,10 +513,26 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
   const latest = summaries[0] || null;
   const currentContent = latest ? (await readSummaryContent(latest.id)).trim() : "";
   const currentHash = latest ? sha256(currentContent) : "";
+  const metadata = {
+    [ATTR.child]: "summary",
+    [ATTR.parent]: meeting.id,
+    [ATTR.summaryGeneratedAt]: generatedAt,
+    [ATTR.summarySources]: sources,
+  };
+  // A metadata write or the subsequent UI refresh can fail after the content
+  // was saved. A retry must not append that content a second time.
+  if (receipt.docId) {
+    if (latest?.id !== receipt.docId || currentHash !== receipt.fingerprint) {
+      throw new Error("纪要已被修改，未覆盖原文。请检查纪要文档，或复制本次生成结果。");
+    }
+    await api.setBlockAttrs(latest.id, { ...metadata, [ATTR.summaryFingerprint]: currentHash });
+    return { ...receipt, content: currentContent, sources, generatedAt };
+  }
   // Native editors remain usable while the model is generating. Do not erase
   // edits made after the user confirmed the replacement.
-  if ((latest && currentHash !== expectedFingerprint) || (!latest && expectedFingerprint)) {
-    throw new Error("纪要在生成期间发生了修改，本次结果未覆盖原文。请确认现有内容后重新生成。");
+  const hasCurrentContent = Boolean(currentContent.replace(/\u200d/g, "").trim());
+  if ((latest && currentHash !== expectedFingerprint && (hasCurrentContent || expectedFingerprint)) || (!latest && expectedFingerprint)) {
+    throw new Error("纪要已发生修改或已有部分结果，未覆盖原文。请检查纪要文档，或复制本次生成结果。");
   }
 
   let target;
@@ -516,11 +562,9 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
   }
   const persisted = (await readSummaryContent(target.id)).trim();
   const fingerprint = sha256(persisted);
+  Object.assign(receipt, { docId: target.id, replaced, fingerprint });
   await api.setBlockAttrs(target.id, {
-    [ATTR.child]: "summary",
-    [ATTR.parent]: meeting.id,
-    [ATTR.summaryGeneratedAt]: generatedAt,
-    [ATTR.summarySources]: sources,
+    ...metadata,
     [ATTR.summaryFingerprint]: fingerprint,
   });
 
@@ -553,6 +597,7 @@ module.exports = {
   appendRecording,
   readRecordings,
   readTranscript,
+  renameTranscriptSpeaker,
   writeTranscript,
   transcriptFingerprint,
   updateRecordingTranscription,
