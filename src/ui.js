@@ -359,6 +359,10 @@ function mountMeetingTab(plugin, tab) {
             <span class="meeting-live__dot"></span>
             <span class="meeting-timer" data-field="timer" role="timer">00:00</span>
             <span class="meeting-live__state" data-field="live-state"></span>
+            <span class="meeting-levels" data-field="levels" hidden>
+              <meter class="meeting-level meeting-level--mic" min="0" max="1" value="0" data-field="mic-level" title="麦克风" aria-label="麦克风音量"></meter>
+              <meter class="meeting-level meeting-level--speaker" min="0" max="1" value="0" data-field="speaker-level" title="电脑声音" aria-label="电脑声音音量"></meter>
+            </span>
           </span>
           <button class="meeting-btn meeting-btn--outline" data-action="pause">
             <span class="meeting-btn__icon" data-field="pause-icon"></span>
@@ -371,12 +375,8 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
-    <div class="meeting-source-info">
+    <div class="meeting-source-info" data-field="source-info">
       <span data-field="source"></span>
-      <span class="meeting-levels" data-field="levels" hidden>
-        <label>麦克风 <meter min="0" max="1" value="0" data-field="mic-level" aria-label="麦克风音量"></meter></label>
-        <label data-field="speaker-level-label">电脑声音 <meter min="0" max="1" value="0" data-field="speaker-level" aria-label="电脑声音音量"></meter></label>
-      </span>
     </div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
@@ -904,8 +904,11 @@ function renderChrome(state, field, action) {
   const deviceName = state.devices.find((device) => device.deviceId === deviceId)?.label || "系统默认麦克风";
   rootSetText(field("source"), `${online ? "麦克风 + 电脑声音" : "仅麦克风"} · ${deviceName}`);
   field("source").title = field("source").textContent;
-  field("levels").hidden = !live || !["recording", "paused"].includes(phase);
-  field("speaker-level-label").hidden = !online;
+  const capturing = live && ["recording", "paused"].includes(phase);
+  field("levels").hidden = !capturing;
+  field("levels").title = field("source").textContent;
+  field("source-info").hidden = capturing;
+  field("speaker-level").hidden = !online;
   field("mic-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[0] || 0)) * 6) : 0;
   field("speaker-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[1] || 0)) * 6) : 0;
   renderViewStatus(state);
@@ -927,15 +930,9 @@ function renderHint(state, field) {
     hint = `已有会议在录音：${snapshot.meeting?.title || "其他会议"}`;
   } else if (phase === "preparing" && activeHere) {
     hint = "正在打开麦克风并检查真实信号。线上模式不会在电脑声音失败时悄悄降级。";
-  } else if (phase === "recording") {
-    const online = activeHere ? snapshot.online : state.mode === "online";
-    hint = snapshot.notice
-      ? snapshot.notice
-      : online
-        ? "正在录制麦克风与电脑声音。请使用耳机，避免外放串音。"
-        : "正在录制麦克风。切换视图或关闭会议页不会结束录音。";
-  } else if (phase === "paused") {
-    hint = snapshot.notice || "已暂停采集，计时冻结。继续后仍属于同一段录音。";
+  } else if (phase === "recording" || phase === "paused") {
+    // The control bar already shows the live state; only surface notices.
+    hint = snapshot.notice || "";
   } else if (phase === "saving") {
     hint = "正在处理最后一批数据并归档，请勿重复结束。";
   } else if (phase === "error" && activeHere) {
@@ -1384,6 +1381,11 @@ function segmentCard(state, recording) {
   if (recording.interrupted) {
     meta.append(h("span", "meeting-segment__notice", "中断后恢复"));
   }
+  if (recording.gaps?.length && state.plugin.transcription.isConfigured()) {
+    const gaps = h("span", "meeting-segment__notice", "部分未转写");
+    gaps.title = `尚未转写：${recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、")}`;
+    meta.append(gaps);
+  }
   if (!recording.assetPath) {
     const warning = h("span", "meeting-segment__warn", "未归档");
     meta.append(warning);
@@ -1830,60 +1832,61 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     notice.append(settings);
     section.append(notice);
   } else if (live) {
-    const phase = state.snapshot.phase;
-    const hasCurrentText = state.transcript.some((segment) => segment.recordingId === state.snapshot.recordingId);
-    const message = phase === "preparing" ? "正在准备录音，开始后将在这里显示实时转写。"
-      : phase === "saving" ? "正在保存录音与已有转写，完成后可以回听。"
-      : !state.snapshot.realtimeEnabled ? "本段录音未开启实时转写，结束保存后可以手动转写。"
+    // Normal live progress is carried by the tab state and the trailing
+    // listening line; only conditions the user should know about get a row.
+    const message = !state.snapshot.realtimeEnabled ? "本段录音未开启实时转写，结束保存后可以手动转写。"
       : !state.snapshot.realtimeConfigured ? "本段录音开始时尚未配置转写服务，录音仍在保存。可在会议设置中配置，下一段录音开始生效。"
-      : state.snapshot.realtimeNotice ? state.snapshot.realtimeNotice
-      : phase === "paused" ? "录音已暂停，继续后会接着显示实时转写。"
-      : hasCurrentText ? "正在实时转写，已确认的句子会持续显示。" : "已开启实时转写，正在等待第一句话。";
-    const notice = h("div", "meeting-inline-notice", message);
-    section.append(notice);
+      : state.snapshot.realtimeNotice || "";
+    if (message) section.append(h("div", "meeting-inline-notice", message));
   }
+  const listening = live && configured && state.snapshot.phase === "recording" &&
+    state.snapshot.realtimeEnabled && state.snapshot.realtimeConfigured && !state.snapshot.realtimeNotice;
+  const listeningLine = () => h("p", "meeting-transcript-listening meeting-pulse", "正在聆听…");
 
-  let processing = false;
+  const activeTasks = [];
   for (const recording of state.recordings) {
     const task = transcriptionTask(state, recording);
     const active = task.running || task.status === "processing";
     const failed = ["failed", "incomplete"].includes(task.status) && task.error;
-    const completed = task.status === "done" && recording.recordingId === state.selectedRecordingId;
-    if (!active && !failed && !completed) continue;
-    processing ||= active;
+    if (active) activeTasks.push({ recording, task });
+    if (!failed || active) continue;
     const feedback = h("div", "meeting-transcription-feedback");
     feedback.dataset.recordingId = recording.recordingId;
     feedback.dataset.state = task.status;
     feedback.dataset.phase = task.phase;
-    feedback.setAttribute("aria-busy", String(active));
-    feedback.setAttribute("role", failed ? "alert" : "status");
-    if (active) feedback.append(h("span", "meeting-spinner"));
+    feedback.setAttribute("role", "alert");
     feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
-    if (active && task.progress?.partCount > 1) {
-      const progress = document.createElement("progress");
-      progress.max = task.progress.partCount;
-      progress.value = task.progress.completedParts;
-      progress.setAttribute("aria-label", "已识别的录音部分");
-      feedback.append(progress);
-    }
-    if (failed && !active) {
-      const retry = h("button", "meeting-link", "重试转写");
-      retry.onclick = () => void startTranscription(state, recording, {
-        gapsOnly: Boolean(recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length),
-      });
-      feedback.append(retry);
-    }
+    const retry = h("button", "meeting-link", "重试转写");
+    retry.onclick = () => void startTranscription(state, recording, {
+      gapsOnly: Boolean(recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length),
+    });
+    feedback.append(retry);
     section.append(feedback);
   }
-
-  for (const recording of state.recordings) {
-    if (recording.gaps?.length) {
-      const ranges = recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、");
-      if (configured) section.append(h("p", "meeting-inline-notice", `${recordingTitle(recording.index)} 尚未转写：${ranges}`));
+  const processing = activeTasks.length > 0;
+  if (processing) {
+    const status = h("span", "meeting-view-status");
+    status.dataset.state = "processing";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-busy", "true");
+    const text = activeTasks.length === 1
+      ? `${recordingTitle(activeTasks[0].recording.index)} · ${transcriptionTaskText(activeTasks[0].task)}`
+      : `正在转写 ${activeTasks.length} 段录音`;
+    status.append(h("span", "meeting-view-status__text", text));
+    status.title = activeTasks.map(({ recording, task }) => `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`).join("\n");
+    const parts = activeTasks.reduce((sum, { task }) => sum + (task.progress?.partCount > 1 ? task.progress.partCount : 0), 0);
+    if (parts) {
+      const progress = document.createElement("progress");
+      progress.max = parts;
+      progress.value = activeTasks.reduce((sum, { task }) => sum + (task.progress?.partCount > 1 ? task.progress.completedParts : 0), 0);
+      progress.setAttribute("aria-label", "已识别的录音部分");
+      status.append(progress);
     }
+    header.insertBefore(status, open);
   }
 
   if (!state.transcript.length) {
+    if (listening) section.append(listeningLine());
     if (!live) section.append(
       emptyState(
         "iconMeetingTranscript",
@@ -1950,6 +1953,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     }
     section.append(group);
   }
+  if (listening) section.append(listeningLine());
   state.playbackKey = "";
   renderTranscriptTools(state);
   if (!state.transcriptEditing) {
