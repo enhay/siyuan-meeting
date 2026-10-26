@@ -348,6 +348,8 @@ function mountMeetingTab(plugin, tab) {
             <span class="meeting-device__chevron">${icon("iconMeetingChevron")}</span>
           </span>
           <button class="meeting-icon-btn meeting-device__refresh" data-action="refresh-devices" aria-label="刷新麦克风列表" title="刷新麦克风列表">${icon("iconMeetingRefresh")}</button>
+          <p class="meeting-recording-options__note" data-field="source"></p>
+          <p class="meeting-recording-options__note" data-field="online-tip">线上录音会同时录下电脑播放的声音，请使用耳机，避免外放声音被重复录入。</p>
           </div></details>
           <button class="meeting-btn meeting-btn--start" data-action="start">
             ${RECORDING_ICON}
@@ -375,9 +377,6 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
-    <div class="meeting-source-info" data-field="source-info">
-      <span data-field="source"></span>
-    </div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
     <div class="meeting-body">
@@ -874,7 +873,7 @@ function renderChrome(state, field, action) {
   const timer = field("timer");
   if (timer) timer.textContent = formatDuration(snapshot.elapsedMs || 0);
   field("live-state").textContent =
-    phase === "paused" ? "已暂停" : phase === "saving" ? "正在保存" : phase === "error" ? "需要处理" : "";
+    phase === "preparing" ? "正在准备" : phase === "paused" ? "已暂停" : phase === "saving" ? "正在保存" : phase === "error" ? "需要处理" : "";
 
   const pauseButton = action("pause");
   const stopButton = action("stop");
@@ -903,13 +902,11 @@ function renderChrome(state, field, action) {
   const deviceId = live ? snapshot.deviceId : state.micDeviceId;
   const deviceName = state.devices.find((device) => device.deviceId === deviceId)?.label || "系统默认麦克风";
   rootSetText(field("source"), `${online ? "麦克风 + 电脑声音" : "仅麦克风"} · ${deviceName}`);
-  field("source").title = field("source").textContent;
   const capturing = live && ["recording", "paused"].includes(phase);
   field("levels").hidden = !capturing;
   field("levels").title = field("source").textContent;
-  // Once a meeting has recordings, the device lives in 录音设置 and the 补录 tooltip.
-  field("source-info").hidden = capturing || state.recordings.length > 0;
-  if (!anotherActive) action("start").title += ` · ${field("source").textContent}`;
+  field("online-tip").hidden = !online;
+  if (!anotherActive) action("start").title += ` · ${field("source").textContent}${online ? "。请使用耳机，避免外放声音被重复录入" : ""}`;
   field("speaker-level").hidden = !online;
   field("mic-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[0] || 0)) * 6) : 0;
   field("speaker-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[1] || 0)) * 6) : 0;
@@ -930,24 +927,13 @@ function renderHint(state, field) {
   let hint = "";
   if (anotherActive) {
     hint = `已有会议在录音：${snapshot.meeting?.title || "其他会议"}`;
-  } else if (phase === "preparing" && activeHere) {
-    hint = "正在打开麦克风并检查真实信号。线上模式不会在电脑声音失败时悄悄降级。";
   } else if (phase === "recording" || phase === "paused") {
-    // The control bar already shows the live state; only surface notices.
+    // The control bar carries routine state; this row is for notices only.
     hint = snapshot.notice || "";
-  } else if (phase === "saving") {
-    hint = "正在处理最后一批数据并归档，请勿重复结束。";
   } else if (phase === "error" && activeHere) {
     hint = snapshot.saveFailed
       ? "音频仍保存在本机，归档失败不会丢弃已录内容。"
       : "采集需要处理；已写入的部分不会丢弃。";
-  } else if (phase === "saved" || state.recordings.length) {
-    // The recordings and the 补录 button already describe this meeting.
-    hint = "";
-  } else if ((activeHere ? snapshot.online : state.mode === "online")) {
-    hint = "线上模式会同时录麦克风和电脑播放的声音。请使用耳机，避免外放声音被麦克风重复录入。";
-  } else {
-    hint = "点击开始后才采集声音。计时只累计实际录音时间，不含暂停。";
   }
   rootSetText(field("hint"), hint);
 }
@@ -1320,19 +1306,10 @@ function renderRecordings(state, section = state.root.querySelector('[data-secti
   state.player = null;
   playerSection?.replaceChildren();
   section.replaceChildren();
-  const header = h("div", "meeting-view-header");
-  header.innerHTML = `<span class="meeting-view-title">录音段</span><span class="meeting-view-count">${state.recordings.length}</span>`;
-  section.append(header);
 
   if (!state.recordings.length) {
+    // The transcript empty state below speaks for an empty meeting.
     state.player = null;
-    section.append(
-      emptyState(
-        "iconMeetingMic",
-        "还没有录音",
-        "点击「开始录音」后，这段录音会出现在这里，并持续写入本机。",
-      ),
-    );
     return;
   }
 
@@ -1367,10 +1344,11 @@ function segmentCard(state, recording) {
   const meta = h(
     "span",
     "meeting-segment__meta",
-    `${recordingRange(recording)} · ${formatDuration(Number(recording.seconds || 0) * 1000, {
+    formatDuration(Number(recording.seconds || 0) * 1000, {
       alwaysHours: Number(recording.seconds || 0) >= 3600,
-    })}`,
+    }),
   );
+  selectButton.title = `${recordingTitle(recording.index)} · ${recordingRange(recording)}`;
   if (recording.interrupted) {
     meta.append(h("span", "meeting-segment__notice", "中断后恢复"));
   }
@@ -1385,7 +1363,9 @@ function segmentCard(state, recording) {
   }
 
   const actions = h("div", "meeting-segment__actions");
-  const button = h("button", "meeting-btn meeting-btn--small", "");
+  // Only the selected recording offers transcription actions; the row stays a quiet picker.
+  actions.hidden = recording.recordingId !== state.selectedRecordingId;
+  const button = h("button", "meeting-link", "");
   const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
   const fillGaps = recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length > 0;
@@ -1884,7 +1864,9 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
       emptyState(
         "iconMeetingTranscript",
         "尚无转写",
-        processing ? "完成后，转写文字会显示在这里。" : configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
+        processing ? "完成后，转写文字会显示在这里。"
+          : !state.recordings.length ? "开始录音后，转写文字会显示在这里。"
+          : configured ? "选择录音后点击「转写」。" : "录音保存后，可在这里回听和转写。",
       ),
     );
     renderTranscriptTools(state);
