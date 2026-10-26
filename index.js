@@ -1029,7 +1029,7 @@ class MeetingController {
     }
   }
 
-  recordCaptureFailure({ stage, error, consoleErrors, ipcTrace = [] }) {
+  recordCaptureFailure({ stage, error, consoleErrors }) {
     // The capture page never holds credentials, so its startup errors are safe to keep.
     const diagnostic = {
       at: new Date().toISOString(), stage, platform: process.platform,
@@ -1039,7 +1039,6 @@ class MeetingController {
       errno: Number.isInteger(error?.errno) ? error.errno : null,
       message: String(error?.message || "").slice(0, 300),
       consoleErrors: consoleErrors.slice(0, 5).map((text) => String(text).slice(0, 300)),
-      ipcTrace,
     };
     try {
       fs.mkdirSync(this.storageRoot, { recursive: true, mode: 0o700 });
@@ -1641,22 +1640,10 @@ class MeetingController {
         this.captureReady.then(() => true),
         new Promise((resolve) => setTimeout(() => resolve(false), 6000)),
       ]);
-      if (!ready) {
-        // TODO(zhaohua): diagnostic for the intermittent missing "ready" on macOS;
-        // tells "script never ran" apart from "message never reached this window".
-        stage = "ready-probe";
-        const scriptRan = await capture.webContents.executeJavaScript("typeof window.meetingStart === 'function'", true).catch(() => null);
-        if (scriptRan) await capture.webContents.executeJavaScript("send({ type: 'ready' })", true).catch(() => {});
-        const resent = await Promise.race([
-          this.captureReady.then(() => true),
-          new Promise((resolve) => setTimeout(() => resolve(false), 1500)),
-        ]);
-        this.recordCaptureFailure({ stage, error: new Error(`ready missing; scriptRan=${scriptRan}; resent=${resent}`), consoleErrors, ipcTrace: this.ipcTrace });
-        if (!resent) throw new Error("capture page did not report ready within 6s");
-      }
+      if (!ready) throw new Error("capture page did not report ready within 6s");
       capture.webContents.off("console-message", onConsole);
     } catch (error) {
-      if (stage !== "ready-probe") this.recordCaptureFailure({ stage, error, consoleErrors, ipcTrace: this.ipcTrace });
+      this.recordCaptureFailure({ stage, error, consoleErrors });
       this.capture = null;
       this.captureReady = null;
       if (!capture.isDestroyed()) capture.destroy();
@@ -1686,8 +1673,6 @@ class MeetingController {
         return undefined;
       }
     };
-    // TODO(zhaohua): drop once the intermittent missing "ready" on macOS is explained.
-    this.ipcTrace = [...(this.ipcTrace || []).slice(-9), { type: String(message?.type || "").slice(0, 30), senderId: senderId ?? null, captureId: idOf(this.capture) ?? null }];
     if (senderId && senderId === idOf(this.capture)) {
       if (message?.type === "realtime-sign") {
         const reply = { type: "realtime-signed", requestId: message.requestId };
