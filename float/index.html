@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self';">
+  <title>会议录音</title>
+  <link rel="stylesheet" href="float.css">
+</head>
+<body>
+  <div id="envelope" class="envelope" data-phase="recording">
+    <div id="handle" class="hover-handle" aria-hidden="true"><div class="handle-dots"></div></div>
+    <div id="surface" class="surface">
+      <div class="controls" id="controls">
+        <button class="control stop" id="stop" type="button" aria-label="结束录音" title="结束录音">
+          <span class="stop-content" id="stop-content" aria-hidden="true"></span>
+          <span class="stop-label" aria-hidden="true">
+            <svg class="stop-icon" width="9" height="9" viewBox="0 0 9 9"><rect x="0.5" y="0.5" width="8" height="8" rx="1.5" fill="currentColor"/></svg>
+            <span>结束</span>
+          </span>
+        </button>
+        <div class="timer" id="timer" role="timer">00:00</div>
+        <button class="control" id="pause" type="button" aria-label="暂停录音" title="暂停录音"></button>
+        <button class="control" id="open" type="button" aria-label="打开会议" title="打开会议"></button>
+      </div>
+      <div class="message" id="message" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+  <script src="float.js"></script>
+</body>
+</html>

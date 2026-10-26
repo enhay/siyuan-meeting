@@ -1,0 +1,4 @@
+:root { color-scheme: light dark; font: 13px system-ui, sans-serif; }
+body { margin: 0; }
+main { padding: 20px; max-width: 520px; color: #333; }
+@media (prefers-color-scheme: dark) { main { color: #ddd; } }

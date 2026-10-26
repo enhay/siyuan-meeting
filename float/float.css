@@ -1,0 +1,210 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; scrollbar-width: none; -ms-overflow-style: none; }
+::-webkit-scrollbar { width: 0; height: 0; display: none; }
+body {
+  font-family: var(--b3-font-family, system-ui, -apple-system, "Segoe UI", sans-serif);
+  color: var(--bar-content, rgb(31, 28, 26));
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.envelope {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: 4px;
+  top: 25px;
+  border-radius: 14px;
+  background: var(--bar-surface);
+  box-shadow: inset 0 0 0 0.5px var(--bar-stroke);
+  overflow: hidden;
+  transition: top 120ms ease, background-color 120ms ease;
+}
+body.is-hovered .envelope {
+  top: 4px;
+  background: var(--bar-envelope-surface);
+}
+
+.hover-handle {
+  display: none;
+  height: 12px;
+  padding-top: 7px;
+  box-sizing: content-box;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  -webkit-app-region: drag;
+}
+body.is-hovered .hover-handle { display: flex; }
+.handle-dots {
+  height: 100%;
+  width: calc(100% - 16px);
+  background-image: radial-gradient(circle, var(--bar-handle) 0.8px, transparent 0.9px);
+  background-size: 5px 7px;
+  -webkit-app-region: drag;
+}
+
+.surface {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 38px;
+  padding: 0 4px;
+}
+.controls > * { -webkit-app-region: no-drag; }
+
+/* Anarlog compact StopControl: 62x30, radius 10, control fill at rest,
+   18% red on hover, DancingSticks normally and Square + label on hover. */
+.control {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  cursor: default;
+  -webkit-app-region: no-drag;
+}
+.control:hover { background: var(--bar-control-fill); }
+.control:focus-visible { outline: 2px solid var(--bar-accent); outline-offset: -2px; }
+.control svg { display: block; }
+
+.stop {
+  width: 62px;
+  flex: 0 0 62px;
+  border-radius: 10px;
+  background: var(--bar-control-fill);
+  color: var(--bar-accent);
+  overflow: hidden;
+}
+.stop:hover { background: rgba(255, 51, 77, 0.18); }
+.stop-content {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.stop-label {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--bar-accent);
+  white-space: nowrap;
+}
+.stop-label .stop-icon { flex: 0 0 auto; }
+.stop:hover .stop-content { display: none; }
+.stop:hover .stop-label { display: inline-flex; }
+
+.timer {
+  min-width: 62px;
+  padding: 0 2px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+body[data-phase="paused"] .timer { opacity: 0.6; }
+
+.sticks {
+  width: 26px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  transform-origin: center;
+}
+.sticks .stick-slot {
+  width: 3px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sticks .stick {
+  width: 3px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--bar-accent);
+  transform-origin: center;
+  animation: dancing-stick 1s ease-in-out infinite;
+}
+.sticks.is-flat {
+  width: 26px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sticks.is-flat .flat-line {
+  width: 26px;
+  height: 1px;
+  border-radius: 999px;
+  background: var(--bar-accent);
+}
+.sticks.is-flat.is-paused .flat-line { background: var(--bar-content); }
+.warning {
+  width: 20px;
+  height: 20px;
+  color: var(--bar-error);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.warning svg { width: 20px; height: 20px; }
+
+.message {
+  display: none;
+  width: 100%;
+  height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+body.is-saving .controls,
+body.is-saved .controls,
+body.is-save-failed .controls { display: none; }
+body.is-saving .message,
+body.is-saved .message,
+body.is-save-failed .message { display: flex; }
+body.is-saved .message { color: var(--bar-content); }
+body.is-save-failed .message { color: var(--bar-error); }
+.message button {
+  -webkit-app-region: no-drag;
+  border: 0;
+  border-radius: 8px;
+  background: var(--bar-control-fill);
+  color: inherit;
+  font: inherit;
+  padding: 3px 8px;
+  cursor: default;
+}
+.message button:hover { background: var(--bar-control-fill-strong); }
+
+@keyframes dancing-stick { 0%, 100% { transform: scaleY(0.2); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .sticks .stick { animation: none; transform: scaleY(0.75); }
+}

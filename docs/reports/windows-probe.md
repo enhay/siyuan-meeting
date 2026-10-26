@@ -1,10 +1,14 @@
 # Windows 录音验证
 
+> 本文件记录 Delivery 1 的最小验证插件。完整会议页、浮条、转写与纪要界面见 [使用说明](使用说明.md)，插件入口已改为 `index.js` + `src/`、`capture/`、`float/`；`probe/` 仅保留为历史验证代码。
+
 这是 Delivery 1 的最小验证插件，不是完整会议产品。当前只验 Windows；macOS 按本轮用户决定暂不处理。会议文档、转写、纪要及正式归档需在真实采集验证通过后继续。
 
-## 运行
+## 运行（历史验证）
 
-无需安装依赖。使用 `node --run check` 与 `node --run test` 检查代码。将 `index.js`、`plugin.json`、`probe/` 与本说明（保留 `docs/reports/windows-probe.md` 路径）放在**空白测试空间**的 `data/plugins/siyuan-meeting/`，在思源插件设置中启用。右上角话筒菜单打开验证窗口；打开窗口不会自动录音。
+以下步骤只记录当时的最小 probe 入口；当前插件入口为 `index.js` + `src/`、`capture/`、`float/`，请按 [使用说明](使用说明.md) 安装，不要再只复制 `probe/`。
+
+无需安装依赖。使用 `node --run check` 与 `node --run test` 检查代码。将当时的 `index.js`、`plugin.json`、`probe/` 与本说明（保留 `docs/reports/windows-probe.md` 路径）放在**空白测试空间**的 `data/plugins/siyuan-meeting/`，在思源插件设置中启用。右上角话筒菜单打开验证窗口；打开窗口不会自动录音。
 
 本轮测试空间：`C:\code\github\siyuan-meeting\.scratch\workspace`，独立端口 `16808`。不操作日常工作空间。
 
