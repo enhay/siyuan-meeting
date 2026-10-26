@@ -58,6 +58,25 @@ class MeetingController {
     }
   }
 
+  recordCaptureFailure({ stage, error, consoleErrors }) {
+    // The capture page never holds credentials, so its startup errors are safe to keep.
+    const diagnostic = {
+      at: new Date().toISOString(), stage, platform: process.platform,
+      electron: process.versions.electron || "",
+      errorName: String(error?.name || "Error").slice(0, 40),
+      code: String(error?.code || "").slice(0, 60),
+      errno: Number.isInteger(error?.errno) ? error.errno : null,
+      message: String(error?.message || "").slice(0, 300),
+      consoleErrors: consoleErrors.slice(0, 5).map((text) => String(text).slice(0, 300)),
+    };
+    try {
+      fs.mkdirSync(this.storageRoot, { recursive: true, mode: 0o700 });
+      fs.appendFileSync(path.join(this.storageRoot, "capture-errors.jsonl"), `${JSON.stringify(diagnostic)}\n`, { mode: 0o600 });
+    } catch {
+      console.warn("[siyuan-meeting] capture diagnostic could not be saved");
+    }
+  }
+
   recordTranscriptionFailure({ meetingId, recordingId, phase, error }) {
     // Renderer stdout is discarded by the desktop host. Retain only diagnostic
     // fields: request bodies, URLs, headers and error messages can contain secrets.
@@ -635,15 +654,25 @@ class MeetingController {
     this.captureReady = new Promise((resolve) => {
       this.resolveCaptureReady = resolve;
     });
+    const consoleErrors = [];
+    const onConsole = (event, legacyLevel, legacyMessage) => {
+      const level = event?.level ?? legacyLevel;
+      if (level === "error" || level === 3) consoleErrors.push(event?.message ?? legacyMessage);
+    };
+    capture.webContents.on("console-message", onConsole);
     const url = `${page}?channel=${encodeURIComponent(this.channel)}`;
+    let stage = "load";
     try {
       await capture.loadURL(url);
+      stage = "ready";
       const ready = await Promise.race([
         this.captureReady.then(() => true),
         new Promise((resolve) => setTimeout(() => resolve(false), 6000)),
       ]);
-      if (!ready) throw new Error("录音未能启动，请重新打开会议后重试");
+      if (!ready) throw new Error("capture page did not report ready within 6s");
+      capture.webContents.off("console-message", onConsole);
     } catch (error) {
+      this.recordCaptureFailure({ stage, error, consoleErrors });
       this.capture = null;
       this.captureReady = null;
       if (!capture.isDestroyed()) capture.destroy();
