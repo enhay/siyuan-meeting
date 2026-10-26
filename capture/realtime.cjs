@@ -5,6 +5,16 @@
 const PACKET_MS = 200;
 const BUFFER_MS = 6000;
 const FINISH_MS = 3000;
+// Final sentences reach the meeting document in batches; captions are live.
+const FLUSH_MS = 10000;
+// Account-level rejections do not recover within one recording segment.
+const ACCOUNT_ERRORS = {
+  4002: "腾讯云验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的配置和电脑时间。",
+  4003: "腾讯云实时语音识别尚未开通，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+  4004: "腾讯云实时转写额度已用完，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+  4005: "腾讯云账户已欠费，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+};
+const LARGE_ENGINE_HINT = "腾讯云大模型实时识别未开通或额度不足，实时转写没有进行；录音仍在保存，可在会议设置中改用通用引擎。";
 
 function mergeGaps(gaps) {
   const result = [];
@@ -27,6 +37,7 @@ class RealtimeChannel {
     this.connecting = false;
     this.ready = false;
     this.closed = false;
+    this.rejected = false;
     this.ending = false;
     this.sentEnd = 0;
     this.confirmedEnd = 0;
@@ -64,8 +75,11 @@ class RealtimeChannel {
         if (this.socket !== socket) return;
         try {
           const data = JSON.parse(event.data);
-          if (Number(data.code) !== 0) {
-            this.owner.notice("实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。");
+          const code = Number(data.code);
+          if (code !== 0) {
+            this.rejected = Object.hasOwn(ACCOUNT_ERRORS, code);
+            this.owner.notice(!this.rejected ? "实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。"
+              : this.owner.engine === "large" && code !== 4002 ? LARGE_ENGINE_HINT : ACCOUNT_ERRORS[code]);
             this.disconnect();
             return;
           }
@@ -74,6 +88,10 @@ class RealtimeChannel {
             this.owner.error = "";
           }
           const result = data.result;
+          const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
+          if ([0, 1].includes(Number(result?.slice_type)) && this.base !== null && Number(result.index) > this.lastIndex) {
+            this.owner.caption({ channel: this.channel, label, text: String(result.voice_text_str || "").trim(), final: false });
+          }
           if (Number(result?.slice_type) === 2 && this.base !== null && Number(result.index) > this.lastIndex) {
             const start = Number(result.start_time);
             const end = Number(result.end_time);
@@ -84,14 +102,15 @@ class RealtimeChannel {
             this.lastIndex = Number(result.index);
             this.confirmedEnd = Math.max(this.confirmedEnd, Math.min(this.sentEnd, this.base + end));
             const text = String(result.voice_text_str || "").trim();
-            this.owner.report(text ? [{
+            if (text) this.owner.sentences.push({
               startMs: this.base + start,
               endMs: Math.min(this.sentEnd, this.base + end),
               speaker: 0,
               channel: this.channel,
-              speakerLabel: this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "说话人 1",
+              speakerLabel: label || "说话人 1",
               text,
-            }] : []);
+            });
+            this.owner.caption({ channel: this.channel, label, text, final: true });
           }
           if (Number(data.final) === 1) {
             this.confirmedEnd = this.sentEnd;
@@ -149,7 +168,7 @@ class RealtimeChannel {
   async tick() {
     if (this.closed || Date.now() < this.nextSendAt) return;
     if (!this.socket) {
-      if (Date.now() >= this.retryAt) void this.connect();
+      if (!this.rejected && Date.now() >= this.retryAt) void this.connect();
       return;
     }
     if (!this.ready || this.socket.readyState !== 1 || !this.queue.length || this.socket.bufferedAmount) return;
@@ -217,17 +236,22 @@ class RealtimeChannel {
 }
 
 class RealtimeTranscriber {
-  constructor({ sampleRate, channels, enabled, configured, requestUrl, emit, WebSocket: Socket = globalThis.WebSocket }) {
+  constructor({ sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
+    WebSocket: Socket = globalThis.WebSocket }) {
     this.sampleRate = sampleRate;
     this.channels = channels;
     this.enabled = enabled;
     this.configured = configured;
+    this.engine = engine;
     this.requestUrl = requestUrl;
     this.emit = emit;
+    this.caption = caption;
     this.WebSocket = Socket;
     this.gaps = [];
+    this.sentences = [];
     this.error = enabled && !configured ? "尚未配置腾讯云，实时转写没有进行；录音仍在保存，可在会议设置中配置。" : "";
     this.lastReport = 0;
+    this.reported = "";
     this.finished = false;
     this.resume();
   }
@@ -242,6 +266,7 @@ class RealtimeTranscriber {
   }
 
   notice(error) {
+    if (error === this.error) return;
     this.error = error;
     this.report();
   }
@@ -250,11 +275,10 @@ class RealtimeTranscriber {
     return mergeGaps([...this.gaps, ...this.connections.flatMap((connection) => connection.pending())]);
   }
 
-  report(segments = [], final = false) {
+  report(final = false) {
     this.lastReport = Date.now();
     const gaps = this.snapshotGaps();
-    this.emit({
-      segments,
+    const update = {
       gaps,
       status: !this.enabled ? "none"
         : !this.configured ? "incomplete"
@@ -262,7 +286,11 @@ class RealtimeTranscriber {
       error: this.error,
       configurationRequired: this.enabled && !this.configured,
       final,
-    });
+    };
+    const reported = JSON.stringify(update);
+    if (!final && !this.sentences.length && reported === this.reported) return;
+    this.reported = reported;
+    this.emit({ segments: this.sentences.splice(0), ...update });
   }
 
   push(samples, startMs) {
@@ -290,7 +318,7 @@ class RealtimeTranscriber {
         }
       }
     }
-    if (Date.now() - this.lastReport >= 1000) this.report();
+    if (Date.now() - this.lastReport >= FLUSH_MS) this.report();
   }
 
   async pause() {
@@ -302,7 +330,7 @@ class RealtimeTranscriber {
   async finish() {
     await this.pause();
     this.finished = true;
-    this.report([], true);
+    this.report(true);
   }
 
   abort() {
@@ -314,7 +342,7 @@ class RealtimeTranscriber {
     }
     for (const connection of this.connections) connection.abort();
     this.connections = [];
-    this.report([], true);
+    this.report(true);
   }
 }
 

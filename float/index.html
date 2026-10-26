@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="float.css">
 </head>
 <body>
+  <div id="captions" class="captions" aria-live="off"></div>
   <div id="envelope" class="envelope" data-phase="recording">
     <div id="handle" class="hover-handle" aria-hidden="true"><div class="handle-dots"></div></div>
     <div id="surface" class="surface">
@@ -21,6 +22,7 @@
         <div class="timer" id="timer" role="timer">00:00</div>
         <button class="control" id="pause" type="button" aria-label="暂停录音" title="暂停录音"></button>
         <button class="control" id="open" type="button" aria-label="打开会议" title="打开会议"></button>
+        <button class="control caption-toggle" id="caption-toggle" type="button" aria-label="显示字幕" title="显示字幕" aria-pressed="false"></button>
       </div>
       <div class="message" id="message" role="status" aria-live="polite"></div>
     </div>

@@ -14,6 +14,10 @@ const { clamp, isBlockId, isAssetPath } = require("./util");
 
 const FLOAT_WIDTH = 200;
 const FLOAT_HEIGHT = 67;
+// The captions toggle adds one 30-wide control; open captions add two lines above.
+const FLOAT_CAPTION_CONTROL_WIDTH = 30;
+const FLOAT_CAPTION_WIDTH = 360;
+const FLOAT_CAPTION_HEIGHT = 54;
 const FLOAT_SCREEN_MARGIN = 8;
 const ACTIVE_PHASES = new Set(["preparing", "recording", "paused"]);
 const PREF_KEY = "siyuan-meeting.prefs";
@@ -150,6 +154,7 @@ class MeetingController {
       realtimeNotice: "",
       realtimeEnabled: false,
       realtimeConfigured: false,
+      realtimeEngine: "large",
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -169,6 +174,8 @@ class MeetingController {
       notebookId: "",
       tencentAppId: "",
       realtimeTranscription: true,
+      realtimeEngine: "large",
+      floatCaptions: true,
       autoTranscribe: false,
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
@@ -431,6 +438,7 @@ class MeetingController {
     this.state.realtimeNotice = "";
     this.state.realtimeEnabled = this.prefs.realtimeTranscription !== false;
     this.state.realtimeConfigured = this.plugin.transcription.isConfigured();
+    this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -465,6 +473,7 @@ class MeetingController {
           realtime: {
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
+            engine: this.state.realtimeEngine,
           },
           meta: {
             recordingId: this.state.recordingId,
@@ -709,7 +718,7 @@ class MeetingController {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
           reply.url = tencent.signRealtimeUrl(this.plugin.transcription.config(), {
-            voiceId: crypto.randomUUID(), sampleRate: 16000,
+            voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
           });
         } catch {
           reply.error = "实时转写暂时不可用，录音仍在保存。";
@@ -739,6 +748,15 @@ class MeetingController {
       this.devicesResolve = null;
       clearTimeout(this.devicesTimer);
       this.emit();
+      return;
+    }
+    if (message.type === "realtime-caption") {
+      if (message.recordingId !== this.state.recordingId || !this.floatShouldShow ||
+          !this.floatWin || this.floatWin.isDestroyed()) return;
+      this.floatWin.webContents.send(this.channel, { caption: {
+        channel: message.channel, label: String(message.label || ""),
+        text: String(message.text || ""), final: Boolean(message.final),
+      } });
       return;
     }
     if (message.type === "realtime") {
@@ -1293,9 +1311,29 @@ class MeetingController {
     win.setBounds({ x: Math.round(x), y: Math.round(y), width, height });
   }
 
+  floatCaptions(snapshot) {
+    const available = snapshot.phase === "recording" && snapshot.realtimeEnabled && snapshot.realtimeConfigured;
+    return { available, visible: available && this.prefs.floatCaptions !== false };
+  }
+
+  // Captions open and close around the bar's bottom edge and horizontal centre.
+  resizeFloat({ available, visible }) {
+    const win = this.floatWin;
+    const width = visible ? FLOAT_CAPTION_WIDTH : FLOAT_WIDTH + (available ? FLOAT_CAPTION_CONTROL_WIDTH : 0);
+    const height = FLOAT_HEIGHT + (visible ? FLOAT_CAPTION_HEIGHT : 0);
+    const bounds = win.getBounds();
+    if (bounds.width === width && bounds.height === height) return;
+    const work = remote.screen.getDisplayMatching(bounds).workArea;
+    const x = clamp(Math.round(bounds.x + (bounds.width - width) / 2), work.x, work.x + work.width - width);
+    const y = clamp(bounds.y + bounds.height - height, work.y, work.y + work.height - height);
+    win.setBounds({ x, y, width, height });
+  }
+
   updateFloat(snapshot) {
     if (!this.floatWin || this.floatWin.isDestroyed()) return;
     const levels = snapshot.levels || [0, 0];
+    const captions = this.floatCaptions(snapshot);
+    this.resizeFloat(captions);
     this.floatWin.webContents.send(this.channel, {
       phase: snapshot.phase,
       elapsedMs: snapshot.elapsedMs,
@@ -1305,6 +1343,7 @@ class MeetingController {
       saveFailed: snapshot.saveFailed,
       dark: this.isDark(),
       opacity: this.prefs.opacity,
+      captions: { ...captions, online: snapshot.online, notice: snapshot.realtimeNotice || "" },
     });
   }
 
@@ -1320,6 +1359,8 @@ class MeetingController {
       void this.resume();
     } else if (message.type === "stop") {
       void this.stop();
+    } else if (message.type === "captions") {
+      this.setPrefs({ floatCaptions: Boolean(message.visible) });
     }
   }
 

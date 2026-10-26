@@ -96,3 +96,29 @@ test("cleanup after a confirmed realtime finish preserves completion", async () 
   assert.equal(reports.at(-1).status, "done");
   assert.deepEqual(reports.at(-1).gaps, []);
 });
+
+test("text still being recognised reaches captions but never the persisted transcript", async () => {
+  const reports = [], captions = [];
+  class Socket {
+    constructor() {
+      this.readyState = 1;
+      this.bufferedAmount = 0;
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ code: 0 }) }));
+    }
+    send(data) {
+      const results = typeof data === "string" ? [{ code: 0, final: 1 }] : [
+        { code: 0, result: { slice_type: 1, index: 0, start_time: 0, end_time: 100, voice_text_str: "预算" } },
+        { code: 0, result: { slice_type: 2, index: 0, start_time: 0, end_time: 200, voice_text_str: "预算已确认" } },
+      ];
+      for (const result of results) queueMicrotask(() => this.onmessage?.({ data: JSON.stringify(result) }));
+    }
+    close() { this.readyState = 3; }
+  }
+  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 1, enabled: true, configured: true,
+    requestUrl: async () => "wss://synthetic", WebSocket: Socket,
+    emit: report => reports.push(report), caption: caption => captions.push(caption) });
+  realtime.push(new Float32Array(3200), 0);
+  await realtime.finish();
+  assert.deepEqual(reports.flatMap(report => report.segments).map(segment => segment.text), ["预算已确认"]);
+  assert.deepEqual(captions.map(caption => [caption.text, caption.final]), [["预算", false], ["预算已确认", true]]);
+});

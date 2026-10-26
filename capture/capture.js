@@ -271,7 +271,8 @@ async function connect() {
     realtime = new RealtimeTranscriber({
       sampleRate: store.meta.sampleRate, channels,
       enabled: Boolean(options.realtime?.enabled), configured: Boolean(options.realtime?.configured),
-      requestUrl: requestRealtimeUrl, emit: realtimeUpdate,
+      engine: options.realtime?.engine, requestUrl: requestRealtimeUrl, emit: realtimeUpdate,
+      caption: (caption) => send({ type: "realtime-caption", recordingId: store?.recordingId, ...caption }),
     });
     realtime.report();
     store.save();

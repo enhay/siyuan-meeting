@@ -13,7 +13,9 @@ test("realtime signs the sorted request URL, with encoded signature and no secre
   const source = `${url.host}${url.pathname}?${url.searchParams.toString()}`;
   assert.equal(signature, crypto.createHmac("sha1", config.secretKey).update(source).digest("base64"));
   assert.equal(url.searchParams.get("voice_format"), "1");
-  assert.equal(url.searchParams.get("engine_model_type"), "16k_zh");
+  assert.equal(url.searchParams.get("engine_model_type"), "16k_zh_en");
+  const general = new URL(signRealtimeUrl(config, { voiceId: "meeting-voice", engine: "general", now: 1793000000 }));
+  assert.equal(general.searchParams.get("engine_model_type"), "16k_zh");
 });
 
 test("flash results retain channel identity and sentence timestamps", () => {

@@ -10,10 +10,13 @@ const timer = document.getElementById("timer");
 const pause = document.getElementById("pause");
 const open = document.getElementById("open");
 const message = document.getElementById("message");
+const captions = document.getElementById("captions");
+const captionToggle = document.getElementById("caption-toggle");
 const STICK_COUNT = 5;
 const PAUSE_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/></svg>';
 const PLAY_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 3.2c0-.8.9-1.3 1.6-.9l7 4.8c.6.4.6 1.3 0 1.7l-7 4.8c-.7.5-1.6 0-1.6-.9V3.2Z" fill="currentColor"/></svg>';
 const OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 7.8 8.2M6.5 3.5H4a1.5 1.5 0 0 0-1.5 1.5v7A1.5 1.5 0 0 0 4 13.5h7a1.5 1.5 0 0 0 1.5-1.5V9.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const CAPTION_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3" width="13" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 7h4M10 7h1.5M4.5 9.8h1.5M7.5 9.8h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
 const WARNING_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true" fill="none"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.5"/><path d="M10 5.8v4.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="13.9" r="0.9" fill="currentColor"/></svg>';
 
 let state = {
@@ -25,7 +28,12 @@ let state = {
   dark: false,
   opacity: 0.9,
   saveFailed: false,
+  captions: { available: false, visible: false, online: false, notice: "" },
 };
+// Captions are display-only: the last few final sentences plus each audio
+// channel's sentence still being recognised.
+let finals = [];
+let interim = new Map();
 let stickParams = [];
 let stopMode = "";
 let stopPaused = false;
@@ -119,8 +127,54 @@ function applyColors() {
   root.setProperty("--bar-error", "rgb(255, 64, 61)");
 }
 
+function renderCaptions() {
+  const { available, visible, notice } = state.captions || {};
+  body.classList.toggle("has-caption-toggle", Boolean(available));
+  body.classList.toggle("has-captions", Boolean(visible));
+  captionToggle.hidden = !available;
+  const label = visible ? "隐藏字幕" : "显示字幕";
+  captionToggle.setAttribute("aria-label", label);
+  captionToggle.title = label;
+  captionToggle.setAttribute("aria-pressed", visible ? "true" : "false");
+  if (!available) {
+    finals = [];
+    interim = new Map();
+  }
+  if (!visible) {
+    captions.replaceChildren();
+    return;
+  }
+  const lines = [...finals, ...[...interim.keys()].sort().map((key) => ({ ...interim.get(key), pending: true }))];
+  if (!lines.length) {
+    const line = document.createElement("p");
+    line.className = "caption is-pending";
+    line.textContent = notice || "正在聆听…";
+    captions.replaceChildren(line);
+    return;
+  }
+  captions.replaceChildren(...lines.map((item) => {
+    const line = document.createElement("p");
+    line.className = item.pending ? "caption is-pending" : "caption";
+    line.textContent = item.label ? `${item.label}：${item.text}` : item.text;
+    return line;
+  }));
+}
+
+function onCaption(caption) {
+  if (!state.captions?.available) return;
+  const key = Number(caption.channel) || 0;
+  interim.delete(key);
+  if (caption.final) {
+    if (caption.text) finals = [...finals, { label: caption.label, text: caption.text }].slice(-3);
+  } else if (caption.text) {
+    interim.set(key, { label: caption.label, text: caption.text });
+  }
+  renderCaptions();
+}
+
 function render() {
   const phase = state.phase || "idle";
+  renderCaptions();
   body.dataset.phase = phase;
   applyColors();
   body.classList.toggle("is-saving", phase === "saving");
@@ -205,12 +259,20 @@ stop.addEventListener("click", () => {
   ipcRenderer.send(channel, { type: "stop" });
 });
 open.addEventListener("click", () => ipcRenderer.send(channel, { type: "open" }));
+captionToggle.addEventListener("click", () => {
+  ipcRenderer.send(channel, { type: "captions", visible: !state.captions?.visible });
+});
 
 ipcRenderer.on(channel, (_, next) => {
+  if (next?.caption) {
+    onCaption(next.caption);
+    return;
+  }
   state = { ...state, ...(next || {}) };
   render();
 });
 
 buildStickParams();
 open.innerHTML = OPEN_ICON;
+captionToggle.innerHTML = CAPTION_ICON;
 render();

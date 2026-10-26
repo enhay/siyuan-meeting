@@ -25,6 +25,39 @@ body.is-hovered .envelope {
   background: var(--bar-envelope-surface);
 }
 
+/* Two caption lines above the control bar; overflow is clipped at the top so
+   the newest text stays visible. */
+.captions {
+  display: none;
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: 4px;
+  height: 50px;
+  padding: 7px 12px;
+  border-radius: 14px;
+  background: var(--bar-surface);
+  box-shadow: inset 0 0 0 0.5px var(--bar-stroke);
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 18px;
+}
+body.has-captions .captions { display: flex; }
+.caption { margin: 0; flex: 0 0 auto; }
+.caption.is-pending { opacity: 0.6; }
+body.has-captions .envelope {
+  top: 79px;
+  left: 50%;
+  right: auto;
+  width: 222px;
+  transform: translateX(-50%);
+}
+body.has-captions.is-hovered .envelope { top: 58px; }
+.caption-toggle[aria-pressed="true"] { background: var(--bar-control-fill); }
+.control[hidden] { display: none; }
+
 .hover-handle {
   display: none;
   height: 12px;

@@ -464,7 +464,18 @@ async function writeTranscript(meeting, recordingId, segments, { append = false,
       transcriptionFingerprint: await transcriptFingerprint(meeting, recordingId),
     });
   }
-  return transcriptId;
+  // The written rows match readTranscript, so a live view can append them.
+  return list.map((segment, index) => ({
+    blockId: addedIds[index],
+    recordingId,
+    startMs: Math.max(0, Math.floor(segment.startMs || 0)),
+    endMs: Math.max(0, Math.floor(segment.endMs || 0)),
+    speaker: Number(segment.speaker || 0),
+    channel: Number(segment.channel || 0),
+    speakerLabel: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
+    notice: Boolean(segment.notice),
+    text: segment.text,
+  }));
 }
 
 async function updateRecordingTranscription(meeting, recordingId, patch) {

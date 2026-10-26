@@ -531,6 +531,19 @@ function mountMeetingTab(plugin, tab) {
     }
     renderTranscriptionFeedback(state);
     if (event.status === "processing") return;
+    // Realtime batches carry their written rows; the whole transcript is
+    // reread only when the recording segment's state settles.
+    if (event.status === "recording" && recording) {
+      if (!event.appended?.length) return;
+      const known = new Set(state.transcript.map((item) => item.blockId));
+      state.transcript = [...state.transcript, ...event.appended.filter((item) => !known.has(item.blockId))]
+        .sort((a, b) => a.startMs - b.startMs);
+      state.materialDirty = true;
+      if (resolveMeetingView(state) === "transcript" && !state.transcriptEditing) renderTranscriptView(state);
+      if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
+      renderViewStatus(state);
+      return;
+    }
     state.materialDirty = true;
     void Promise.all([refreshRecordings(state), refreshTranscript(state)]).then(() => {
       if (state.destroyed) return;
@@ -2633,7 +2646,13 @@ function openSettings(plugin) {
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
+        <label class="meeting-settings__row"><span>实时识别引擎</span>
+          <select class="b3-select" name="realtimeEngine">
+            <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
+            <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
+          </select>
+        </label>
+        <p class="meeting-settings__hint">从下一段录音开始生效。大模型在腾讯云单独计费、没有免费额度，需要先开通；线上会议两路声音分别计费。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
         <label class="meeting-settings__row"><span>结束后自动转写</span>
           <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
         </label>
@@ -2684,6 +2703,7 @@ function openSettings(plugin) {
         opacity: Number(value("opacity")) / 100,
         tencentAppId: value("appId").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
+        realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",
         autoTranscribe: element.querySelector('[name="autoTranscribe"]').checked,
       });
       showMessage("设置已保存", 3000);

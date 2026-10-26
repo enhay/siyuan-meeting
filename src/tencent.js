@@ -34,21 +34,28 @@ function signature(secretKey, source) {
   return crypto.createHmac("sha1", secretKey).update(source).digest("base64");
 }
 
+// Realtime engines selectable in the meeting settings; the large model is
+// billed separately and has no free quota.
+const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
+
 // https://cloud.tencent.com/document/product/1093/48982
 // `now` is a Unix timestamp in seconds. Only the main window calls this function.
-function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000,
+function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0 ||
+      Number(sampleRate) !== 16000 || !Object.hasOwn(REALTIME_ENGINES, engine)) {
     throw new Error("无法开始实时转写，请重新开始录音后再试");
   }
   const params = {
-    engine_model_type: engineForSampleRate(sampleRate),
+    engine_model_type: REALTIME_ENGINES[engine],
     expired: now + 3600,
+    max_speak_time: 20000,
     needvad: 1,
     nonce: crypto.randomInt(1, 1000000000),
     secretid: config.secretId,
     timestamp: now,
+    vad_silence_time: 600,
     voice_format: 1,
     voice_id: voiceId,
   };

@@ -16,6 +16,16 @@
 const PACKET_MS = 200;
 const BUFFER_MS = 6000;
 const FINISH_MS = 3000;
+// Final sentences reach the meeting document in batches; captions are live.
+const FLUSH_MS = 10000;
+// Account-level rejections do not recover within one recording segment.
+const ACCOUNT_ERRORS = {
+  4002: "腾讯云验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的配置和电脑时间。",
+  4003: "腾讯云实时语音识别尚未开通，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+  4004: "腾讯云实时转写额度已用完，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+  4005: "腾讯云账户已欠费，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+};
+const LARGE_ENGINE_HINT = "腾讯云大模型实时识别未开通或额度不足，实时转写没有进行；录音仍在保存，可在会议设置中改用通用引擎。";
 
 function mergeGaps(gaps) {
   const result = [];
@@ -38,6 +48,7 @@ class RealtimeChannel {
     this.connecting = false;
     this.ready = false;
     this.closed = false;
+    this.rejected = false;
     this.ending = false;
     this.sentEnd = 0;
     this.confirmedEnd = 0;
@@ -75,8 +86,11 @@ class RealtimeChannel {
         if (this.socket !== socket) return;
         try {
           const data = JSON.parse(event.data);
-          if (Number(data.code) !== 0) {
-            this.owner.notice("实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。");
+          const code = Number(data.code);
+          if (code !== 0) {
+            this.rejected = Object.hasOwn(ACCOUNT_ERRORS, code);
+            this.owner.notice(!this.rejected ? "实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。"
+              : this.owner.engine === "large" && code !== 4002 ? LARGE_ENGINE_HINT : ACCOUNT_ERRORS[code]);
             this.disconnect();
             return;
           }
@@ -85,6 +99,10 @@ class RealtimeChannel {
             this.owner.error = "";
           }
           const result = data.result;
+          const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
+          if ([0, 1].includes(Number(result?.slice_type)) && this.base !== null && Number(result.index) > this.lastIndex) {
+            this.owner.caption({ channel: this.channel, label, text: String(result.voice_text_str || "").trim(), final: false });
+          }
           if (Number(result?.slice_type) === 2 && this.base !== null && Number(result.index) > this.lastIndex) {
             const start = Number(result.start_time);
             const end = Number(result.end_time);
@@ -95,14 +113,15 @@ class RealtimeChannel {
             this.lastIndex = Number(result.index);
             this.confirmedEnd = Math.max(this.confirmedEnd, Math.min(this.sentEnd, this.base + end));
             const text = String(result.voice_text_str || "").trim();
-            this.owner.report(text ? [{
+            if (text) this.owner.sentences.push({
               startMs: this.base + start,
               endMs: Math.min(this.sentEnd, this.base + end),
               speaker: 0,
               channel: this.channel,
-              speakerLabel: this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "说话人 1",
+              speakerLabel: label || "说话人 1",
               text,
-            }] : []);
+            });
+            this.owner.caption({ channel: this.channel, label, text, final: true });
           }
           if (Number(data.final) === 1) {
             this.confirmedEnd = this.sentEnd;
@@ -160,7 +179,7 @@ class RealtimeChannel {
   async tick() {
     if (this.closed || Date.now() < this.nextSendAt) return;
     if (!this.socket) {
-      if (Date.now() >= this.retryAt) void this.connect();
+      if (!this.rejected && Date.now() >= this.retryAt) void this.connect();
       return;
     }
     if (!this.ready || this.socket.readyState !== 1 || !this.queue.length || this.socket.bufferedAmount) return;
@@ -228,17 +247,22 @@ class RealtimeChannel {
 }
 
 class RealtimeTranscriber {
-  constructor({ sampleRate, channels, enabled, configured, requestUrl, emit, WebSocket: Socket = globalThis.WebSocket }) {
+  constructor({ sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
+    WebSocket: Socket = globalThis.WebSocket }) {
     this.sampleRate = sampleRate;
     this.channels = channels;
     this.enabled = enabled;
     this.configured = configured;
+    this.engine = engine;
     this.requestUrl = requestUrl;
     this.emit = emit;
+    this.caption = caption;
     this.WebSocket = Socket;
     this.gaps = [];
+    this.sentences = [];
     this.error = enabled && !configured ? "尚未配置腾讯云，实时转写没有进行；录音仍在保存，可在会议设置中配置。" : "";
     this.lastReport = 0;
+    this.reported = "";
     this.finished = false;
     this.resume();
   }
@@ -253,6 +277,7 @@ class RealtimeTranscriber {
   }
 
   notice(error) {
+    if (error === this.error) return;
     this.error = error;
     this.report();
   }
@@ -261,11 +286,10 @@ class RealtimeTranscriber {
     return mergeGaps([...this.gaps, ...this.connections.flatMap((connection) => connection.pending())]);
   }
 
-  report(segments = [], final = false) {
+  report(final = false) {
     this.lastReport = Date.now();
     const gaps = this.snapshotGaps();
-    this.emit({
-      segments,
+    const update = {
       gaps,
       status: !this.enabled ? "none"
         : !this.configured ? "incomplete"
@@ -273,7 +297,11 @@ class RealtimeTranscriber {
       error: this.error,
       configurationRequired: this.enabled && !this.configured,
       final,
-    });
+    };
+    const reported = JSON.stringify(update);
+    if (!final && !this.sentences.length && reported === this.reported) return;
+    this.reported = reported;
+    this.emit({ segments: this.sentences.splice(0), ...update });
   }
 
   push(samples, startMs) {
@@ -301,7 +329,7 @@ class RealtimeTranscriber {
         }
       }
     }
-    if (Date.now() - this.lastReport >= 1000) this.report();
+    if (Date.now() - this.lastReport >= FLUSH_MS) this.report();
   }
 
   async pause() {
@@ -313,7 +341,7 @@ class RealtimeTranscriber {
   async finish() {
     await this.pause();
     this.finished = true;
-    this.report([], true);
+    this.report(true);
   }
 
   abort() {
@@ -325,7 +353,7 @@ class RealtimeTranscriber {
     }
     for (const connection of this.connections) connection.abort();
     this.connections = [];
-    this.report([], true);
+    this.report(true);
   }
 }
 
@@ -985,6 +1013,10 @@ const { clamp, isBlockId, isAssetPath } = require("./util");
 
 const FLOAT_WIDTH = 200;
 const FLOAT_HEIGHT = 67;
+// The captions toggle adds one 30-wide control; open captions add two lines above.
+const FLOAT_CAPTION_CONTROL_WIDTH = 30;
+const FLOAT_CAPTION_WIDTH = 360;
+const FLOAT_CAPTION_HEIGHT = 54;
 const FLOAT_SCREEN_MARGIN = 8;
 const ACTIVE_PHASES = new Set(["preparing", "recording", "paused"]);
 const PREF_KEY = "siyuan-meeting.prefs";
@@ -1121,6 +1153,7 @@ class MeetingController {
       realtimeNotice: "",
       realtimeEnabled: false,
       realtimeConfigured: false,
+      realtimeEngine: "large",
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -1140,6 +1173,8 @@ class MeetingController {
       notebookId: "",
       tencentAppId: "",
       realtimeTranscription: true,
+      realtimeEngine: "large",
+      floatCaptions: true,
       autoTranscribe: false,
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
@@ -1402,6 +1437,7 @@ class MeetingController {
     this.state.realtimeNotice = "";
     this.state.realtimeEnabled = this.prefs.realtimeTranscription !== false;
     this.state.realtimeConfigured = this.plugin.transcription.isConfigured();
+    this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -1436,6 +1472,7 @@ class MeetingController {
           realtime: {
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
+            engine: this.state.realtimeEngine,
           },
           meta: {
             recordingId: this.state.recordingId,
@@ -1680,7 +1717,7 @@ class MeetingController {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
           reply.url = tencent.signRealtimeUrl(this.plugin.transcription.config(), {
-            voiceId: crypto.randomUUID(), sampleRate: 16000,
+            voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
           });
         } catch {
           reply.error = "实时转写暂时不可用，录音仍在保存。";
@@ -1710,6 +1747,15 @@ class MeetingController {
       this.devicesResolve = null;
       clearTimeout(this.devicesTimer);
       this.emit();
+      return;
+    }
+    if (message.type === "realtime-caption") {
+      if (message.recordingId !== this.state.recordingId || !this.floatShouldShow ||
+          !this.floatWin || this.floatWin.isDestroyed()) return;
+      this.floatWin.webContents.send(this.channel, { caption: {
+        channel: message.channel, label: String(message.label || ""),
+        text: String(message.text || ""), final: Boolean(message.final),
+      } });
       return;
     }
     if (message.type === "realtime") {
@@ -2264,9 +2310,29 @@ class MeetingController {
     win.setBounds({ x: Math.round(x), y: Math.round(y), width, height });
   }
 
+  floatCaptions(snapshot) {
+    const available = snapshot.phase === "recording" && snapshot.realtimeEnabled && snapshot.realtimeConfigured;
+    return { available, visible: available && this.prefs.floatCaptions !== false };
+  }
+
+  // Captions open and close around the bar's bottom edge and horizontal centre.
+  resizeFloat({ available, visible }) {
+    const win = this.floatWin;
+    const width = visible ? FLOAT_CAPTION_WIDTH : FLOAT_WIDTH + (available ? FLOAT_CAPTION_CONTROL_WIDTH : 0);
+    const height = FLOAT_HEIGHT + (visible ? FLOAT_CAPTION_HEIGHT : 0);
+    const bounds = win.getBounds();
+    if (bounds.width === width && bounds.height === height) return;
+    const work = remote.screen.getDisplayMatching(bounds).workArea;
+    const x = clamp(Math.round(bounds.x + (bounds.width - width) / 2), work.x, work.x + work.width - width);
+    const y = clamp(bounds.y + bounds.height - height, work.y, work.y + work.height - height);
+    win.setBounds({ x, y, width, height });
+  }
+
   updateFloat(snapshot) {
     if (!this.floatWin || this.floatWin.isDestroyed()) return;
     const levels = snapshot.levels || [0, 0];
+    const captions = this.floatCaptions(snapshot);
+    this.resizeFloat(captions);
     this.floatWin.webContents.send(this.channel, {
       phase: snapshot.phase,
       elapsedMs: snapshot.elapsedMs,
@@ -2276,6 +2342,7 @@ class MeetingController {
       saveFailed: snapshot.saveFailed,
       dark: this.isDark(),
       opacity: this.prefs.opacity,
+      captions: { ...captions, online: snapshot.online, notice: snapshot.realtimeNotice || "" },
     });
   }
 
@@ -2291,6 +2358,8 @@ class MeetingController {
       void this.resume();
     } else if (message.type === "stop") {
       void this.stop();
+    } else if (message.type === "captions") {
+      this.setPrefs({ floatCaptions: Boolean(message.visible) });
     }
   }
 
@@ -3290,7 +3359,18 @@ async function writeTranscript(meeting, recordingId, segments, { append = false,
       transcriptionFingerprint: await transcriptFingerprint(meeting, recordingId),
     });
   }
-  return transcriptId;
+  // The written rows match readTranscript, so a live view can append them.
+  return list.map((segment, index) => ({
+    blockId: addedIds[index],
+    recordingId,
+    startMs: Math.max(0, Math.floor(segment.startMs || 0)),
+    endMs: Math.max(0, Math.floor(segment.endMs || 0)),
+    speaker: Number(segment.speaker || 0),
+    channel: Number(segment.channel || 0),
+    speakerLabel: segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
+    notice: Boolean(segment.notice),
+    text: segment.text,
+  }));
 }
 
 async function updateRecordingTranscription(meeting, recordingId, patch) {
@@ -4430,21 +4510,28 @@ function signature(secretKey, source) {
   return crypto.createHmac("sha1", secretKey).update(source).digest("base64");
 }
 
+// Realtime engines selectable in the meeting settings; the large model is
+// billed separately and has no free quota.
+const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
+
 // https://cloud.tencent.com/document/product/1093/48982
 // `now` is a Unix timestamp in seconds. Only the main window calls this function.
-function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000,
+function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0 ||
+      Number(sampleRate) !== 16000 || !Object.hasOwn(REALTIME_ENGINES, engine)) {
     throw new Error("无法开始实时转写，请重新开始录音后再试");
   }
   const params = {
-    engine_model_type: engineForSampleRate(sampleRate),
+    engine_model_type: REALTIME_ENGINES[engine],
     expired: now + 3600,
+    max_speak_time: 20000,
     needvad: 1,
     nonce: crypto.randomInt(1, 1000000000),
     secretid: config.secretId,
     timestamp: now,
+    vad_silence_time: 600,
     voice_format: 1,
     voice_id: voiceId,
   };
@@ -4685,12 +4772,12 @@ class TranscriptionManager {
     return () => this.events.off("change", listener);
   }
 
-  notify(meeting, recordingId, status, error = "", progress = null) {
+  notify(meeting, recordingId, status, error = "", progress = null, appended = []) {
     const key = `${meeting.id}:${recordingId}`;
     this.status.set(key, status);
     this.errors.set(key, error);
     this.progress.set(key, progress);
-    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error, progress });
+    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error, progress, appended });
   }
 
   statusFor(meetingId, recordingId) {
@@ -4713,19 +4800,20 @@ class TranscriptionManager {
     return tencent.isConfigured(config);
   }
 
-  async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null } = {}) {
+  async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null, appended } = {}) {
     await meetingStore.updateRecordingTranscription(meeting, recordingId, {
       transcriptionIssue: "", ...patch, transcriptionStatus: status, transcriptionError: error,
     });
-    if (publish) this.notify(meeting, recordingId, status, error, progress);
+    if (publish) this.notify(meeting, recordingId, status, error, progress, appended);
   }
 
   async onRealtime(meeting, recordingId, message) {
     const key = `${meeting.id}:${recordingId}`;
     if (message.meta) await meetingStore.ensureRecording(meeting, { ...message.meta, recordingId, deviceId: this.deviceId });
+    let appended = [];
     if (message.segments?.length) {
       try {
-        await meetingStore.writeTranscript(meeting, recordingId, message.segments, { append: true });
+        appended = await meetingStore.writeTranscript(meeting, recordingId, message.segments, { append: true });
       } catch {
         this.persistenceGaps.set(key, mergeGaps([
           ...(this.persistenceGaps.get(key) || []),
@@ -4740,7 +4828,7 @@ class TranscriptionManager {
     await this.setState(meeting, recordingId, status, error, {
       transcriptionIssue: message.configurationRequired && !missing.length ? "configuration-required" : "",
       gaps, ...(message.meta ? { realtimeEnabled: Boolean(message.meta.realtimeEnabled) } : {}),
-    });
+    }, { appended });
     return { gaps, status, error };
   }
 
@@ -5412,6 +5500,19 @@ function mountMeetingTab(plugin, tab) {
     }
     renderTranscriptionFeedback(state);
     if (event.status === "processing") return;
+    // Realtime batches carry their written rows; the whole transcript is
+    // reread only when the recording segment's state settles.
+    if (event.status === "recording" && recording) {
+      if (!event.appended?.length) return;
+      const known = new Set(state.transcript.map((item) => item.blockId));
+      state.transcript = [...state.transcript, ...event.appended.filter((item) => !known.has(item.blockId))]
+        .sort((a, b) => a.startMs - b.startMs);
+      state.materialDirty = true;
+      if (resolveMeetingView(state) === "transcript" && !state.transcriptEditing) renderTranscriptView(state);
+      if (resolveMeetingView(state) === "summary") void safeRefreshMaterial(state);
+      renderViewStatus(state);
+      return;
+    }
     state.materialDirty = true;
     void Promise.all([refreshRecordings(state), refreshTranscript(state)]).then(() => {
       if (state.destroyed) return;
@@ -7514,7 +7615,13 @@ function openSettings(plugin) {
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
+        <label class="meeting-settings__row"><span>实时识别引擎</span>
+          <select class="b3-select" name="realtimeEngine">
+            <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
+            <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
+          </select>
+        </label>
+        <p class="meeting-settings__hint">从下一段录音开始生效。大模型在腾讯云单独计费、没有免费额度，需要先开通；线上会议两路声音分别计费。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
         <label class="meeting-settings__row"><span>结束后自动转写</span>
           <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
         </label>
@@ -7565,6 +7672,7 @@ function openSettings(plugin) {
         opacity: Number(value("opacity")) / 100,
         tencentAppId: value("appId").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
+        realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",
         autoTranscribe: element.querySelector('[name="autoTranscribe"]').checked,
       });
       showMessage("设置已保存", 3000);

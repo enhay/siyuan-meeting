@@ -31,12 +31,12 @@ class TranscriptionManager {
     return () => this.events.off("change", listener);
   }
 
-  notify(meeting, recordingId, status, error = "", progress = null) {
+  notify(meeting, recordingId, status, error = "", progress = null, appended = []) {
     const key = `${meeting.id}:${recordingId}`;
     this.status.set(key, status);
     this.errors.set(key, error);
     this.progress.set(key, progress);
-    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error, progress });
+    this.events.emit("change", { meetingId: meeting.id, recordingId, status, error, progress, appended });
   }
 
   statusFor(meetingId, recordingId) {
@@ -59,19 +59,20 @@ class TranscriptionManager {
     return tencent.isConfigured(config);
   }
 
-  async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null } = {}) {
+  async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null, appended } = {}) {
     await meetingStore.updateRecordingTranscription(meeting, recordingId, {
       transcriptionIssue: "", ...patch, transcriptionStatus: status, transcriptionError: error,
     });
-    if (publish) this.notify(meeting, recordingId, status, error, progress);
+    if (publish) this.notify(meeting, recordingId, status, error, progress, appended);
   }
 
   async onRealtime(meeting, recordingId, message) {
     const key = `${meeting.id}:${recordingId}`;
     if (message.meta) await meetingStore.ensureRecording(meeting, { ...message.meta, recordingId, deviceId: this.deviceId });
+    let appended = [];
     if (message.segments?.length) {
       try {
-        await meetingStore.writeTranscript(meeting, recordingId, message.segments, { append: true });
+        appended = await meetingStore.writeTranscript(meeting, recordingId, message.segments, { append: true });
       } catch {
         this.persistenceGaps.set(key, mergeGaps([
           ...(this.persistenceGaps.get(key) || []),
@@ -86,7 +87,7 @@ class TranscriptionManager {
     await this.setState(meeting, recordingId, status, error, {
       transcriptionIssue: message.configurationRequired && !missing.length ? "configuration-required" : "",
       gaps, ...(message.meta ? { realtimeEnabled: Boolean(message.meta.realtimeEnabled) } : {}),
-    });
+    }, { appended });
     return { gaps, status, error };
   }
 
