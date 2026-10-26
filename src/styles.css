@@ -467,8 +467,18 @@
 .meeting-template-manager__markdown { font-family: var(--b3-font-family-code); }
 .meeting-template-manager__field [readonly] { color: var(--b3-theme-on-surface); }
 .meeting-template-manager__error { color: var(--b3-theme-error); margin: 0; font-size: 12px; }
-.meeting-summary-inputs { margin-bottom: 8px; }
-.meeting-summary-inputs .meeting-summary-scope { justify-content: flex-start; }
+.meeting-summary-options { position: relative; }
+.meeting-summary-options > summary { list-style: none; }
+.meeting-summary-options > summary::-webkit-details-marker { display: none; }
+.meeting-summary-options > summary[data-state="incomplete"]::after { content: ""; display: inline-block; width: 5px; height: 5px; margin-left: 4px; vertical-align: middle; border-radius: 50%; background: #f59e0b; }
+.meeting-summary-options__panel {
+  position: absolute; right: 0; top: 100%; z-index: 5; width: max-content; max-width: 320px;
+  display: flex; flex-direction: column; gap: 8px; padding: 10px 12px;
+  background: var(--b3-theme-background); border: 1px solid var(--meeting-border);
+  border-radius: 8px; box-shadow: var(--b3-dialog-shadow);
+}
+.meeting-summary-options__panel .meeting-summary-scope { justify-content: flex-start; }
+.meeting-summary-meta__outdated { color: var(--b3-card-warning-color, #d97706); }
 .meeting-summary-missing { color: var(--meeting-muted); font-size: 12px; line-height: 1.6; text-align: left; }
 .meeting-summary-missing summary { cursor: pointer; padding: 4px 0; }
 .meeting-summary-missing ul { margin: 0 0 6px; padding-left: 20px; }

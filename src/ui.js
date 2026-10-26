@@ -907,7 +907,9 @@ function renderChrome(state, field, action) {
   const capturing = live && ["recording", "paused"].includes(phase);
   field("levels").hidden = !capturing;
   field("levels").title = field("source").textContent;
-  field("source-info").hidden = capturing;
+  // Once a meeting has recordings, the device lives in 录音设置 and the 补录 tooltip.
+  field("source-info").hidden = capturing || state.recordings.length > 0;
+  if (!anotherActive) action("start").title += ` · ${field("source").textContent}`;
   field("speaker-level").hidden = !online;
   field("mic-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[0] || 0)) * 6) : 0;
   field("speaker-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[1] || 0)) * 6) : 0;
@@ -939,18 +941,9 @@ function renderHint(state, field) {
     hint = snapshot.saveFailed
       ? "音频仍保存在本机，归档失败不会丢弃已录内容。"
       : "采集需要处理；已写入的部分不会丢弃。";
-  } else if (
-    (phase === "saved" || phase === "idle") &&
-    activeHere &&
-    state.recordings.length
-  ) {
-    const count = Math.max(state.meeting?.segments || 0, state.recordings.length);
-    const total = state.recordings.reduce((sum, item) => sum + Number(item.seconds || 0), 0);
-    hint = `${phase === "saved" ? "已保存" : "已有"} · ${count} 段录音 · 总时长 ${formatDuration(
-      total * 1000,
-      { alwaysHours: total >= 3600 },
-    )}`;
-    if (phase === "idle") hint += "。点击「补录」在原会议下继续";
+  } else if (phase === "saved" || state.recordings.length) {
+    // The recordings and the 补录 button already describe this meeting.
+    hint = "";
   } else if ((activeHere ? snapshot.online : state.mode === "online")) {
     hint = "线上模式会同时录麦克风和电脑播放的声音。请使用耳机，避免外放声音被麦克风重复录入。";
   } else {
@@ -2109,7 +2102,22 @@ function renderSummary(state) {
     "meeting-summary-meta__text",
     `${latest.generatedAt ? `生成于 ${formatClock(latest.generatedAt)}` : "已生成"}${latest.basis?.templateId ? ` · ${latest.basis.templateName || state.plugin.summaryTemplates.get(latest.basis.templateId)?.name || "自定义模板"}` : ""}${latest.sources ? ` · ${latest.sources}` : ""}`,
   );
+  if (changes.length) {
+    const outdated = h("span", "meeting-summary-meta__outdated", ` · ${changes.join("、")}已更新，重新生成后生效`);
+    outdated.dataset.state = "outdated";
+    metaText.append(outdated);
+  }
   const actions = h("div", "meeting-summary-actions");
+  // Scope only matters for the next generation, so it waits behind a toggle.
+  const options = h("details", "meeting-summary-options");
+  options.open = Boolean(state.summaryOptionsOpen);
+  options.ontoggle = () => { state.summaryOptionsOpen = options.open; };
+  const optionsToggle = h("summary", "meeting-link", "材料范围");
+  if (incompleteSummaryRecordings(state).length) optionsToggle.dataset.state = "incomplete";
+  const optionsPanel = h("div", "meeting-summary-options__panel");
+  appendSummaryScope(state, optionsPanel);
+  options.append(optionsToggle, optionsPanel);
+  if (state.material) actions.append(options);
   const regenerate = h("button", "meeting-link", "重新生成");
   regenerate.disabled = Boolean(state.summaryTemplateSaving || templateUnavailable);
   regenerate.onclick = () => void regenerateSummary(state);
@@ -2118,14 +2126,6 @@ function renderSummary(state) {
   actions.append(regenerate, open);
   meta.append(metaText, actions);
   section.insertBefore(meta, retainedEditor?.parentNode === section ? retainedEditor : null);
-  const inputs = h("div", "meeting-summary-inputs");
-  appendSummaryScope(state, inputs);
-  section.insertBefore(inputs, retainedEditor?.parentNode === section ? retainedEditor : null);
-  if (changes.length) {
-    const notice = h("div", "meeting-inline-notice", `${changes.join("、")}已更新，重新生成后生效。`);
-    notice.dataset.state = "outdated";
-    section.insertBefore(notice, retainedEditor?.parentNode === section ? retainedEditor : null);
-  }
   if (state.summaryNotice) {
     section.insertBefore(h("p", "meeting-summary-state__notice", state.summaryNotice), retainedEditor?.parentNode === section ? retainedEditor : null);
   }
@@ -2446,14 +2446,14 @@ async function saveSummaryDraft(state) {
   state.summaryBasisInitialized = saved.docId;
   state.summaryDocId = saved.docId;
   state.summaryContent = saved.content;
-  state.summaryNotice = saved.replaced ? "已替换纪要" : "纪要已保存";
+  state.summaryNotice = "";
   state.summaryStream = "";
   state.summaryDraft = null;
   try {
     await refreshMaterial(state);
   } catch {
     state.materialDirty = true;
-    state.summaryNotice = "纪要已保存，重新打开可刷新材料状态。";
+    state.summaryNotice = "材料状态未能刷新，重新打开会议页可更新。";
   }
 }
 
