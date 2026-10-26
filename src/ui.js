@@ -1991,10 +1991,6 @@ function renderSummary(state) {
   const overBudget = Boolean(budget && material && material.characters > budget);
 
   if (!hasContent) {
-    if (!budget) {
-      section.append(capacityError(state, material?.characters || 0, 0));
-      return;
-    }
     if (overBudget) {
       section.append(capacityError(state, material.characters, budget));
       return;
@@ -2135,16 +2131,8 @@ function configError(state) {
 function capacityError(state, characters, budget) {
   const card = h("div", "meeting-summary-state");
   card.innerHTML = `${icon("iconMeetingWarning", "meeting-summary-state__icon")}
-    <p class="meeting-summary-state__title">${budget ? "材料超出模型容量" : "尚不清楚模型能处理多少内容"}</p>
-    <p class="meeting-summary-state__text">${budget
-      ? `当前材料约 ${characters} 字，超过所用模型约 ${budget} 字的处理范围。请选择较少的录音段，或只用笔记生成。`
-      : "请在思源 AI 设置中填写所选模型的上下文容量，再生成纪要。"}</p>`;
-  if (!budget) {
-    const settings = h("button", "meeting-btn", "打开思源设置");
-    settings.onclick = () => openSetting(state.plugin.app);
-    card.append(settings);
-    return card;
-  }
+    <p class="meeting-summary-state__title">材料超出模型容量</p>
+    <p class="meeting-summary-state__text">当前材料约 ${characters} 字，超过所用模型约 ${budget} 字的处理范围。请选择较少的录音段，或只用笔记生成。</p>`;
   const notesOnly = h("button", "meeting-btn", "只用笔记");
   notesOnly.onclick = () => {
     state.summaryOnlyNotes = true;
@@ -2251,13 +2239,10 @@ async function generateSummary(state) {
     await refreshMaterial(state);
     const resolved = JSON.parse(JSON.stringify(ai.getEditingModel()));
     const budget = prompts.contextCharacterBudget(resolved?.model);
-    if (!budget) {
-      throw new Error("尚不清楚所选模型能处理多少内容。请在思源 AI 设置中填写模型的上下文容量，再生成纪要。");
-    }
     const system = prompts.buildSystemPrompt({ date: new Date() });
     const user = state.material.userPrompt;
     const characters = prompts.countNormalizedCharacters(`${system}\n${user}`);
-    if (characters > budget) {
+    if (budget && characters > budget) {
       throw new Error(
         `本次内容约 ${characters} 字，超过所选模型约 ${budget} 字的处理范围。请只用笔记或选择较少的录音段。`,
       );
