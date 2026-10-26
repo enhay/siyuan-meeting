@@ -2,13 +2,27 @@
 
 const fs = require("node:fs");
 
-// Tencent flash ASR accepts at most 100 MB and two hours per request.
+// Tencent and Doubao flash ASR both accept at most 100 MB and two hours per request.
 const MAX_FILE_BYTES = 100000000;
 const MAX_DURATION_SECONDS = 2 * 60 * 60;
 const HEADER_BYTES = 44;
 
 function invalidAudio() {
   return new Error("录音文件不完整或无法读取，请重新归档录音后再试");
+}
+
+// One request carries one complete 16-bit PCM WAV part produced by wavParts.
+function isUploadableWav(data, channels, sampleRate) {
+  return Buffer.isBuffer(data) && data.length > HEADER_BYTES && data.length <= MAX_FILE_BYTES &&
+    [1, 2].includes(channels) && data.toString("ascii", 0, 4) === "RIFF" &&
+    data.toString("ascii", 8, 12) === "WAVE" && data.toString("ascii", 12, 16) === "fmt " &&
+    data.readUInt32LE(16) === 16 && data.readUInt16LE(20) === 1 &&
+    data.readUInt16LE(22) === channels && data.readUInt32LE(24) === sampleRate &&
+    data.readUInt32LE(28) === sampleRate * channels * 2 && data.readUInt16LE(32) === channels * 2 &&
+    data.readUInt16LE(34) === 16 && data.toString("ascii", 36, 40) === "data" &&
+    data.readUInt32LE(40) === data.length - HEADER_BYTES && data.readUInt32LE(4) === data.length - 8 &&
+    !((data.length - HEADER_BYTES) % (channels * 2)) &&
+    (data.length - HEADER_BYTES) / (sampleRate * channels * 2) <= MAX_DURATION_SECONDS;
 }
 
 function readExact(fd, buffer, position) {
@@ -162,4 +176,4 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
   }
 }
 
-module.exports = { MAX_FILE_BYTES, MAX_DURATION_SECONDS, readWavInfo, wavParts, wavHeader };
+module.exports = { isUploadableWav, readWavInfo, wavParts, wavHeader };

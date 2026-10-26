@@ -1405,12 +1405,13 @@ function segmentCard(state, recording) {
   const button = h("button", "meeting-link", "");
   const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
-  const fillGaps = recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length > 0;
+  const fillGaps = recording.realtimeEnabled && recording.gaps?.length > 0;
   button.textContent = running ? `${statusLabel("processing", task.phase)}…`
     : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : ["failed", "incomplete"].includes(status) ? "重试转写" : "转写";
   button.disabled = running || !recording.assetPath;
   button.setAttribute("aria-busy", String(running));
-  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试" : "使用腾讯云转写服务";
+  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试"
+    : `使用${state.plugin.transcription.service() === "tencent" ? "腾讯云" : "豆包"}转写服务`;
   button.onclick = (event) => {
     event.stopPropagation();
     void startTranscription(state, recording, { gapsOnly: fillGaps });
@@ -1836,7 +1837,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   const live = isLiveTranscript(state);
   const configured = state.plugin.transcription.isConfigured();
   if (!configured) {
-    const notice = h("div", "meeting-inline-notice", "配置腾讯云后可使用转写，录音仍可正常保存。");
+    const notice = h("div", "meeting-inline-notice", "配置转写服务后可使用转写，录音仍可正常保存。");
     notice.dataset.state = "configuration-required";
     const settings = h("button", "meeting-link", "去配置");
     settings.onclick = () => openSettings(state.plugin);
@@ -1869,7 +1870,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
     const retry = h("button", "meeting-link", "重试转写");
     retry.onclick = () => void startTranscription(state, recording, {
-      gapsOnly: Boolean(recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length),
+      gapsOnly: Boolean(recording.realtimeEnabled && recording.gaps?.length),
     });
     feedback.append(retry);
     section.append(feedback);
@@ -2606,6 +2607,8 @@ async function refreshAll(state) {
 function openSettings(plugin) {
   const prefs = plugin.controller.getPrefs();
   const notebooks = api.notebooks();
+  const service = plugin.transcription.service();
+  const hasApiKey = Boolean(plugin.getSecret?.("meeting.doubao.apiKey"));
   const hasSecretId = Boolean(plugin.getSecret?.("meeting.tencent.secretId"));
   const hasSecretKey = Boolean(plugin.getSecret?.("meeting.tencent.secretKey"));
   const content = `
@@ -2632,31 +2635,46 @@ function openSettings(plugin) {
         </label>
       </section>
       <section>
-        <h3>腾讯云转写</h3>
-        <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你配置的腾讯云服务；密钥留空表示不修改。</p>
-        <label class="meeting-settings__row"><span>AppId</span>
-          <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
+        <h3>转写</h3>
+        <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你选择的服务；密钥留空表示不修改。</p>
+        <label class="meeting-settings__row"><span>转写服务</span>
+          <select class="b3-select" name="service">
+            <option value="doubao"${service === "doubao" ? " selected" : ""}>豆包</option>
+            <option value="tencent"${service === "tencent" ? " selected" : ""}>腾讯云</option>
+          </select>
         </label>
-        <label class="meeting-settings__row"><span>SecretId</span>
-          <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
-        </label>
-        <label class="meeting-settings__row"><span>SecretKey</span>
-          <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
-        </label>
+        <div class="meeting-settings__group" data-service="doubao"${service === "doubao" ? "" : " hidden"}>
+          <label class="meeting-settings__row"><span>API Key</span>
+            <input class="b3-text-field" type="password" name="apiKey" placeholder="${hasApiKey ? "已保存，留空不修改" : "填写 API Key"}" autocomplete="off">
+          </label>
+          <p class="meeting-settings__hint">需在火山引擎控制台开通豆包流式语音识别 2.0（按小时计费）和录音文件识别极速版。</p>
+        </div>
+        <div class="meeting-settings__group" data-service="tencent"${service === "tencent" ? "" : " hidden"}>
+          <label class="meeting-settings__row"><span>AppId</span>
+            <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretId</span>
+            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretKey</span>
+            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>实时识别引擎</span>
+            <select class="b3-select" name="realtimeEngine">
+              <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
+              <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
+            </select>
+          </label>
+          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写分不出线下会议的说话人，需要时可在会后重新转写。</p>
+        </div>
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <label class="meeting-settings__row"><span>实时识别引擎</span>
-          <select class="b3-select" name="realtimeEngine">
-            <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
-            <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
-          </select>
-        </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。大模型在腾讯云单独计费、没有免费额度，需要先开通；线上会议两路声音分别计费。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
+        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议两路声音分别计费。</p>
         <label class="meeting-settings__row"><span>结束后自动转写</span>
           <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">线上实时转写只补齐缺口；关闭实时转写时，结束后转写整段。</p>
+        <p class="meeting-settings__hint">开启实时转写时只补齐缺口；关闭实时转写时，结束后转写整段。</p>
       </section>
       <section>
         <h3>AI 纪要</h3>
@@ -2676,6 +2694,11 @@ function openSettings(plugin) {
   element.querySelector('[name="opacity"]').addEventListener("input", (event) => {
     element.querySelector('[data-field="opacity-value"]').textContent = `${event.target.value}%`;
   });
+  element.querySelector('[name="service"]').addEventListener("change", (event) => {
+    for (const group of element.querySelectorAll(".meeting-settings__group")) {
+      group.hidden = group.dataset.service !== event.target.value;
+    }
+  });
   element.querySelector('[data-action="open-ai"]').onclick = () => {
     try {
       openSetting(plugin.app);
@@ -2694,6 +2717,7 @@ function openSettings(plugin) {
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
       await api.writeSecrets([
+        { name: "meeting.doubao.apiKey", value: value("apiKey").trim() },
         { name: "meeting.tencent.secretId", value: secretId },
         { name: "meeting.tencent.secretKey", value: secretKey },
       ]);
@@ -2701,6 +2725,7 @@ function openSettings(plugin) {
         notebookId: value("notebook"),
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,
+        transcriptionService: value("service") === "tencent" ? "tencent" : "doubao",
         tencentAppId: value("appId").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
         realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",

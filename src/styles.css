@@ -779,6 +779,8 @@
 .meeting-settings { display: flex; flex-direction: column; gap: 18px; }
 .meeting-settings section { display: flex; flex-direction: column; gap: 9px; }
 .meeting-settings h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+.meeting-settings__group { display: flex; flex-direction: column; gap: 9px; }
+.meeting-settings__group[hidden] { display: none; }
 .meeting-settings__row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 .meeting-settings__row > span:first-child { width: 110px; flex: 0 0 110px; color: var(--b3-theme-on-surface); }
 .meeting-settings__row .b3-select,

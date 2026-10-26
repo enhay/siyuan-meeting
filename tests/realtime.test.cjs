@@ -41,7 +41,7 @@ test("a lost realtime acknowledgement becomes an audio-relative gap while pause 
   }
   let realtime;
   try {
-    realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 1, enabled: true,
+    realtime = new RealtimeTranscriber({ service: "tencent", sampleRate: 16000, channels: 1, enabled: true,
       configured: true, requestUrl: async () => "wss://synthetic", WebSocket: Socket,
       emit: report => reports.push(report) });
     realtime.push(new Float32Array(16000), 0);
@@ -86,7 +86,7 @@ test("cleanup after a confirmed realtime finish preserves completion", async () 
     }
     close() { this.readyState = 3; }
   }
-  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 2,
+  const realtime = new RealtimeTranscriber({ service: "tencent", sampleRate: 16000, channels: 2,
     enabled: true, configured: true, requestUrl: async () => "wss://synthetic",
     WebSocket: Socket, emit: report => reports.push(report) });
   realtime.push(new Float32Array(3200 * 2), 0);
@@ -114,11 +114,52 @@ test("text still being recognised reaches captions but never the persisted trans
     }
     close() { this.readyState = 3; }
   }
-  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 1, enabled: true, configured: true,
+  const realtime = new RealtimeTranscriber({ service: "tencent", sampleRate: 16000, channels: 1, enabled: true, configured: true,
     requestUrl: async () => "wss://synthetic", WebSocket: Socket,
     emit: report => reports.push(report), caption: caption => captions.push(caption) });
   realtime.push(new Float32Array(3200), 0);
   await realtime.finish();
   assert.deepEqual(reports.flatMap(report => report.segments).map(segment => segment.text), ["预算已确认"]);
   assert.deepEqual(captions.map(caption => [caption.text, caption.final]), [["预算", false], ["预算已确认", true]]);
+});
+
+test("doubao frames become audio-relative sentences with speakers even when the service omits a zero start time", async () => {
+  const zlib = require("node:zlib");
+  const reply = (flags, sequence, payload) => {
+    const body = zlib.gzipSync(JSON.stringify(payload));
+    const head = Buffer.alloc(sequence === null ? 8 : 12);
+    head.set([0x11, 0x90 | flags, 0x11, 0]);
+    if (sequence !== null) head.writeInt32BE(sequence, 4);
+    head.writeUInt32BE(body.length, head.length - 4);
+    const frame = Buffer.concat([head, body]);
+    return frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
+  };
+  const reports = [], captions = [];
+  class Socket {
+    constructor() {
+      this.readyState = 1;
+      this.bufferedAmount = 0;
+      queueMicrotask(() => this.onopen?.());
+    }
+    send(frame) {
+      const type = frame[1] >> 4, flags = frame[1] & 15;
+      // Shapes observed from the live service on 2026-10-26.
+      const replies = type === 1 ? [reply(0, null, { result: { text: "" } })]
+        : flags === 2 ? [reply(3, 3, { audio_info: { duration: 200 }, result: { text: "" } })]
+          : [reply(1, 1, { result: { utterances: [{ definite: false, end_time: 100, text: "预算" }] } }),
+            reply(1, 2, { result: { utterances: [{ definite: true, end_time: 180, text: "预算已确认。", additions: { speaker_id: "1" } }] } })];
+      for (const data of replies) queueMicrotask(() => this.onmessage?.({ data }));
+    }
+    close() { this.readyState = 3; }
+  }
+  const realtime = new RealtimeTranscriber({ service: "doubao", sampleRate: 16000, channels: 1, enabled: true,
+    configured: true, requestUrl: async () => "wss://synthetic", WebSocket: Socket,
+    emit: report => reports.push(report), caption: caption => captions.push(caption) });
+  realtime.push(new Float32Array(3200), 500);
+  await realtime.finish();
+  assert.deepEqual(reports.flatMap(report => report.segments).map(({ startMs, endMs, speakerLabel, text }) => ({ startMs, endMs, speakerLabel, text })),
+    [{ startMs: 500, endMs: 680, speakerLabel: "说话人 2", text: "预算已确认。" }]);
+  assert.deepEqual(captions.map(caption => [caption.text, caption.final]), [["预算", false], ["预算已确认。", true]]);
+  assert.equal(reports.at(-1).status, "done");
+  assert.deepEqual(reports.at(-1).gaps, []);
 });

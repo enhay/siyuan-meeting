@@ -9,6 +9,7 @@ const remote = require("@electron/remote");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const tencent = require("./tencent");
+const doubao = require("./doubao");
 const { recover, finalizeInterrupted } = require("../capture/storage.cjs");
 const { clamp, isBlockId, isAssetPath } = require("./util");
 
@@ -155,6 +156,7 @@ class MeetingController {
       realtimeEnabled: false,
       realtimeConfigured: false,
       realtimeEngine: "large",
+      realtimeService: "doubao",
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -172,6 +174,7 @@ class MeetingController {
       deviceId: "",
       opacity: 0.9,
       notebookId: "",
+      transcriptionService: "doubao",
       tencentAppId: "",
       realtimeTranscription: true,
       realtimeEngine: "large",
@@ -437,7 +440,8 @@ class MeetingController {
     this.state.recordingId = crypto.randomUUID();
     this.state.realtimeNotice = "";
     this.state.realtimeEnabled = this.prefs.realtimeTranscription !== false;
-    this.state.realtimeConfigured = this.plugin.transcription.isConfigured();
+    this.state.realtimeService = this.plugin.transcription.service();
+    this.state.realtimeConfigured = this.plugin.transcription.isConfigured(this.state.realtimeService);
     this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
     this.state.phase = "preparing";
     this.state.error = "";
@@ -471,6 +475,7 @@ class MeetingController {
           online: Boolean(online),
           deviceId,
           realtime: {
+            service: this.state.realtimeService,
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
             engine: this.state.realtimeEngine,
@@ -636,6 +641,29 @@ class MeetingController {
     isolated.setPermissionRequestHandler((contents, permission, callback, details) =>
       callback(isCapture(contents) && permission === "media" && details.isMainFrame === true),
     );
+    // Doubao accepts its key only in request headers. The capture window opens
+    // the connection without it and the main window adds the headers here.
+    const doubaoFilter = { urls: [`${new URL(doubao.REALTIME_URL).origin}/*`] };
+    isolated.webRequest.onBeforeSendHeaders(doubaoFilter, (details, callback) => {
+      let headers = {};
+      try {
+        if (this.isBusy() && this.state.realtimeService === "doubao") {
+          headers = doubao.realtimeHeaders(this.plugin.transcription.config("doubao"));
+        }
+      } catch {
+        // Without a usable key the service refuses the handshake below.
+      }
+      callback({ requestHeaders: { ...details.requestHeaders, ...headers } });
+    });
+    // A refused key closes the handshake without a message the capture window
+    // can read, so it would otherwise reconnect for the whole segment.
+    isolated.webRequest.onHeadersReceived(doubaoFilter, (details, callback) => {
+      if ([401, 403].includes(details.statusCode) && !capture.isDestroyed()) {
+        capture.webContents.send(this.channel, { type: "realtime-rejected", recordingId: this.state.recordingId,
+          error: "豆包验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的 API Key。" });
+      }
+      callback({});
+    });
     isolated.setDisplayMediaRequestHandler(async (request, callback) => {
       try {
         if (
@@ -717,9 +745,10 @@ class MeetingController {
         try {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
-          reply.url = tencent.signRealtimeUrl(this.plugin.transcription.config(), {
-            voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
-          });
+          reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
+            : tencent.signRealtimeUrl(this.plugin.transcription.config("tencent"), {
+              voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
+            });
         } catch {
           reply.error = "实时转写暂时不可用，录音仍在保存。";
         }
@@ -1398,6 +1427,8 @@ class MeetingController {
         this.isolated.setDisplayMediaRequestHandler(null);
         this.isolated.setPermissionCheckHandler(null);
         this.isolated.setPermissionRequestHandler(null);
+        this.isolated.webRequest.onBeforeSendHeaders(null);
+        this.isolated.webRequest.onHeadersReceived(null);
       } catch {
         // session may already be destroyed
       }

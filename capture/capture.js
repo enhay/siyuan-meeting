@@ -65,6 +65,10 @@ ipcRenderer.on(channel, (_event, message) => {
     // Do not overwrite the host's archive marker after the audio file closes.
     return;
   }
+  if (message?.type === "realtime-rejected") {
+    if (store && message.recordingId === store.recordingId) realtime?.reject(String(message.error || ""));
+    return;
+  }
   if (message?.type !== "realtime-signed") return;
   const pending = signRequests.get(message.requestId);
   if (!pending) return;
@@ -269,7 +273,7 @@ async function connect() {
     store.meta.realtimeError = "";
     store.meta.realtimeThroughMs = 0;
     realtime = new RealtimeTranscriber({
-      sampleRate: store.meta.sampleRate, channels,
+      service: options.realtime?.service, sampleRate: store.meta.sampleRate, channels,
       enabled: Boolean(options.realtime?.enabled), configured: Boolean(options.realtime?.configured),
       engine: options.realtime?.engine, requestUrl: requestRealtimeUrl, emit: realtimeUpdate,
       caption: (caption) => send({ type: "realtime-caption", recordingId: store?.recordingId, ...caption }),

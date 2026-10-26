@@ -5,6 +5,9 @@ const { EventEmitter } = require("node:events");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const tencent = require("./tencent");
+const doubao = require("./doubao");
+
+const CLIENTS = { doubao, tencent };
 const { wavParts } = require("./wav");
 const { mergeGaps } = require("../capture/realtime.cjs");
 
@@ -46,17 +49,23 @@ class TranscriptionManager {
 
   isRunning(recordingId) { return this.jobs.has(recordingId); }
 
-  config() {
+  // One service serves both realtime and post-meeting transcription.
+  service() {
+    return this.plugin.controller.getPrefs().transcriptionService === "tencent" ? "tencent" : "doubao";
+  }
+
+  config(service = this.service()) {
+    if (service === "doubao") return { service, apiKey: secret(this.plugin, "meeting.doubao.apiKey") };
     return {
+      service,
       appId: String(this.plugin.controller.getPrefs().tencentAppId || "").trim(),
       secretId: secret(this.plugin, "meeting.tencent.secretId"),
       secretKey: secret(this.plugin, "meeting.tencent.secretKey"),
     };
   }
 
-  isConfigured() {
-    const config = this.config();
-    return tencent.isConfigured(config);
+  isConfigured(service = this.service()) {
+    return CLIENTS[service].isConfigured(this.config(service));
   }
 
   async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null, appended } = {}) {
@@ -94,7 +103,8 @@ class TranscriptionManager {
   async start(meeting, recording, { gapsOnly = false, expectedFingerprint } = {}) {
     if (!meeting?.id || !recording?.recordingId) throw new Error("没有可转写的录音");
     if (this.closing || this.jobs.has(recording.recordingId)) return;
-    if (!this.isConfigured()) throw new Error("请先在会议设置中配置腾讯云转写服务");
+    const config = this.config();
+    if (!this.isConfigured(config.service)) throw new Error("请先在会议设置中配置转写服务");
     if (!recording.assetPath) throw new Error("录音保存完成后才能转写");
     const controller = new AbortController();
     const { signal } = controller;
@@ -122,8 +132,8 @@ class TranscriptionManager {
           progress = { phase: "uploading", partIndex: part.partIndex + 1, partCount: part.partCount,
             completedParts: part.partIndex, rangeIndex: rangeIndex + 1, rangeCount: ranges.length };
           this.notify(meeting, recording.recordingId, "processing", "", progress);
-          const segments = await tencent.flashRecognize({
-            ...this.config(), data: part.data, channels: part.channels,
+          const segments = await CLIENTS[config.service].flashRecognize({
+            ...config, data: part.data, channels: part.channels,
             sampleRate: part.sampleRate, signal,
             onUploadComplete: () => {
               progress = { ...progress, phase: "recognizing" };
@@ -173,7 +183,7 @@ class TranscriptionManager {
           ? "转写文字在处理期间被修改，已保留修改，请确认后重新转写"
           : progress.phase === "saving" ? "识别已完成，但转写文字未能保存；录音和已有文字已保留，请检查思源后重试"
           : progress.phase === "preparing" ? "未能读取录音或转写内容，请确认录音已同步后重新打开会议重试"
-          : "这段转写未完成，录音和已有文字已保留；请检查网络与腾讯云设置后手动重试");
+          : "这段转写未完成，录音和已有文字已保留；请检查网络与转写服务设置后手动重试");
       outcome = { status: "incomplete", error: persisted
         ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message,
         progress: { ...progress, phase: "incomplete" } };
@@ -187,11 +197,10 @@ class TranscriptionManager {
   async afterRecording(meeting, recording) {
     if (this.closing || recording.interrupted) return;
     if (!this.isConfigured()) {
-      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
+      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
       return;
     }
     if (recording.realtimeEnabled) {
-      if (recording.channels === 1) return this.start(meeting, recording);
       if (!recording.gaps?.length && recording.transcriptionStatus === "done") return;
       if (this.plugin.controller.getPrefs().autoTranscribe && recording.gaps?.length) {
         return this.start(meeting, recording, { gapsOnly: true });

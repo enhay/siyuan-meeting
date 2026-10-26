@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const https = require("node:https");
-const { MAX_FILE_BYTES, MAX_DURATION_SECONDS } = require("./wav");
+const { isUploadableWav } = require("./wav");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
@@ -138,16 +138,7 @@ async function flashRecognize(config) {
   const channels = Number(config.channels);
   const sampleRate = Number(config.sampleRate);
   const engine = engineForSampleRate(sampleRate);
-  if (!Buffer.isBuffer(data) || data.length <= 44 || data.length > MAX_FILE_BYTES ||
-      ![1, 2].includes(channels) || data.toString("ascii", 0, 4) !== "RIFF" ||
-      data.toString("ascii", 8, 12) !== "WAVE" || data.toString("ascii", 12, 16) !== "fmt " ||
-      data.readUInt32LE(16) !== 16 || data.readUInt16LE(20) !== 1 ||
-      data.readUInt16LE(22) !== channels || data.readUInt32LE(24) !== sampleRate ||
-      data.readUInt32LE(28) !== sampleRate * channels * 2 || data.readUInt16LE(32) !== channels * 2 ||
-      data.readUInt16LE(34) !== 16 || data.toString("ascii", 36, 40) !== "data" ||
-      data.readUInt32LE(40) !== data.length - 44 || data.readUInt32LE(4) !== data.length - 8 ||
-      (data.length - 44) % (channels * 2) ||
-      (data.length - 44) / (sampleRate * channels * 2) > MAX_DURATION_SECONDS) {
+  if (!isUploadableWav(data, channels, sampleRate)) {
     const message = "这段录音无法直接转写，请检查录音后重试";
     throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
   }

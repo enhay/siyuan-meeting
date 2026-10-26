@@ -11,6 +11,8 @@
   "capture/realtime.cjs": function (module, exports, require) {
 "use strict";
 
+const zlib = require("node:zlib");
+
 // The service accepts audio at its original rate. Keep at most one allowed
 // packet-gap worth of unsent audio; longer outages are repaired from the WAV.
 const PACKET_MS = 200;
@@ -19,13 +21,113 @@ const FINISH_MS = 3000;
 // Final sentences reach the meeting document in batches; captions are live.
 const FLUSH_MS = 10000;
 // Account-level rejections do not recover within one recording segment.
-const ACCOUNT_ERRORS = {
+const TENCENT_ACCOUNT_ERRORS = {
   4002: "腾讯云验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的配置和电脑时间。",
   4003: "腾讯云实时语音识别尚未开通，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
   4004: "腾讯云实时转写额度已用完，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
   4005: "腾讯云账户已欠费，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
 };
 const LARGE_ENGINE_HINT = "腾讯云大模型实时识别未开通或额度不足，实时转写没有进行；录音仍在保存，可在会议设置中改用通用引擎。";
+const DOUBAO_ACCOUNT_ERRORS = {
+  45000010: "豆包验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的 API Key。",
+  45000030: "豆包流式语音识别 2.0 尚未开通按小时计费，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+  45000292: "豆包实时转写额度不足，实时转写没有进行；录音仍在保存，结束后可以补齐转写。",
+};
+const TEMPORARY_ERROR = "实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。";
+
+// Each service turns its wire format into the same events: `ack` (the session
+// accepts audio), `partial`/`final` sentences relative to the session start,
+// `done` after the end of audio, or `error` with `account` set when
+// reconnecting cannot help.
+const PROTOCOLS = {
+  tencent: {
+    open() {},
+    audio(data) { return data; },
+    end() { return JSON.stringify({ type: "end" }); },
+    parse(raw, channel) {
+      const data = JSON.parse(raw);
+      const code = Number(data.code);
+      if (code !== 0) {
+        const account = Object.hasOwn(TENCENT_ACCOUNT_ERRORS, code);
+        return [{ error: !account ? TEMPORARY_ERROR
+          : channel.owner.engine === "large" && code !== 4002 ? LARGE_ENGINE_HINT : TENCENT_ACCOUNT_ERRORS[code], account }];
+      }
+      const events = [{ ack: true }];
+      const result = data.result;
+      const index = Number(result?.index);
+      if (result && index > channel.lastIndex) {
+        const text = String(result.voice_text_str || "").trim();
+        if ([0, 1].includes(Number(result.slice_type))) events.push({ partial: text });
+        if (Number(result.slice_type) === 2) {
+          channel.lastIndex = index;
+          events.push({ final: { start: Number(result.start_time), end: Number(result.end_time), text, speaker: null } });
+        }
+      }
+      if (Number(data.final) === 1) events.push({ done: true });
+      return events;
+    },
+  },
+  // Binary frames: 4-byte header, optional sequence, payload size, gzip payload.
+  doubao: {
+    frame(type, flags, serialization, payload) {
+      const body = zlib.gzipSync(payload);
+      const frame = Buffer.alloc(8 + body.length);
+      frame.set([0x11, (type << 4) | flags, (serialization << 4) | 1, 0]);
+      frame.writeUInt32BE(body.length, 4);
+      body.copy(frame, 8);
+      return frame;
+    },
+    open(socket, channel) {
+      const speakers = channel.owner.channels === 1 || channel.channel === 1;
+      socket.send(this.frame(1, 0, 1, JSON.stringify({
+        user: { uid: "siyuan-meeting" },
+        audio: { format: "pcm", codec: "raw", rate: channel.owner.sampleRate, bits: 16, channel: 1 },
+        request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
+          result_type: "single", end_window_size: 600, ...(speakers ? { enable_speaker_info: true } : {}) },
+      })));
+    },
+    audio(data) { return this.frame(2, 0, 0, Buffer.from(data)); },
+    end() { return this.frame(2, 2, 0, Buffer.alloc(0)); },
+    parse(raw) {
+      const buffer = Buffer.from(raw);
+      const type = buffer[1] >> 4;
+      const flags = buffer[1] & 15;
+      if (type === 15) {
+        const code = buffer.readUInt32BE(4);
+        const account = String(code).startsWith("45");
+        return [{ error: DOUBAO_ACCOUNT_ERRORS[code]
+          || (account ? "豆包无法处理实时转写请求，实时转写没有进行；录音仍在保存，结束后可以补齐转写。" : TEMPORARY_ERROR), account }];
+      }
+      if (type !== 9) throw new Error("unexpected frame");
+      const offset = flags & 1 ? 8 : 4;
+      const size = buffer.readUInt32BE(offset);
+      let payload = buffer.subarray(offset + 4, offset + 4 + size);
+      if ((buffer[2] & 15) === 1) payload = zlib.gunzipSync(payload);
+      const data = payload.length ? JSON.parse(payload.toString("utf8")) : {};
+      const events = [{ ack: true }];
+      for (const utterance of data.result?.utterances || []) {
+        const text = String(utterance.text || "").trim();
+        if (!utterance.definite) events.push({ partial: text });
+        else {
+          const speaker = Number(utterance.additions?.speaker_id);
+          // Zero-valued fields are omitted by the service.
+          events.push({ final: { start: Number(utterance.start_time ?? 0), end: Number(utterance.end_time), text,
+            speaker: Number.isInteger(speaker) && speaker >= 0 ? speaker : null } });
+        }
+      }
+      if ((flags & 2) === 2) events.push({ done: true });
+      return events;
+    },
+  },
+};
+
+function speakerLabel(owner, channel, speaker) {
+  if (owner.channels === 2) {
+    if (channel === 0) return "我";
+    return speaker > 0 ? `其他参会者 ${speaker + 1}` : "其他参会者";
+  }
+  return speaker === null ? "说话人" : `说话人 ${speaker + 1}`;
+}
 
 function mergeGaps(gaps) {
   const result = [];
@@ -56,6 +158,7 @@ class RealtimeChannel {
     this.lastIndex = -1;
     this.retryAt = 0;
     this.nextSendAt = 0;
+    this.sessions = 0;
     this.timer = setInterval(() => this.tick(), 20);
   }
 
@@ -78,55 +181,70 @@ class RealtimeChannel {
       const url = await this.owner.requestUrl(this.channel);
       if (this.closed || this.ending && !this.queue.length) return;
       const socket = new this.owner.WebSocket(url);
+      socket.binaryType = "arraybuffer";
       this.socket = socket;
       this.ready = false;
       this.base = null;
       this.lastIndex = -1;
+      this.sessionSpoke = false;
+      socket.onopen = () => {
+        if (this.socket !== socket) return;
+        try { this.owner.protocol.open(socket, this); } catch { this.disconnect(); }
+      };
       socket.onmessage = (event) => {
         if (this.socket !== socket) return;
         try {
-          const data = JSON.parse(event.data);
-          const code = Number(data.code);
-          if (code !== 0) {
-            this.rejected = Object.hasOwn(ACCOUNT_ERRORS, code);
-            this.owner.notice(!this.rejected ? "实时转写暂时不可用，录音仍在保存；结束后可以补齐转写。"
-              : this.owner.engine === "large" && code !== 4002 ? LARGE_ENGINE_HINT : ACCOUNT_ERRORS[code]);
-            this.disconnect();
-            return;
-          }
-          this.ready = true;
-          if (this.owner.connections.every((connection) => connection === this || connection.ready)) {
-            this.owner.error = "";
-          }
-          const result = data.result;
-          const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
-          if ([0, 1].includes(Number(result?.slice_type)) && this.base !== null && Number(result.index) > this.lastIndex) {
-            this.owner.caption({ channel: this.channel, label, text: String(result.voice_text_str || "").trim(), final: false });
-          }
-          if (Number(result?.slice_type) === 2 && this.base !== null && Number(result.index) > this.lastIndex) {
-            const start = Number(result.start_time);
-            const end = Number(result.end_time);
-            if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end > this.sentEnd - this.base + 1000) {
+          for (const item of this.owner.protocol.parse(event.data, this)) {
+            if (this.socket !== socket) return;
+            if (item.error) {
+              this.rejected = item.account;
+              this.owner.notice(item.error);
               this.disconnect();
               return;
             }
-            this.lastIndex = Number(result.index);
-            this.confirmedEnd = Math.max(this.confirmedEnd, Math.min(this.sentEnd, this.base + end));
-            const text = String(result.voice_text_str || "").trim();
-            if (text) this.owner.sentences.push({
-              startMs: this.base + start,
-              endMs: Math.min(this.sentEnd, this.base + end),
-              speaker: 0,
-              channel: this.channel,
-              speakerLabel: label || "说话人 1",
-              text,
-            });
-            this.owner.caption({ channel: this.channel, label, text, final: true });
-          }
-          if (Number(data.final) === 1) {
-            this.confirmedEnd = this.sentEnd;
-            this.disconnect(false);
-            this.finishResolve?.();
+            if (item.ack && !this.ready) {
+              this.ready = true;
+              this.sessions++;
+              if (this.owner.connections.every((connection) => connection === this || connection.ready)) {
+                this.owner.error = "";
+              }
+            }
+            const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
+            if (typeof item.partial === "string" && this.base !== null) {
+              this.owner.caption({ channel: this.channel, label, text: item.partial, final: false });
+            }
+            if (item.final && this.base !== null) {
+              const { start, end, text, speaker } = item.final;
+              if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end > this.sentEnd - this.base + 1000) {
+                this.disconnect();
+                return;
+              }
+              this.confirmedEnd = Math.max(this.confirmedEnd, Math.min(this.sentEnd, this.base + end));
+              if (text) {
+                // Speaker numbers only hold within one service session.
+                if (speaker !== null && !this.sessionSpoke && this.sessions > 1 && this.spoke) {
+                  this.owner.sentences.push({ startMs: this.base + start, endMs: this.base + start, speaker: 0,
+                    channel: this.channel, speakerLabel: "说明", notice: true,
+                    text: "实时转写在这里重新连接，说话人编号重新开始。" });
+                }
+                this.sessionSpoke = this.spoke = true;
+                this.owner.sentences.push({
+                  startMs: this.base + start,
+                  endMs: Math.min(this.sentEnd, this.base + end),
+                  speaker: speaker ?? 0,
+                  channel: this.channel,
+                  speakerLabel: speakerLabel(this.owner, this.channel, speaker),
+                  text,
+                });
+              }
+              this.owner.caption({ channel: this.channel, label, text, final: true });
+            }
+            if (item.done) {
+              this.confirmedEnd = this.sentEnd;
+              this.disconnect(false);
+              this.finishResolve?.();
+              return;
+            }
           }
         } catch {
           this.owner.notice("实时转写返回内容无法读取，录音仍在保存；结束后可以补齐转写。");
@@ -195,7 +313,7 @@ class RealtimeChannel {
       return;
     }
     try {
-      this.socket.send(packet.data);
+      this.socket.send(this.owner.protocol.audio(packet.data));
       this.sentEnd = packet.endMs;
       this.nextSendAt = Date.now() + packet.endMs - packet.startMs;
     } catch {
@@ -227,13 +345,19 @@ class RealtimeChannel {
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, FINISH_MS);
         this.finishResolve = () => { clearTimeout(timer); resolve(); };
-        try { this.socket.send(JSON.stringify({ type: "end" })); } catch { this.finishResolve(); }
+        try { this.socket.send(this.owner.protocol.end()); } catch { this.finishResolve(); }
       });
     }
     for (const gap of this.pending()) this.owner.gap(gap.startMs, gap.endMs, gap.channel);
     this.queue = [];
     this.disconnect();
     this.finishResolve = null;
+  }
+
+  reject(error) {
+    this.rejected = true;
+    this.owner.notice(error);
+    this.disconnect();
   }
 
   abort() {
@@ -247,8 +371,10 @@ class RealtimeChannel {
 }
 
 class RealtimeTranscriber {
-  constructor({ sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
+  constructor({ service, sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
     WebSocket: Socket = globalThis.WebSocket }) {
+    if (!Object.hasOwn(PROTOCOLS, service)) throw new Error("unknown transcription service");
+    this.protocol = PROTOCOLS[service];
     this.sampleRate = sampleRate;
     this.channels = channels;
     this.enabled = enabled;
@@ -260,7 +386,7 @@ class RealtimeTranscriber {
     this.WebSocket = Socket;
     this.gaps = [];
     this.sentences = [];
-    this.error = enabled && !configured ? "尚未配置腾讯云，实时转写没有进行；录音仍在保存，可在会议设置中配置。" : "";
+    this.error = enabled && !configured ? "尚未配置转写服务，实时转写没有进行；录音仍在保存，可在会议设置中配置。" : "";
     this.lastReport = 0;
     this.reported = "";
     this.finished = false;
@@ -293,7 +419,7 @@ class RealtimeTranscriber {
       gaps,
       status: !this.enabled ? "none"
         : !this.configured ? "incomplete"
-          : final ? (!gaps.length && this.channels === 2 ? "done" : "incomplete") : "recording",
+          : final ? (!gaps.length ? "done" : "incomplete") : "recording",
       error: this.error,
       configurationRequired: this.enabled && !this.configured,
       final,
@@ -330,6 +456,11 @@ class RealtimeTranscriber {
       }
     }
     if (Date.now() - this.lastReport >= FLUSH_MS) this.report();
+  }
+
+  // The main window saw the service refuse the account during the handshake.
+  reject(error) {
+    for (const connection of this.connections) connection.reject(error);
   }
 
   async pause() {
@@ -1008,6 +1139,7 @@ const remote = require("@electron/remote");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const tencent = require("./tencent");
+const doubao = require("./doubao");
 const { recover, finalizeInterrupted } = require("../capture/storage.cjs");
 const { clamp, isBlockId, isAssetPath } = require("./util");
 
@@ -1154,6 +1286,7 @@ class MeetingController {
       realtimeEnabled: false,
       realtimeConfigured: false,
       realtimeEngine: "large",
+      realtimeService: "doubao",
       saveFailed: false,
       savingStage: "",
       savedAt: 0,
@@ -1171,6 +1304,7 @@ class MeetingController {
       deviceId: "",
       opacity: 0.9,
       notebookId: "",
+      transcriptionService: "doubao",
       tencentAppId: "",
       realtimeTranscription: true,
       realtimeEngine: "large",
@@ -1436,7 +1570,8 @@ class MeetingController {
     this.state.recordingId = crypto.randomUUID();
     this.state.realtimeNotice = "";
     this.state.realtimeEnabled = this.prefs.realtimeTranscription !== false;
-    this.state.realtimeConfigured = this.plugin.transcription.isConfigured();
+    this.state.realtimeService = this.plugin.transcription.service();
+    this.state.realtimeConfigured = this.plugin.transcription.isConfigured(this.state.realtimeService);
     this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
     this.state.phase = "preparing";
     this.state.error = "";
@@ -1470,6 +1605,7 @@ class MeetingController {
           online: Boolean(online),
           deviceId,
           realtime: {
+            service: this.state.realtimeService,
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
             engine: this.state.realtimeEngine,
@@ -1635,6 +1771,29 @@ class MeetingController {
     isolated.setPermissionRequestHandler((contents, permission, callback, details) =>
       callback(isCapture(contents) && permission === "media" && details.isMainFrame === true),
     );
+    // Doubao accepts its key only in request headers. The capture window opens
+    // the connection without it and the main window adds the headers here.
+    const doubaoFilter = { urls: [`${new URL(doubao.REALTIME_URL).origin}/*`] };
+    isolated.webRequest.onBeforeSendHeaders(doubaoFilter, (details, callback) => {
+      let headers = {};
+      try {
+        if (this.isBusy() && this.state.realtimeService === "doubao") {
+          headers = doubao.realtimeHeaders(this.plugin.transcription.config("doubao"));
+        }
+      } catch {
+        // Without a usable key the service refuses the handshake below.
+      }
+      callback({ requestHeaders: { ...details.requestHeaders, ...headers } });
+    });
+    // A refused key closes the handshake without a message the capture window
+    // can read, so it would otherwise reconnect for the whole segment.
+    isolated.webRequest.onHeadersReceived(doubaoFilter, (details, callback) => {
+      if ([401, 403].includes(details.statusCode) && !capture.isDestroyed()) {
+        capture.webContents.send(this.channel, { type: "realtime-rejected", recordingId: this.state.recordingId,
+          error: "豆包验证未通过，实时转写没有进行；录音仍在保存，请检查会议设置中的 API Key。" });
+      }
+      callback({});
+    });
     isolated.setDisplayMediaRequestHandler(async (request, callback) => {
       try {
         if (
@@ -1716,9 +1875,10 @@ class MeetingController {
         try {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
-          reply.url = tencent.signRealtimeUrl(this.plugin.transcription.config(), {
-            voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
-          });
+          reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
+            : tencent.signRealtimeUrl(this.plugin.transcription.config("tencent"), {
+              voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
+            });
         } catch {
           reply.error = "实时转写暂时不可用，录音仍在保存。";
         }
@@ -2397,6 +2557,8 @@ class MeetingController {
         this.isolated.setDisplayMediaRequestHandler(null);
         this.isolated.setPermissionCheckHandler(null);
         this.isolated.setPermissionRequestHandler(null);
+        this.isolated.webRequest.onBeforeSendHeaders(null);
+        this.isolated.webRequest.onHeadersReceived(null);
       } catch {
         // session may already be destroyed
       }
@@ -2405,6 +2567,220 @@ class MeetingController {
 }
 
 module.exports = { MeetingController, ACTIVE_PHASES };
+
+  },
+  "src/doubao.js": function (module, exports, require) {
+"use strict";
+
+const crypto = require("node:crypto");
+const https = require("node:https");
+const { isUploadableWav } = require("./wav");
+
+const HOST = "openspeech.bytedance.com";
+// https://docs.volcengine.com/docs/DoubaoVoice/bidirectional-streaming-automatic-speech-recognition-websocket
+// The key travels only in request headers, which the main window adds to the
+// capture window's connection.
+const REALTIME_URL = `wss://${HOST}/api/v3/sauc/bigmodel_async`;
+const REALTIME_RESOURCE = "volc.seedasr.sauc.duration";
+// https://www.volcengine.com/docs/6561/1631584
+const FLASH_PATH = "/api/v3/auc/bigmodel/recognize/flash";
+const FLASH_RESOURCE = "volc.bigasr.auc_turbo";
+
+function isConfigured(config) {
+  const apiKey = config?.apiKey;
+  return typeof apiKey === "string" && /^[\x21-\x7e]+$/.test(apiKey.trim());
+}
+
+function requireConfig(config) {
+  if (!isConfigured(config)) {
+    const message = "请先在会议设置中填写豆包 API Key";
+    throw Object.assign(new Error(message), { code: "INVALID_CONFIGURATION", userMessage: message });
+  }
+}
+
+function realtimeHeaders(config) {
+  requireConfig(config);
+  return {
+    "X-Api-Key": config.apiKey.trim(),
+    "X-Api-Resource-Id": REALTIME_RESOURCE,
+    "X-Api-Request-Id": crypto.randomUUID(),
+    "X-Api-Connect-Id": crypto.randomUUID(),
+  };
+}
+
+function serviceError(code, requestId = "") {
+  const messages = {
+    45000001: "豆包无法处理这次转写，请稍后手动重试",
+    45000002: "这次提交的录音没有内容，请检查录音后重试",
+    45000010: "豆包验证未通过，请检查会议设置中的 API Key",
+    45000030: "豆包录音文件极速版尚未开通，请在火山引擎控制台开通后重试",
+    45000151: "豆包无法读取这段录音，请检查录音能否正常播放后重试",
+    45000292: "豆包转写额度不足，请补充额度后重试",
+    55000031: "豆包当前繁忙，请稍后手动重试",
+  };
+  const error = new Error(messages[Number(code)] || "豆包暂时未能完成转写，请稍后手动重试");
+  error.userMessage = error.message;
+  error.serviceCode = Number(code) || 0;
+  error.requestId = String(requestId || "");
+  return error;
+}
+
+function responseError(responseIssue) {
+  const message = "豆包返回的转写不完整，请稍后手动重试";
+  return Object.assign(new Error(message), { code: "INVALID_RESPONSE", responseIssue, userMessage: message });
+}
+
+// The service omits zero-valued fields, so a missing start time means 0.
+function parseFlashResult(result, channels = 1) {
+  const utterances = result?.result?.utterances ?? [];
+  if (!Array.isArray(utterances)) throw responseError("missing-result");
+  const sentences = [];
+  for (const utterance of utterances) {
+    if (typeof utterance?.text !== "string") throw responseError("invalid-sentence");
+    const text = utterance.text.trim();
+    if (!text) continue;
+    const startMs = Number(utterance.start_time ?? 0);
+    const endMs = Number(utterance.end_time);
+    const speaker = Number(utterance.additions?.speaker_id ?? 0);
+    const channelId = Number(utterance.channel_id ?? utterance.additions?.channel_id ?? 1);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs ||
+        !Number.isInteger(speaker) || speaker < 0 || !Number.isInteger(channelId) ||
+        channelId < 1 || channelId > channels) {
+      throw responseError("invalid-timestamp");
+    }
+    sentences.push({ startMs, endMs, speaker, channel: channelId - 1, text });
+  }
+  const others = new Set(sentences.filter((sentence) => sentence.channel === 1).map((sentence) => sentence.speaker));
+  return sentences.map((sentence) => ({
+    ...sentence,
+    speakerLabel: channels === 2
+      ? sentence.channel === 0 ? "我" : `其他参会者${others.size > 1 ? ` ${sentence.speaker + 1}` : ""}`
+      : `说话人 ${sentence.speaker + 1}`,
+  })).sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+}
+
+function aborted() {
+  const error = new Error("已取消转写");
+  error.name = "AbortError";
+  return error;
+}
+
+async function flashRecognize(config) {
+  requireConfig(config);
+  const { data, signal } = config;
+  const channels = Number(config.channels);
+  const sampleRate = Number(config.sampleRate);
+  if (!isUploadableWav(data, channels, sampleRate)) {
+    const message = "这段录音无法直接转写，请检查录音后重试";
+    throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
+  }
+  if (signal?.aborted) throw aborted();
+  // The audio is streamed as base64 inside the JSON body so a 100 MB part never
+  // exists twice in memory as a string.
+  const prefix = Buffer.from('{"user":{"uid":"siyuan-meeting"},"audio":{"format":"wav","data":"');
+  const suffix = Buffer.from(`"},"request":${JSON.stringify({
+    model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
+    enable_speaker_info: true, ...(channels === 2 ? { enable_channel_split: true } : {}),
+  })}}`);
+  const encodedBytes = Math.ceil(data.length / 3) * 4;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const abort = () => {
+      request?.destroy();
+      finish(aborted());
+    };
+    request = https.request({
+      hostname: HOST, path: FLASH_PATH, method: "POST",
+      headers: {
+        "Content-Type": "application/json", "Content-Length": prefix.length + encodedBytes + suffix.length,
+        "X-Api-Key": config.apiKey.trim(), "X-Api-Resource-Id": FLASH_RESOURCE,
+        "X-Api-Request-Id": crypto.randomUUID(), "X-Api-Sequence": "-1",
+      },
+      // A synchronous upload can take minutes on a meeting participant's connection.
+      // Stop a stalled connection without resubmitting a billable request.
+      timeout: 10 * 60 * 1000,
+    }, (response) => {
+      const chunks = [];
+      let received = 0;
+      const status = Number(response.headers["x-api-status-code"]);
+      const requestId = response.headers["x-tt-logid"] || "";
+      response.on("data", (chunk) => {
+        received += chunk.length;
+        // Bound untrusted response data independently of the audio upload size.
+        if (received > 16 * 1024 * 1024) {
+          finish(new Error("豆包返回的转写无法处理，请稍后手动重试"));
+          response.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      const responseFailure = (code) => {
+        const message = "转写连接已断开，请检查网络后手动重试";
+        finish(Object.assign(new Error(message), { code, userMessage: message, httpStatus: response.statusCode, responseBytes: received }));
+      };
+      response.on("aborted", () => responseFailure("ECONNRESET"));
+      response.on("error", (cause) => responseFailure(cause.code));
+      response.on("end", () => {
+        try {
+          if (status === 20000003) {
+            finish(null, []);
+            return;
+          }
+          if (status !== 20000000) throw serviceError(status, requestId);
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            throw Object.assign(new Error("豆包暂时未能完成转写，请稍后手动重试"), { responseIssue: "http-error" });
+          }
+          finish(null, parseFlashResult(JSON.parse(Buffer.concat(chunks).toString("utf8")), channels));
+        } catch (error) {
+          const failure = error instanceof SyntaxError ? responseError("invalid-json") : error;
+          failure.httpStatus = response.statusCode;
+          failure.responseBytes = received;
+          failure.requestId ||= String(requestId);
+          finish(failure);
+        }
+      });
+    });
+    request.on("timeout", () => {
+      const message = "转写等待时间过长，请检查网络后手动重试";
+      finish(Object.assign(new Error(message), { code: "ETIMEDOUT", userMessage: message }));
+      request.destroy();
+    });
+    request.on("error", (cause) => {
+      const message = "转写连接未完成，请检查网络后手动重试";
+      finish(signal?.aborted ? aborted() : Object.assign(new Error(message), { code: cause.code, userMessage: message }));
+    });
+    request.on("finish", () => {
+      if (!settled && !signal?.aborted) config.onUploadComplete?.();
+    });
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    void (async () => {
+      const write = (chunk) => new Promise((done) => {
+        if (request.write(chunk)) done();
+        else request.once("drain", done);
+      });
+      await write(prefix);
+      // Multiples of three bytes encode without padding until the final chunk.
+      for (let offset = 0; offset < data.length && !settled; offset += 3 * 1024 * 1024) {
+        await write(data.toString("base64", offset, Math.min(data.length, offset + 3 * 1024 * 1024)));
+      }
+      if (!settled) request.end(suffix);
+    })();
+  });
+}
+
+module.exports = { REALTIME_URL, isConfigured, realtimeHeaders, serviceError, parseFlashResult, flashRecognize };
 
   },
   "src/icons.js": function (module, exports, require) {
@@ -4478,7 +4854,7 @@ module.exports = { createTemplatePicker, openTemplateManager };
 
 const crypto = require("node:crypto");
 const https = require("node:https");
-const { MAX_FILE_BYTES, MAX_DURATION_SECONDS } = require("./wav");
+const { isUploadableWav } = require("./wav");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
@@ -4614,16 +4990,7 @@ async function flashRecognize(config) {
   const channels = Number(config.channels);
   const sampleRate = Number(config.sampleRate);
   const engine = engineForSampleRate(sampleRate);
-  if (!Buffer.isBuffer(data) || data.length <= 44 || data.length > MAX_FILE_BYTES ||
-      ![1, 2].includes(channels) || data.toString("ascii", 0, 4) !== "RIFF" ||
-      data.toString("ascii", 8, 12) !== "WAVE" || data.toString("ascii", 12, 16) !== "fmt " ||
-      data.readUInt32LE(16) !== 16 || data.readUInt16LE(20) !== 1 ||
-      data.readUInt16LE(22) !== channels || data.readUInt32LE(24) !== sampleRate ||
-      data.readUInt32LE(28) !== sampleRate * channels * 2 || data.readUInt16LE(32) !== channels * 2 ||
-      data.readUInt16LE(34) !== 16 || data.toString("ascii", 36, 40) !== "data" ||
-      data.readUInt32LE(40) !== data.length - 44 || data.readUInt32LE(4) !== data.length - 8 ||
-      (data.length - 44) % (channels * 2) ||
-      (data.length - 44) / (sampleRate * channels * 2) > MAX_DURATION_SECONDS) {
+  if (!isUploadableWav(data, channels, sampleRate)) {
     const message = "这段录音无法直接转写，请检查录音后重试";
     throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
   }
@@ -4746,6 +5113,9 @@ const { EventEmitter } = require("node:events");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const tencent = require("./tencent");
+const doubao = require("./doubao");
+
+const CLIENTS = { doubao, tencent };
 const { wavParts } = require("./wav");
 const { mergeGaps } = require("../capture/realtime.cjs");
 
@@ -4787,17 +5157,23 @@ class TranscriptionManager {
 
   isRunning(recordingId) { return this.jobs.has(recordingId); }
 
-  config() {
+  // One service serves both realtime and post-meeting transcription.
+  service() {
+    return this.plugin.controller.getPrefs().transcriptionService === "tencent" ? "tencent" : "doubao";
+  }
+
+  config(service = this.service()) {
+    if (service === "doubao") return { service, apiKey: secret(this.plugin, "meeting.doubao.apiKey") };
     return {
+      service,
       appId: String(this.plugin.controller.getPrefs().tencentAppId || "").trim(),
       secretId: secret(this.plugin, "meeting.tencent.secretId"),
       secretKey: secret(this.plugin, "meeting.tencent.secretKey"),
     };
   }
 
-  isConfigured() {
-    const config = this.config();
-    return tencent.isConfigured(config);
+  isConfigured(service = this.service()) {
+    return CLIENTS[service].isConfigured(this.config(service));
   }
 
   async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null, appended } = {}) {
@@ -4835,7 +5211,8 @@ class TranscriptionManager {
   async start(meeting, recording, { gapsOnly = false, expectedFingerprint } = {}) {
     if (!meeting?.id || !recording?.recordingId) throw new Error("没有可转写的录音");
     if (this.closing || this.jobs.has(recording.recordingId)) return;
-    if (!this.isConfigured()) throw new Error("请先在会议设置中配置腾讯云转写服务");
+    const config = this.config();
+    if (!this.isConfigured(config.service)) throw new Error("请先在会议设置中配置转写服务");
     if (!recording.assetPath) throw new Error("录音保存完成后才能转写");
     const controller = new AbortController();
     const { signal } = controller;
@@ -4863,8 +5240,8 @@ class TranscriptionManager {
           progress = { phase: "uploading", partIndex: part.partIndex + 1, partCount: part.partCount,
             completedParts: part.partIndex, rangeIndex: rangeIndex + 1, rangeCount: ranges.length };
           this.notify(meeting, recording.recordingId, "processing", "", progress);
-          const segments = await tencent.flashRecognize({
-            ...this.config(), data: part.data, channels: part.channels,
+          const segments = await CLIENTS[config.service].flashRecognize({
+            ...config, data: part.data, channels: part.channels,
             sampleRate: part.sampleRate, signal,
             onUploadComplete: () => {
               progress = { ...progress, phase: "recognizing" };
@@ -4914,7 +5291,7 @@ class TranscriptionManager {
           ? "转写文字在处理期间被修改，已保留修改，请确认后重新转写"
           : progress.phase === "saving" ? "识别已完成，但转写文字未能保存；录音和已有文字已保留，请检查思源后重试"
           : progress.phase === "preparing" ? "未能读取录音或转写内容，请确认录音已同步后重新打开会议重试"
-          : "这段转写未完成，录音和已有文字已保留；请检查网络与腾讯云设置后手动重试");
+          : "这段转写未完成，录音和已有文字已保留；请检查网络与转写服务设置后手动重试");
       outcome = { status: "incomplete", error: persisted
         ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message,
         progress: { ...progress, phase: "incomplete" } };
@@ -4928,11 +5305,10 @@ class TranscriptionManager {
   async afterRecording(meeting, recording) {
     if (this.closing || recording.interrupted) return;
     if (!this.isConfigured()) {
-      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置腾讯云转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
+      await this.setState(meeting, recording.recordingId, "incomplete", "尚未配置转写服务，请打开会议设置", { transcriptionIssue: "configuration-required" });
       return;
     }
     if (recording.realtimeEnabled) {
-      if (recording.channels === 1) return this.start(meeting, recording);
       if (!recording.gaps?.length && recording.transcriptionStatus === "done") return;
       if (this.plugin.controller.getPrefs().autoTranscribe && recording.gaps?.length) {
         return this.start(meeting, recording, { gapsOnly: true });
@@ -6374,12 +6750,13 @@ function segmentCard(state, recording) {
   const button = h("button", "meeting-link", "");
   const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
-  const fillGaps = recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length > 0;
+  const fillGaps = recording.realtimeEnabled && recording.gaps?.length > 0;
   button.textContent = running ? `${statusLabel("processing", task.phase)}…`
     : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : ["failed", "incomplete"].includes(status) ? "重试转写" : "转写";
   button.disabled = running || !recording.assetPath;
   button.setAttribute("aria-busy", String(running));
-  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试" : "使用腾讯云转写服务";
+  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试"
+    : `使用${state.plugin.transcription.service() === "tencent" ? "腾讯云" : "豆包"}转写服务`;
   button.onclick = (event) => {
     event.stopPropagation();
     void startTranscription(state, recording, { gapsOnly: fillGaps });
@@ -6805,7 +7182,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   const live = isLiveTranscript(state);
   const configured = state.plugin.transcription.isConfigured();
   if (!configured) {
-    const notice = h("div", "meeting-inline-notice", "配置腾讯云后可使用转写，录音仍可正常保存。");
+    const notice = h("div", "meeting-inline-notice", "配置转写服务后可使用转写，录音仍可正常保存。");
     notice.dataset.state = "configuration-required";
     const settings = h("button", "meeting-link", "去配置");
     settings.onclick = () => openSettings(state.plugin);
@@ -6838,7 +7215,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
     const retry = h("button", "meeting-link", "重试转写");
     retry.onclick = () => void startTranscription(state, recording, {
-      gapsOnly: Boolean(recording.channels === 2 && recording.realtimeEnabled && recording.gaps?.length),
+      gapsOnly: Boolean(recording.realtimeEnabled && recording.gaps?.length),
     });
     feedback.append(retry);
     section.append(feedback);
@@ -7575,6 +7952,8 @@ async function refreshAll(state) {
 function openSettings(plugin) {
   const prefs = plugin.controller.getPrefs();
   const notebooks = api.notebooks();
+  const service = plugin.transcription.service();
+  const hasApiKey = Boolean(plugin.getSecret?.("meeting.doubao.apiKey"));
   const hasSecretId = Boolean(plugin.getSecret?.("meeting.tencent.secretId"));
   const hasSecretKey = Boolean(plugin.getSecret?.("meeting.tencent.secretKey"));
   const content = `
@@ -7601,31 +7980,46 @@ function openSettings(plugin) {
         </label>
       </section>
       <section>
-        <h3>腾讯云转写</h3>
-        <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你配置的腾讯云服务；密钥留空表示不修改。</p>
-        <label class="meeting-settings__row"><span>AppId</span>
-          <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
+        <h3>转写</h3>
+        <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你选择的服务；密钥留空表示不修改。</p>
+        <label class="meeting-settings__row"><span>转写服务</span>
+          <select class="b3-select" name="service">
+            <option value="doubao"${service === "doubao" ? " selected" : ""}>豆包</option>
+            <option value="tencent"${service === "tencent" ? " selected" : ""}>腾讯云</option>
+          </select>
         </label>
-        <label class="meeting-settings__row"><span>SecretId</span>
-          <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
-        </label>
-        <label class="meeting-settings__row"><span>SecretKey</span>
-          <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
-        </label>
+        <div class="meeting-settings__group" data-service="doubao"${service === "doubao" ? "" : " hidden"}>
+          <label class="meeting-settings__row"><span>API Key</span>
+            <input class="b3-text-field" type="password" name="apiKey" placeholder="${hasApiKey ? "已保存，留空不修改" : "填写 API Key"}" autocomplete="off">
+          </label>
+          <p class="meeting-settings__hint">需在火山引擎控制台开通豆包流式语音识别 2.0（按小时计费）和录音文件识别极速版。</p>
+        </div>
+        <div class="meeting-settings__group" data-service="tencent"${service === "tencent" ? "" : " hidden"}>
+          <label class="meeting-settings__row"><span>AppId</span>
+            <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretId</span>
+            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretKey</span>
+            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>实时识别引擎</span>
+            <select class="b3-select" name="realtimeEngine">
+              <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
+              <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
+            </select>
+          </label>
+          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写分不出线下会议的说话人，需要时可在会后重新转写。</p>
+        </div>
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <label class="meeting-settings__row"><span>实时识别引擎</span>
-          <select class="b3-select" name="realtimeEngine">
-            <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
-            <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
-          </select>
-        </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。大模型在腾讯云单独计费、没有免费额度，需要先开通；线上会议两路声音分别计费。线下会议开启后，结束时会再次转写整段以区分说话人，两次识别分别计费。</p>
+        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议两路声音分别计费。</p>
         <label class="meeting-settings__row"><span>结束后自动转写</span>
           <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">线上实时转写只补齐缺口；关闭实时转写时，结束后转写整段。</p>
+        <p class="meeting-settings__hint">开启实时转写时只补齐缺口；关闭实时转写时，结束后转写整段。</p>
       </section>
       <section>
         <h3>AI 纪要</h3>
@@ -7645,6 +8039,11 @@ function openSettings(plugin) {
   element.querySelector('[name="opacity"]').addEventListener("input", (event) => {
     element.querySelector('[data-field="opacity-value"]').textContent = `${event.target.value}%`;
   });
+  element.querySelector('[name="service"]').addEventListener("change", (event) => {
+    for (const group of element.querySelectorAll(".meeting-settings__group")) {
+      group.hidden = group.dataset.service !== event.target.value;
+    }
+  });
   element.querySelector('[data-action="open-ai"]').onclick = () => {
     try {
       openSetting(plugin.app);
@@ -7663,6 +8062,7 @@ function openSettings(plugin) {
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
       await api.writeSecrets([
+        { name: "meeting.doubao.apiKey", value: value("apiKey").trim() },
         { name: "meeting.tencent.secretId", value: secretId },
         { name: "meeting.tencent.secretKey", value: secretKey },
       ]);
@@ -7670,6 +8070,7 @@ function openSettings(plugin) {
         notebookId: value("notebook"),
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,
+        transcriptionService: value("service") === "tencent" ? "tencent" : "doubao",
         tencentAppId: value("appId").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
         realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",
@@ -7977,13 +8378,27 @@ module.exports = {
 
 const fs = require("node:fs");
 
-// Tencent flash ASR accepts at most 100 MB and two hours per request.
+// Tencent and Doubao flash ASR both accept at most 100 MB and two hours per request.
 const MAX_FILE_BYTES = 100000000;
 const MAX_DURATION_SECONDS = 2 * 60 * 60;
 const HEADER_BYTES = 44;
 
 function invalidAudio() {
   return new Error("录音文件不完整或无法读取，请重新归档录音后再试");
+}
+
+// One request carries one complete 16-bit PCM WAV part produced by wavParts.
+function isUploadableWav(data, channels, sampleRate) {
+  return Buffer.isBuffer(data) && data.length > HEADER_BYTES && data.length <= MAX_FILE_BYTES &&
+    [1, 2].includes(channels) && data.toString("ascii", 0, 4) === "RIFF" &&
+    data.toString("ascii", 8, 12) === "WAVE" && data.toString("ascii", 12, 16) === "fmt " &&
+    data.readUInt32LE(16) === 16 && data.readUInt16LE(20) === 1 &&
+    data.readUInt16LE(22) === channels && data.readUInt32LE(24) === sampleRate &&
+    data.readUInt32LE(28) === sampleRate * channels * 2 && data.readUInt16LE(32) === channels * 2 &&
+    data.readUInt16LE(34) === 16 && data.toString("ascii", 36, 40) === "data" &&
+    data.readUInt32LE(40) === data.length - HEADER_BYTES && data.readUInt32LE(4) === data.length - 8 &&
+    !((data.length - HEADER_BYTES) % (channels * 2)) &&
+    (data.length - HEADER_BYTES) / (sampleRate * channels * 2) <= MAX_DURATION_SECONDS;
 }
 
 function readExact(fd, buffer, position) {
@@ -8137,7 +8552,7 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
   }
 }
 
-module.exports = { MAX_FILE_BYTES, MAX_DURATION_SECONDS, readWavInfo, wavParts, wavHeader };
+module.exports = { isUploadableWav, readWavInfo, wavParts, wavHeader };
 
   }
   };

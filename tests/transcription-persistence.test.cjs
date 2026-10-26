@@ -27,7 +27,7 @@ test("restart marks interrupted local requests incomplete without submitting or 
   } finally { store.readRecordings = oldRead; store.updateRecordingTranscription = oldUpdate; }
 });
 
-test("post-recording policy distinguishes offline speakers, online gaps and disabled realtime", async () => {
+test("post-recording policy fills realtime gaps and transcribes whole recordings only without realtime", async () => {
   const prefs = { autoTranscribe: false };
   const manager = new TranscriptionManager({ controller: { getPrefs: () => prefs } });
   manager.isConfigured = () => true;
@@ -40,17 +40,18 @@ test("post-recording policy distinguishes offline speakers, online gaps and disa
   await manager.afterRecording(meeting, offline);
   await manager.afterRecording(meeting, online);
   await manager.afterRecording(meeting, disabled);
-  assert.deepEqual(jobs, [{ id: "offline", gapsOnly: false }]);
+  assert.deepEqual(jobs, []);
   prefs.autoTranscribe = true;
+  await manager.afterRecording(meeting, offline);
   await manager.afterRecording(meeting, online);
   await manager.afterRecording(meeting, disabled);
-  assert.deepEqual(jobs.slice(1), [{ id: "online", gapsOnly: true }, { id: "disabled", gapsOnly: false }]);
+  assert.deepEqual(jobs, [{ id: "online", gapsOnly: true }, { id: "disabled", gapsOnly: false }]);
 });
 
 test("configuration-only transcription state is distinguished from an actual failure on the persisted path", async (t) => {
   const { RealtimeTranscriber } = require("../capture/realtime.cjs");
   let report;
-  const realtime = new RealtimeTranscriber({ sampleRate: 16000, channels: 1, enabled: true, configured: false, emit: (value) => { report = value; } });
+  const realtime = new RealtimeTranscriber({ service: "tencent", sampleRate: 16000, channels: 1, enabled: true, configured: false, emit: (value) => { report = value; } });
   realtime.report();
   const persisted = {};
   t.mock.method(store, "updateRecordingTranscription", async (_meeting, _id, patch) => Object.assign(persisted, patch));
@@ -81,7 +82,7 @@ test("transcription acknowledges before IO, reports real work, and releases the 
   };
   const asset = deferred(), recognition = deferred(), saving = deferred(), requested = deferred(), writing = deferred();
   const meeting = { id: "meeting" }, recording = { recordingId: "recording", assetPath: "assets/synthetic.wav", channels: 1 };
-  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({}), recordTranscriptionFailure() {} } });
+  const manager = new TranscriptionManager({ controller: { getPrefs: () => ({ transcriptionService: "tencent" }), recordTranscriptionFailure() {} } });
   manager.isConfigured = () => true;
   const events = [], persisted = {};
   manager.subscribe((event) => events.push({ ...event, running: manager.isRunning(recording.recordingId) }));
