@@ -62,6 +62,9 @@ test("transcription diagnostics persist only allowed failure fields, excluding s
       code: "ECONNRESET", serviceCode: null, httpStatus: 502, responseBytes: 80,
       requestId: error.requestId, responseIssue: "",
     });
+    controller.recordSummaryFailure({ meetingId: "meeting", phase: "generating", error: Object.assign(error, { httpStatus: 403, category: "permission", serviceCode: "private user material" }) });
+    const summary = JSON.parse(fs.readFileSync(path.join(dir, "summary-errors.jsonl"), "utf8"));
+    assert.deepEqual({ ...summary, at: null }, { at: null, meetingId: "meeting", phase: "generating", httpStatus: 403, category: "permission", serviceCode: "" });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

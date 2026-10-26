@@ -41,6 +41,23 @@ function writeJson(file, value) {
 }
 
 class MeetingController {
+  recordSummaryFailure({ meetingId, phase, error }) {
+    const categories = ["authentication", "permission", "model", "balance", "rate-limit", "capacity", "service"];
+    const codes = ["invalid_api_key", "authentication_error", "permission_denied", "permission_error", "model_not_found", "insufficient_quota", "rate_limit_exceeded", "context_length_exceeded"];
+    const diagnostic = {
+      at: new Date().toISOString(), meetingId, phase,
+      httpStatus: Number.isInteger(error.httpStatus) ? error.httpStatus : null,
+      category: categories.includes(error.category) ? error.category : "service",
+      serviceCode: codes.includes(error.serviceCode) ? error.serviceCode : "",
+    };
+    try {
+      fs.mkdirSync(this.storageRoot, { recursive: true, mode: 0o700 });
+      fs.appendFileSync(path.join(this.storageRoot, "summary-errors.jsonl"), `${JSON.stringify(diagnostic)}\n`, { mode: 0o600 });
+    } catch {
+      console.warn("[siyuan-meeting] summary diagnostic could not be saved");
+    }
+  }
+
   recordTranscriptionFailure({ meetingId, recordingId, phase, error }) {
     // Renderer stdout is discarded by the desktop host. Retain only diagnostic
     // fields: request bodies, URLs, headers and error messages can contain secrets.

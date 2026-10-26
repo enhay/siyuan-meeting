@@ -12,8 +12,7 @@ function aiConfig() {
  * Resolve the same model SiYuan uses for editor AI. Meeting summaries follow the
  * user's existing AI configuration instead of introducing a second provider list.
  */
-function getEditingModel() {
-  const ai = aiConfig();
+function getEditingModel(ai = aiConfig()) {
   if (!ai || !Array.isArray(ai.providers)) return null;
   const editing = ai.editing?.modelId ? ai.editing : ai.agent || {};
   const modelId = String(editing.modelId || "").trim();
@@ -124,11 +123,38 @@ function textFromResponsesJson(data) {
     .join("");
 }
 
-function serviceFailure(status = 0) {
-  if (status === 401 || status === 403) return new Error("AI 服务未接受当前配置。请检查思源中的 AI 账号与访问权限。");
-  if (status === 429) return new Error("AI 服务暂时无法继续处理。请检查可用额度，或稍后重试。");
-  if (status === 413) return new Error("本次会议内容超出 AI 服务的处理范围。请选择较少的录音段后重试。");
-  return new Error("AI 服务未能完成本次纪要。请检查网络和思源 AI 设置后重试。");
+function serviceFailure(status = 0, serviceCode = "") {
+  // Provider error messages may echo credentials or meeting text. Only retain
+  // known error identifiers; never expose or persist the response body.
+  const codes = ["invalid_api_key", "authentication_error", "permission_denied", "permission_error", "model_not_found", "insufficient_quota", "rate_limit_exceeded", "context_length_exceeded"];
+  const knownCode = codes.includes(serviceCode) ? serviceCode : "";
+  let category = "service";
+  let message = "AI 服务未能完成本次纪要。请检查网络和思源 AI 设置后重试。";
+  if (status === 401 || ["invalid_api_key", "authentication_error"].includes(knownCode)) {
+    category = "authentication";
+    message = "AI 服务鉴权失败。请检查思源中的 AI 密钥或登录状态。";
+  } else if (knownCode === "model_not_found") {
+    category = "model";
+    message = "AI 服务无法使用当前模型。请检查思源中的模型名称及访问权限。";
+  } else if (status === 403 || ["permission_denied", "permission_error"].includes(knownCode)) {
+    category = "permission";
+    message = "AI 服务拒绝了这次生成。请检查模型访问权限或服务限制。";
+  } else if (status === 402 || knownCode === "insufficient_quota") {
+    category = "balance";
+    message = "AI 服务可用额度不足。请检查服务账户的余额或额度。";
+  } else if (status === 429 || knownCode === "rate_limit_exceeded") {
+    category = "rate-limit";
+    message = "AI 服务当前请求过多。请稍后手动重试。";
+  } else if (status === 413 || knownCode === "context_length_exceeded") {
+    category = "capacity";
+    message = "本次会议内容超出 AI 服务的处理范围。请选择较少的录音段后重试。";
+  }
+  return Object.assign(new Error(message), { httpStatus: status, category, serviceCode: knownCode });
+}
+
+function responseErrorCode(data) {
+  const error = data?.error || data?.response?.error;
+  return error?.code || error?.type || "";
 }
 
 /**
@@ -170,10 +196,18 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
         };
 
         if (status < 200 || status >= 300) {
-          response.resume();
+          const chunks = [];
+          let bytes = 0;
+          response.on("data", (chunk) => {
+            bytes += chunk.length;
+            if (bytes <= 65536) chunks.push(chunk);
+          });
           response.on("end", () => {
-            console.warn("Meeting AI request failed", { status });
-            reject(serviceFailure(status));
+            let code = "";
+            if (bytes <= 65536) {
+              try { code = responseErrorCode(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { /* Non-JSON errors retain their HTTP status. */ }
+            }
+            reject(serviceFailure(status, code));
           });
           response.on("error", () => reject(serviceFailure()));
           return;
@@ -192,7 +226,7 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
             try {
               const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
               if (data?.error || data?.status === "failed") {
-                reject(serviceFailure());
+                reject(serviceFailure(status, responseErrorCode(data)));
                 return;
               }
               const text =
@@ -233,7 +267,7 @@ function requestStream(urlString, headers, payload, { signal, onDelta } = {}) {
             }
             if (event.error || event.type === "error" || event.type === "response.failed") {
               response.destroy();
-              reject(serviceFailure());
+              reject(serviceFailure(status, responseErrorCode(event)));
               return;
             }
             if (event.type === "message_stop") {

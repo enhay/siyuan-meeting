@@ -2345,11 +2345,6 @@ async function generateSummary(state) {
     renderSummary(state);
     return;
   }
-  if (!ai.isConfigured()) {
-    state.summaryError = "尚未配置 AI 模型";
-    renderSummary(state);
-    return;
-  }
   state.summaryGenerating = true;
   state.summaryError = "";
   state.summaryNotice = "";
@@ -2357,7 +2352,13 @@ async function generateSummary(state) {
   renderSummary(state);
   const abort = new AbortController();
   state.summaryAbort = abort;
+  let phase = "preparing";
   try {
+    // A meeting tab can outlive a settings update or synchronization. Resolve
+    // once from the kernel, then freeze it for the entire generation.
+    const { conf } = await api.post("/api/system/getConf");
+    const resolved = JSON.parse(JSON.stringify(ai.getEditingModel(conf.ai || null)));
+    if (!resolved) throw new Error("尚未配置 AI：请在思源设置中配置 AI 模型");
     await refreshRecordings(state);
     await refreshTranscript(state);
     await refreshSummaries(state);
@@ -2365,7 +2366,6 @@ async function generateSummary(state) {
       throw new Error("这场会议中有多份旧纪要。请先在思源中保留一份，再重新生成。");
     }
     await refreshMaterial(state);
-    const resolved = JSON.parse(JSON.stringify(ai.getEditingModel()));
     const budget = prompts.contextCharacterBudget(resolved?.model);
     const template = state.plugin.summaryTemplates.get(state.summaryTemplateId);
     if (!template) throw new Error("模板已不可用，请重新选择模板后再生成。");
@@ -2402,6 +2402,7 @@ async function generateSummary(state) {
     }
     if (abort.signal.aborted) throw new Error("已取消生成");
     const generatedAt = new Date().toISOString();
+    phase = "generating";
     const text = await ai.streamSummary({
       system,
       user,
@@ -2424,6 +2425,7 @@ async function generateSummary(state) {
       state.summaryNotice = "已取消生成，未写入任何内容";
     } else {
       state.summaryError = error.message;
+      state.controller.recordSummaryFailure({ meetingId: state.docId, phase, error });
     }
   } finally {
     state.summaryGenerating = false;
