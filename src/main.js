@@ -1,6 +1,6 @@
 "use strict";
 
-const { Plugin, Menu, showMessage, openTab } = require("siyuan");
+const { Plugin, Menu, showMessage, openTab, getAllEditor } = require("siyuan");
 const { ICONS } = require("./icons");
 const { MeetingController } = require("./controller");
 const { TranscriptionManager } = require("./transcription");
@@ -8,7 +8,7 @@ const { SummaryTemplateStore } = require("./summary-templates");
 const ui = require("./ui");
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
-const { formatDuration, formatDate } = require("./util");
+const { formatDuration, formatDate, isBlockId } = require("./util");
 
 const TAB_MEETING = "meeting";
 const TAB_ALL = "meetings";
@@ -25,6 +25,7 @@ module.exports = class MeetingPlugin extends Plugin {
     this.registerTopBar();
     this.registerCommands();
     this.registerTranscriptClicks();
+    this.registerNativeMeetingEntry();
     this.recentMeetings = [];
     void meetingStore
       .listMeetings(12)
@@ -142,6 +143,68 @@ module.exports = class MeetingPlugin extends Plugin {
       })().catch(() => {});
     };
     this.eventBus.on("click-editorcontent", this.onClickEditorContent);
+  }
+
+  registerNativeMeetingEntry() {
+    this.nativeMeetingEntries = new WeakMap();
+    this.nativeMeetingEntryActive = true;
+    this.onNativeMeetingEditor = (event) => {
+      const protyle = (event?.detail || event)?.protyle;
+      void this.updateNativeMeetingEntry(protyle);
+    };
+    this.eventBus.on("loaded-protyle-static", this.onNativeMeetingEditor);
+    this.eventBus.on("switch-protyle", this.onNativeMeetingEditor);
+  }
+
+  onLayoutReady() {
+    for (const editor of getAllEditor()) {
+      void this.updateNativeMeetingEntry(editor.protyle);
+    }
+  }
+
+  async updateNativeMeetingEntry(protyle) {
+    const element = protyle?.element;
+    const rootId = protyle?.block?.rootID;
+    if (!this.nativeMeetingEntryActive || !element?.isConnected || element.closest(".meeting-page")) return;
+    const previous = this.nativeMeetingEntries.get(protyle);
+    if (previous?.rootId === rootId && (!previous.element || previous.element.isConnected)) return;
+    previous?.element?.remove();
+    const entry = { rootId };
+    this.nativeMeetingEntries.set(protyle, entry);
+    if (!isBlockId(rootId)) return;
+    try {
+      const attrs = await api.getBlockAttrs(rootId);
+      let meetingId = attrs[meetingStore.ATTR.id] ? rootId : "";
+      if (!meetingId && ["summary", "transcript"].includes(attrs[meetingStore.ATTR.child])) {
+        const parentId = attrs[meetingStore.ATTR.parent];
+        if (isBlockId(parentId)) {
+          const parentAttrs = await api.getBlockAttrs(parentId);
+          if (parentAttrs[meetingStore.ATTR.id]) meetingId = parentId;
+        }
+      }
+      // Native editors can navigate to another document while attributes load.
+      if (!meetingId || !this.nativeMeetingEntryActive || !element.isConnected ||
+          protyle.block?.rootID !== rootId || this.nativeMeetingEntries.get(protyle) !== entry) return;
+      const bar = document.createElement("div");
+      bar.className = "meeting-native-entry";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "meeting-native-entry__button";
+      button.innerHTML = '<svg aria-hidden="true"><use href="#iconMeetingMic"></use></svg><span>打开会议</span>';
+      button.addEventListener("click", async () => {
+        try {
+          await this.openMeetingTab(meetingId);
+        } catch (error) {
+          showMessage(error.message, 5000, "error");
+        }
+      });
+      bar.append(button);
+      element.prepend(bar);
+      entry.element = bar;
+    } catch {
+      // A later native tab switch retries a failed document read.
+      if (this.nativeMeetingEntries.get(protyle) === entry) this.nativeMeetingEntries.delete(protyle);
+    }
   }
 
   async openMenu(target) {
@@ -295,6 +358,12 @@ module.exports = class MeetingPlugin extends Plugin {
   }
 
   async onunload() {
+    this.nativeMeetingEntryActive = false;
+    if (this.onNativeMeetingEditor) {
+      this.eventBus.off("loaded-protyle-static", this.onNativeMeetingEditor);
+      this.eventBus.off("switch-protyle", this.onNativeMeetingEditor);
+      document.querySelectorAll(".meeting-native-entry").forEach((element) => element.remove());
+    }
     if (this.onClickEditorContent) {
       this.eventBus.off("click-editorcontent", this.onClickEditorContent);
     }

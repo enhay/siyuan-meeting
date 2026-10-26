@@ -1,4 +1,26 @@
 /* Meeting plugin — layout metrics follow Anarlog's desktop surfaces. */
+.meeting-native-entry {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  padding: 2px 12px;
+}
+.meeting-native-entry__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: var(--b3-border-radius);
+  background: transparent;
+  color: var(--b3-theme-on-surface);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.meeting-native-entry__button:hover { background: var(--b3-list-hover); color: var(--b3-theme-on-background); }
+.meeting-native-entry__button:focus-visible { outline: 2px solid var(--b3-theme-primary); outline-offset: 1px; }
+.meeting-native-entry__button svg { width: 14px; height: 14px; }
 .meeting-page {
   --meeting-red: rgb(255, 51, 77);
   --meeting-red-soft: rgba(255, 51, 77, 0.12);
