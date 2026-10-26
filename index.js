@@ -2188,8 +2188,11 @@ class MeetingController {
     });
     this.floatWin = win;
     win.setAlwaysOnTop(true, "floating");
-    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    win.setContentProtection(true);
+    // Without skipTransformProcessType macOS briefly hides every SiYuan window.
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+    // On macOS (Electron 44 panel) content protection also hides the bar from the
+    // user's own screen, so screen-share exclusion is Windows-only.
+    if (process.platform !== "darwin") win.setContentProtection(true);
     win.setIgnoreMouseEvents(false);
     win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     win.webContents.on("will-navigate", (event) => event.preventDefault());

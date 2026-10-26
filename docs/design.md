@@ -201,7 +201,8 @@ anarlog 固定在提交 `341ccb3a5636a4e2784a9d4f1177a094d855c1bd`（MIT 部分�
 - 不抢焦点：`type: 'panel'`（macOS）、`focusable: false`、`showInactive()`。对应 anarlog 的 `.nonactivatingPanel`。
 - 全屏和多桌面下可见：`setAlwaysOnTop(true, 'floating')`、`setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })`。对应 `.canJoinAllSpaces` 和 `.fullScreenAuxiliary`。
 - 不出现在任务栏和 Dock：`skipTaskbar: true`。
-- 共享屏幕时不被采集：`setContentProtection(true)`，对应 anarlog 的 `sharingType = .none`。用户在腾讯会议里共享屏幕时，其他参会者看不到浮条。
+- 共享屏幕时不被采集：Windows 上使用 `setContentProtection(true)`，对应 anarlog 的 `sharingType = .none`，用户在腾讯会议里共享屏幕时，其他参会者看不到浮条。macOS（思源 3.8.8 / Electron 44）上实测该设置会让浮条在本机屏幕上也不可见，因此 macOS 不启用，共享屏幕时浮条会被其他参会者看到。
+- 不影响思源主窗口：`setVisibleOnAllWorkspaces` 传入 `skipTransformProcessType: true`；否则 macOS 上开始录音时思源窗口会被短暂隐藏。
 - 透明、无边框、无阴影、不可缩放、不可关闭（只能通过结束录音来隐藏）。
 - 位置：
   - 默认显示在当前显示器工作区的底部居中。
@@ -277,7 +278,7 @@ anarlog 固定在提交 `341ccb3a5636a4e2784a9d4f1177a094d855c1bd`（MIT 部分�
 - **BAR-04** 切换应用、思源最小化、全屏会议、切换 Mac 桌面、多显示器时仍然可见，且不超出屏幕。（P0，D1）
   验收：两个平台分别记录结果。
 - **BAR-05** 拖动移动位置，本次录音内记住位置。（P0，D2）
-- **BAR-06** 共享屏幕时不被采集。（P1，D1 验证可行性）
+- **BAR-06** 共享屏幕时不被采集。（P1，D1 验证可行性；仅 Windows，macOS 因浮条本机不可见而不启用）
 - **BAR-07** 不透明度设置。（P1）
 
 ### 保存、归档与恢复（SAV）
