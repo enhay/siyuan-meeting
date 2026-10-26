@@ -22,6 +22,7 @@ module.exports = class MeetingPlugin extends Plugin {
     this.summaryTemplates = new SummaryTemplateStore(this);
     await this.summaryTemplates.init();
     this.registerTabs();
+    this.adoptOpenTabs();
     this.registerTopBar();
     this.registerCommands();
     this.registerTranscriptClicks();
@@ -35,12 +36,36 @@ module.exports = class MeetingPlugin extends Plugin {
       .catch(() => {});
   }
 
+  // A plugin reload keeps open tabs but leaves them bound to the unloaded
+  // instance, whose controller no longer receives capture messages. Re-mount
+  // them on this instance.
+  adoptOpenTabs() {
+    const opened = this.getOpenedTab?.() || {};
+    const mounts = { [TAB_MEETING]: ui.mountMeetingTab, [TAB_ALL]: ui.mountAllMeetingsTab };
+    for (const [type, mount] of Object.entries(mounts)) {
+      for (const tab of opened[type] || []) {
+        if (!tab.meetingOwner || tab.meetingOwner === this) continue;
+        try {
+          tab.meetingCleanup?.();
+        } catch (error) {
+          console.error("[siyuan-meeting] stale tab cleanup failed", error);
+        }
+        tab.meetingOwner = this;
+        mount(this, tab);
+      }
+    }
+  }
+
   registerTabs() {
     const plugin = this;
     this.addTab({
       type: TAB_MEETING,
       init() {
+        this.meetingOwner = plugin;
         ui.mountMeetingTab(plugin, this);
+      },
+      update() {
+        this.meetingRefresh?.();
       },
       destroy() {
         try {
@@ -53,6 +78,7 @@ module.exports = class MeetingPlugin extends Plugin {
     this.addTab({
       type: TAB_ALL,
       init() {
+        this.meetingOwner = plugin;
         ui.mountAllMeetingsTab(plugin, this);
       },
       destroy() {

@@ -2438,6 +2438,7 @@ module.exports = class MeetingPlugin extends Plugin {
     this.summaryTemplates = new SummaryTemplateStore(this);
     await this.summaryTemplates.init();
     this.registerTabs();
+    this.adoptOpenTabs();
     this.registerTopBar();
     this.registerCommands();
     this.registerTranscriptClicks();
@@ -2451,12 +2452,36 @@ module.exports = class MeetingPlugin extends Plugin {
       .catch(() => {});
   }
 
+  // A plugin reload keeps open tabs but leaves them bound to the unloaded
+  // instance, whose controller no longer receives capture messages. Re-mount
+  // them on this instance.
+  adoptOpenTabs() {
+    const opened = this.getOpenedTab?.() || {};
+    const mounts = { [TAB_MEETING]: ui.mountMeetingTab, [TAB_ALL]: ui.mountAllMeetingsTab };
+    for (const [type, mount] of Object.entries(mounts)) {
+      for (const tab of opened[type] || []) {
+        if (!tab.meetingOwner || tab.meetingOwner === this) continue;
+        try {
+          tab.meetingCleanup?.();
+        } catch (error) {
+          console.error("[siyuan-meeting] stale tab cleanup failed", error);
+        }
+        tab.meetingOwner = this;
+        mount(this, tab);
+      }
+    }
+  }
+
   registerTabs() {
     const plugin = this;
     this.addTab({
       type: TAB_MEETING,
       init() {
+        this.meetingOwner = plugin;
         ui.mountMeetingTab(plugin, this);
+      },
+      update() {
+        this.meetingRefresh?.();
       },
       destroy() {
         try {
@@ -2469,6 +2494,7 @@ module.exports = class MeetingPlugin extends Plugin {
     this.addTab({
       type: TAB_ALL,
       init() {
+        this.meetingOwner = plugin;
         ui.mountAllMeetingsTab(plugin, this);
       },
       destroy() {
@@ -2805,7 +2831,6 @@ const api = require("./siyuan-api");
 const {
   sha256,
   escapeIal,
-  sqlString,
   defaultMeetingTitle,
   isBlockId,
   isAssetPath,
@@ -3361,13 +3386,13 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
     target = { id: latest.id, title: latest.title };
     // Capture the old block ids and append the new content first. If the
     // append fails, the previous summary is still intact.
-    oldBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
+    oldBlocks = await api.post("/api/block/getChildBlocks", { id: target.id });
     replaced = true;
   }
 
   await api.appendMarkdown(target.id, content);
   if (oldBlocks.length) {
-    const currentBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
+    const currentBlocks = await api.post("/api/block/getChildBlocks", { id: target.id });
     const oldIds = new Set(oldBlocks.map((block) => block.id));
     const currentOld = currentBlocks.filter((block) => oldIds.has(block.id));
     if (blocksFingerprint(currentOld) !== blocksFingerprint(oldBlocks)) {
@@ -3744,7 +3769,7 @@ module.exports = {
 "use strict";
 
 const { fetchSyncPost, openTab, getAllEditor } = require("siyuan");
-const { parseIal, sqlString, escapeIal } = require("./util");
+const { sqlString, escapeIal } = require("./util");
 
 async function post(endpoint, payload = {}) {
   let response;
@@ -3955,7 +3980,7 @@ async function listChildDocs(parentID, kind = "") {
     ? `JOIN attributes c ON c.block_id=b.id AND c.name='custom-meeting-child' AND c.value=${sqlString(kind)}`
     : "";
   const rows = await sql(
-    `SELECT b.id, b.content, b.ial, b.created
+    `SELECT b.id, b.content, b.created
       FROM blocks b
       JOIN attributes p ON p.block_id=b.id AND p.name='custom-meeting-parent' AND p.value=${sqlString(parentID)}
       ${kindJoin}
@@ -3963,18 +3988,36 @@ async function listChildDocs(parentID, kind = "") {
       GROUP BY b.id
       ORDER BY b.created ASC, b.id ASC LIMIT -1`,
   );
-  return rows.map((row) => ({ id: row.id, title: row.content, attrs: parseIal(row.ial) }));
+  return Promise.all(rows.map(async (row) => ({
+    id: row.id, title: row.content, attrs: await getBlockAttrs(row.id),
+  })));
 }
 
 async function listBlocksWithAttr(parentID, attrName) {
-  const rows = await sql(
-    `SELECT b.id, b.type, b.content, b.markdown, b.ial, b.created
-      FROM blocks b JOIN attributes a ON a.block_id=b.id AND a.name=${sqlString(attrName)}
-      WHERE b.parent_id=${sqlString(parentID)}
-      GROUP BY b.id
-      ORDER BY b.created ASC, b.id ASC LIMIT -1`,
-  );
-  return rows.map((row) => ({ id: row.id, type: row.type, content: row.content, markdown: row.markdown, attrs: parseIal(row.ial) }));
+  // Synced trees can be newer than the SQL block/attribute index. Read both
+  // content and attributes from the native tree, including newly synced IDs.
+  const [rows, data] = await Promise.all([
+    post("/api/block/getChildBlocks", { id: parentID }),
+    post("/api/block/getBlockDOM", { id: parentID }),
+  ]);
+  if (!Array.isArray(rows) || typeof data?.dom !== "string") {
+    throw new Error("无法读取会议文档，请重新加载会议数据。");
+  }
+  const template = document.createElement("template");
+  template.innerHTML = data.dom;
+  const attrsById = new Map();
+  for (const element of template.content.querySelectorAll("[data-node-id]")) {
+    const attrs = { id: element.getAttribute("data-node-id") };
+    for (const attr of element.attributes) {
+      if (attr.name.startsWith("custom-")) attrs[attr.name] = attr.value;
+    }
+    attrsById.set(attrs.id, attrs);
+  }
+  return rows.flatMap((row) => {
+    const attrs = attrsById.get(row.id);
+    if (!attrs) throw new Error("会议文档在读取期间发生变化，请重新加载会议数据。");
+    return Object.hasOwn(attrs, attrName) ? [{ ...row, attrs }] : [];
+  });
 }
 
 async function getBlockInfo(id) {
@@ -5305,6 +5348,25 @@ function mountMeetingTab(plugin, tab) {
 
   const cleanupFns = [];
   const onCleanup = (fn) => cleanupFns.push(fn);
+  // SiYuan calls custom-tab update after a sync merge or native doc reload.
+  const refreshSyncedMeeting = debounce(async () => {
+    if (state.destroyed || !state.meeting) return;
+    try {
+      await Promise.all(tab.editors.map((editor) => editor.flushPendingTransactions()));
+      if (state.destroyed) return;
+      await refreshAll(state);
+      if (state.destroyed) return;
+      for (const editor of tab.editors) editor.reload(false);
+    } catch (error) {
+      if (!state.destroyed) showMessage(`刷新会议数据失败：${error.message}`, 6000, "error");
+    }
+  }, 300);
+  tab.meetingRefresh = refreshSyncedMeeting;
+  onCleanup(() => {
+    refreshSyncedMeeting.cancel();
+    delete tab.meetingRefresh;
+    tab.editors = [];
+  });
 
   const rerenderChrome = () => renderChrome(state, field, action);
   const unsubscribe = plugin.controller.subscribe((snapshot) => {
@@ -5556,6 +5618,7 @@ function mountMeetingTab(plugin, tab) {
           scroll: true,
         },
       });
+      registerMeetingEditors(state);
       const wysiwyg = state.protyle?.protyle?.wysiwyg?.element;
       if (wysiwyg) {
         wysiwyg.classList.add("meeting-notes-editor");
@@ -5923,6 +5986,10 @@ function defaultMeetingView(state) {
 
 function resolveMeetingView(state) {
   return MEETING_VIEWS.includes(state.ui.view) ? state.ui.view : defaultMeetingView(state);
+}
+
+function registerMeetingEditors(state) {
+  state.tab.editors = [state.protyle, state.summaryProtyle, state.transcriptProtyle].filter(Boolean);
 }
 
 function setMeetingView(state, view) {
@@ -6601,6 +6668,7 @@ async function toggleTranscriptEditor(state) {
           blockId, mode: "wysiwyg", action: ["cb-get-all"],
           render: { background: false, title: false, gutter: true, breadcrumb: false, scroll: true },
         });
+        registerMeetingEditors(state);
       }
     }
     renderTranscriptView(state);
@@ -6965,6 +7033,7 @@ function renderSummary(state) {
       action: ["cb-get-all"],
       render: { background: false, title: false, gutter: true, breadcrumb: false, scroll: true },
     });
+    registerMeetingEditors(state);
   } else {
     state.summaryProtyle.resize?.();
   }
@@ -7377,7 +7446,7 @@ function openMoreMenu(state) {
   menu.addItem({
     icon: "iconMeetingRefresh",
     label: "重新加载会议数据",
-    click: () => void refreshAll(state),
+    click: () => state.tab.meetingRefresh(),
   });
   menu.addItem({
     icon: "iconMeetingSettings",

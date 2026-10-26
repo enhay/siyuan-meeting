@@ -9,14 +9,17 @@ Module._load = function (name, ...args) {
 };
 const api = require("../src/siyuan-api");
 const store = require("../src/meeting-store");
-const { parseIal } = require("../src/util");
+const { parseIal, sha256 } = require("../src/util");
 Module._load = originalLoad;
 
 test("retrying summary metadata save preserves a single result and refuses to overwrite a later edit", async (t) => {
   const document = { id: "summary", content: "", attrs: {} };
   t.mock.method(api, "listChildDocs", async () => [{ id: document.id, attrs: document.attrs }]);
   t.mock.method(api, "getDocMarkdown", async () => document.content);
-  t.mock.method(api, "sql", async () => []);
+  t.mock.method(api, "post", async (endpoint) => {
+    assert.equal(endpoint, "/api/block/getChildBlocks");
+    return [];
+  });
   t.mock.method(api, "appendMarkdown", async (_id, content) => { document.content += content; });
   let failMetadata = true;
   t.mock.method(api, "setBlockAttrs", async (_id, attrs) => {
@@ -33,6 +36,26 @@ test("retrying summary metadata save preserves a single result and refuses to ov
   document.content = "人工确认的纪要";
   await assert.rejects(store.saveSummary({ id: "meeting" }, draft));
   assert.equal(document.content, "人工确认的纪要");
+});
+
+test("replacing a synced summary uses native blocks when the SQL index still has the previous revision", async (t) => {
+  let blocks = [{ id: "old-summary-block", markdown: "原纪要", content: "原纪要" }];
+  let attrs = {};
+  t.mock.method(api, "listChildDocs", async () => [{ id: "summary", attrs }]);
+  t.mock.method(api, "sql", async () => []);
+  t.mock.method(api, "getDocMarkdown", async () => blocks.map((block) => block.markdown).join("\n"));
+  t.mock.method(api, "post", async (endpoint) => {
+    assert.equal(endpoint, "/api/block/getChildBlocks");
+    return structuredClone(blocks);
+  });
+  t.mock.method(api, "appendMarkdown", async (_id, markdown) => {
+    blocks.push({ id: "new-summary-block", markdown, content: markdown });
+  });
+  t.mock.method(api, "deleteBlocks", async (ids) => { blocks = blocks.filter((block) => !ids.includes(block.id)); });
+  t.mock.method(api, "setBlockAttrs", async (_id, patch) => { attrs = { ...attrs, ...patch }; });
+  const saved = await store.saveSummary({ id: "meeting" }, { markdown: "更新后的纪要", expectedFingerprint: sha256("原纪要") });
+  assert.equal(saved.content, "更新后的纪要");
+  assert.equal(attrs[store.ATTR.summaryFingerprint], sha256("更新后的纪要"));
 });
 
 test("renaming a speaker changes matching native labels while retaining emphasis, links and timing attributes", async (t) => {

@@ -5,7 +5,6 @@ const api = require("./siyuan-api");
 const {
   sha256,
   escapeIal,
-  sqlString,
   defaultMeetingTitle,
   isBlockId,
   isAssetPath,
@@ -561,13 +560,13 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
     target = { id: latest.id, title: latest.title };
     // Capture the old block ids and append the new content first. If the
     // append fails, the previous summary is still intact.
-    oldBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
+    oldBlocks = await api.post("/api/block/getChildBlocks", { id: target.id });
     replaced = true;
   }
 
   await api.appendMarkdown(target.id, content);
   if (oldBlocks.length) {
-    const currentBlocks = await api.sql(`SELECT id, markdown, content FROM blocks WHERE parent_id=${sqlString(target.id)} ORDER BY id LIMIT -1`);
+    const currentBlocks = await api.post("/api/block/getChildBlocks", { id: target.id });
     const oldIds = new Set(oldBlocks.map((block) => block.id));
     const currentOld = currentBlocks.filter((block) => oldIds.has(block.id));
     if (blocksFingerprint(currentOld) !== blocksFingerprint(oldBlocks)) {

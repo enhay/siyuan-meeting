@@ -1,7 +1,7 @@
 "use strict";
 
 const { fetchSyncPost, openTab, getAllEditor } = require("siyuan");
-const { parseIal, sqlString, escapeIal } = require("./util");
+const { sqlString, escapeIal } = require("./util");
 
 async function post(endpoint, payload = {}) {
   let response;
@@ -212,7 +212,7 @@ async function listChildDocs(parentID, kind = "") {
     ? `JOIN attributes c ON c.block_id=b.id AND c.name='custom-meeting-child' AND c.value=${sqlString(kind)}`
     : "";
   const rows = await sql(
-    `SELECT b.id, b.content, b.ial, b.created
+    `SELECT b.id, b.content, b.created
       FROM blocks b
       JOIN attributes p ON p.block_id=b.id AND p.name='custom-meeting-parent' AND p.value=${sqlString(parentID)}
       ${kindJoin}
@@ -220,18 +220,36 @@ async function listChildDocs(parentID, kind = "") {
       GROUP BY b.id
       ORDER BY b.created ASC, b.id ASC LIMIT -1`,
   );
-  return rows.map((row) => ({ id: row.id, title: row.content, attrs: parseIal(row.ial) }));
+  return Promise.all(rows.map(async (row) => ({
+    id: row.id, title: row.content, attrs: await getBlockAttrs(row.id),
+  })));
 }
 
 async function listBlocksWithAttr(parentID, attrName) {
-  const rows = await sql(
-    `SELECT b.id, b.type, b.content, b.markdown, b.ial, b.created
-      FROM blocks b JOIN attributes a ON a.block_id=b.id AND a.name=${sqlString(attrName)}
-      WHERE b.parent_id=${sqlString(parentID)}
-      GROUP BY b.id
-      ORDER BY b.created ASC, b.id ASC LIMIT -1`,
-  );
-  return rows.map((row) => ({ id: row.id, type: row.type, content: row.content, markdown: row.markdown, attrs: parseIal(row.ial) }));
+  // Synced trees can be newer than the SQL block/attribute index. Read both
+  // content and attributes from the native tree, including newly synced IDs.
+  const [rows, data] = await Promise.all([
+    post("/api/block/getChildBlocks", { id: parentID }),
+    post("/api/block/getBlockDOM", { id: parentID }),
+  ]);
+  if (!Array.isArray(rows) || typeof data?.dom !== "string") {
+    throw new Error("无法读取会议文档，请重新加载会议数据。");
+  }
+  const template = document.createElement("template");
+  template.innerHTML = data.dom;
+  const attrsById = new Map();
+  for (const element of template.content.querySelectorAll("[data-node-id]")) {
+    const attrs = { id: element.getAttribute("data-node-id") };
+    for (const attr of element.attributes) {
+      if (attr.name.startsWith("custom-")) attrs[attr.name] = attr.value;
+    }
+    attrsById.set(attrs.id, attrs);
+  }
+  return rows.flatMap((row) => {
+    const attrs = attrsById.get(row.id);
+    if (!attrs) throw new Error("会议文档在读取期间发生变化，请重新加载会议数据。");
+    return Object.hasOwn(attrs, attrName) ? [{ ...row, attrs }] : [];
+  });
 }
 
 async function getBlockInfo(id) {

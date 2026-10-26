@@ -467,6 +467,25 @@ function mountMeetingTab(plugin, tab) {
 
   const cleanupFns = [];
   const onCleanup = (fn) => cleanupFns.push(fn);
+  // SiYuan calls custom-tab update after a sync merge or native doc reload.
+  const refreshSyncedMeeting = debounce(async () => {
+    if (state.destroyed || !state.meeting) return;
+    try {
+      await Promise.all(tab.editors.map((editor) => editor.flushPendingTransactions()));
+      if (state.destroyed) return;
+      await refreshAll(state);
+      if (state.destroyed) return;
+      for (const editor of tab.editors) editor.reload(false);
+    } catch (error) {
+      if (!state.destroyed) showMessage(`刷新会议数据失败：${error.message}`, 6000, "error");
+    }
+  }, 300);
+  tab.meetingRefresh = refreshSyncedMeeting;
+  onCleanup(() => {
+    refreshSyncedMeeting.cancel();
+    delete tab.meetingRefresh;
+    tab.editors = [];
+  });
 
   const rerenderChrome = () => renderChrome(state, field, action);
   const unsubscribe = plugin.controller.subscribe((snapshot) => {
@@ -718,6 +737,7 @@ function mountMeetingTab(plugin, tab) {
           scroll: true,
         },
       });
+      registerMeetingEditors(state);
       const wysiwyg = state.protyle?.protyle?.wysiwyg?.element;
       if (wysiwyg) {
         wysiwyg.classList.add("meeting-notes-editor");
@@ -1085,6 +1105,10 @@ function defaultMeetingView(state) {
 
 function resolveMeetingView(state) {
   return MEETING_VIEWS.includes(state.ui.view) ? state.ui.view : defaultMeetingView(state);
+}
+
+function registerMeetingEditors(state) {
+  state.tab.editors = [state.protyle, state.summaryProtyle, state.transcriptProtyle].filter(Boolean);
 }
 
 function setMeetingView(state, view) {
@@ -1763,6 +1787,7 @@ async function toggleTranscriptEditor(state) {
           blockId, mode: "wysiwyg", action: ["cb-get-all"],
           render: { background: false, title: false, gutter: true, breadcrumb: false, scroll: true },
         });
+        registerMeetingEditors(state);
       }
     }
     renderTranscriptView(state);
@@ -2127,6 +2152,7 @@ function renderSummary(state) {
       action: ["cb-get-all"],
       render: { background: false, title: false, gutter: true, breadcrumb: false, scroll: true },
     });
+    registerMeetingEditors(state);
   } else {
     state.summaryProtyle.resize?.();
   }
@@ -2539,7 +2565,7 @@ function openMoreMenu(state) {
   menu.addItem({
     icon: "iconMeetingRefresh",
     label: "重新加载会议数据",
-    click: () => void refreshAll(state),
+    click: () => state.tab.meetingRefresh(),
   });
   menu.addItem({
     icon: "iconMeetingSettings",
