@@ -82,7 +82,8 @@ const PROTOCOLS = {
         user: { uid: "siyuan-meeting" },
         audio: { format: "pcm", codec: "raw", rate: channel.owner.sampleRate, bits: 16, channel: 1 },
         request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
-          result_type: "single", end_window_size: 600, enable_speaker_info: true },
+          result_type: "single", end_window_size: 600, enable_speaker_info: true,
+          ...(channel.owner.corpus ? { corpus: channel.owner.corpus } : {}) },
       })));
     },
     audio(data) { return this.frame(2, 0, 0, Buffer.from(data)); },
@@ -366,7 +367,7 @@ class RealtimeChannel {
 }
 
 class RealtimeTranscriber {
-  constructor({ service, sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
+  constructor({ service, sampleRate, channels, enabled, configured, engine = "large", corpus, requestUrl, emit, caption = () => {},
     WebSocket: Socket = globalThis.WebSocket }) {
     if (!Object.hasOwn(PROTOCOLS, service)) throw new Error("unknown transcription service");
     this.protocol = PROTOCOLS[service];
@@ -376,6 +377,7 @@ class RealtimeTranscriber {
     this.enabled = enabled;
     this.configured = configured;
     this.engine = engine;
+    this.corpus = corpus;
     this.requestUrl = requestUrl;
     this.emit = emit;
     this.caption = caption;
@@ -565,6 +567,7 @@ class RecordingStore {
       meetingId: meta.meetingId || "",
       docId: meta.docId || "",
       segmentNo: Number(meta.segmentNo || 0) || 0,
+      hotwords: Array.isArray(meta.hotwords) ? meta.hotwords.slice() : [],
       startedAt: meta.startedAt || new Date().toISOString(),
       sampleRate,
       channels,
@@ -1272,6 +1275,7 @@ const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const tencent = require("./tencent");
 const doubao = require("./doubao");
+const { effectiveHotwords, validateHotwords, doubaoCorpus } = require("./hotwords");
 const { recover, finalizeInterrupted } = require("../capture/storage.cjs");
 const { clamp, isBlockId, isAssetPath } = require("./util");
 
@@ -1442,6 +1446,7 @@ class MeetingController {
       realtimeEngine: "large",
       floatCaptions: true,
       autoFillGaps: true,
+      hotwords: [],
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
     remote.ipcMain.on(this.channel, this.ipcListener);
@@ -1676,6 +1681,8 @@ class MeetingController {
     if (!doc) throw new Error("请先新建或打开一个会议");
     let meeting = await meetingStore.getMeeting(doc);
     if (!meeting.isMeeting) throw new Error("这篇文档不是会议文档");
+    const hotwords = effectiveHotwords(this.prefs.hotwords, meeting);
+    if (this.prefs.realtimeTranscription !== false) validateHotwords(hotwords, this.plugin.transcription.service());
 
     this.prefs.mode = online ? "online" : "offline";
     this.prefs.deviceId = deviceId;
@@ -1705,6 +1712,7 @@ class MeetingController {
     this.state.realtimeService = this.plugin.transcription.service();
     this.state.realtimeConfigured = this.plugin.transcription.isConfigured(this.state.realtimeService);
     this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
+    this.state.realtimeHotwords = hotwords;
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -1741,12 +1749,14 @@ class MeetingController {
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
             engine: this.state.realtimeEngine,
+            ...(this.state.realtimeEnabled && this.state.realtimeService === "doubao" ? doubaoCorpus(this.state.realtimeHotwords) : {}),
           },
           meta: {
             recordingId: this.state.recordingId,
             meetingId: meeting.meetingId,
             docId: meeting.id,
             segmentNo: meeting.segments || 0,
+            hotwords: this.state.realtimeHotwords,
           },
         })})`,
       );
@@ -2010,6 +2020,7 @@ class MeetingController {
           reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
             : tencent.signRealtimeUrl(await this.plugin.transcription.realtimeConfig(), {
               voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
+              hotwords: this.state.realtimeHotwords,
             });
         } catch (error) {
           reply.error = error.userMessage || "实时转写暂时不可用，录音仍在保存。";
@@ -2705,6 +2716,7 @@ module.exports = { MeetingController, ACTIVE_PHASES };
 
 const crypto = require("node:crypto");
 const cloud = require("./cloud");
+const { doubaoCorpus } = require("./hotwords");
 
 const HOST = "openspeech.bytedance.com";
 // https://docs.volcengine.com/docs/DoubaoVoice/bidirectional-streaming-automatic-speech-recognition-websocket
@@ -2795,11 +2807,11 @@ async function fileRequest(config, action, requestId, body, signal) {
   return { status, body: response.text ? cloud.json(response) : {} };
 }
 
-async function submit(config, url, requestId, signal) {
+async function submit(config, url, requestId, signal, hotwords = []) {
   const result = await fileRequest(config, "submit", requestId, {
     user: { uid: "siyuan-meeting" }, audio: { url, format: "wav", rate: 16000, bits: 16, channel: 1 },
     request: { model_name: "bigmodel", enable_itn: true, enable_punc: true,
-      enable_speaker_info: true, show_utterances: true, ssd_version: "300" },
+      enable_speaker_info: true, show_utterances: true, ssd_version: "300", ...doubaoCorpus(hotwords) },
   }, signal);
   if (result.status !== 20000000 || typeof result.body.task_id !== "string" || !result.body.task_id) {
     throw cloud.failure("豆包未返回任务编号，请检查云端任务后再操作");
@@ -2815,6 +2827,46 @@ async function query(config, taskId, signal) {
 }
 
 module.exports = { REALTIME_URL, isConfigured, realtimeHeaders, serviceError, parseResult, submit, query };
+
+  },
+  "src/hotwords.js": function (module, exports, require) {
+"use strict";
+
+function parseHotwords(value) {
+  const text = Array.isArray(value) ? value.filter((word) => typeof word === "string").join("\n") : String(value || "");
+  return [...new Set(text.split(/[\s\p{P}\p{S}\p{C}]+/u).filter(Boolean))];
+}
+
+function effectiveHotwords(globalWords, meeting = {}) {
+  const excluded = new Set(parseHotwords(meeting.excludedHotwords));
+  return parseHotwords([
+    ...parseHotwords(meeting.hotwords),
+    ...(meeting.useGlobalHotwords === false ? [] : parseHotwords(globalWords)),
+  ]).filter((word) => !excluded.has(word));
+}
+
+function validateHotwords(value, service) {
+  const words = parseHotwords(value);
+  const limit = service === "tencent" ? 128 : 5000;
+  if (words.length > limit) throw new Error(`${service === "tencent" ? "腾讯云" : "豆包"}最多支持 ${limit} 个热词，请减少后再试`);
+  const tooLong = words.find((word) => service === "tencent"
+    ? Buffer.byteLength(word, "utf8") > 30
+    : [...word].length > 30 || (word.match(/\p{Script=Han}/gu) || []).length > 10);
+  if (tooLong) throw new Error(`热词“${tooLong}”过长，请使用简短的人名或术语（中文最多 10 字，英文最多 30 字母）`);
+  return words;
+}
+
+function tencentHotwords(words) {
+  // Ordinary emphasis; never opt users into forced homophone replacement.
+  return validateHotwords(words, "tencent").map((word) => `${word}|5`).join(",");
+}
+
+function doubaoCorpus(words) {
+  const hotwords = validateHotwords(words, "doubao").map((word) => ({ word }));
+  return hotwords.length ? { corpus: { context: JSON.stringify({ hotwords }) } } : {};
+}
+
+module.exports = { parseHotwords, effectiveHotwords, validateHotwords, tencentHotwords, doubaoCorpus };
 
   },
   "src/icons.js": function (module, exports, require) {
@@ -3307,6 +3359,7 @@ module.exports = class MeetingPlugin extends Plugin {
 
 const crypto = require("node:crypto");
 const api = require("./siyuan-api");
+const { parseHotwords } = require("./hotwords");
 const {
   sha256,
   escapeIal,
@@ -3354,6 +3407,11 @@ const ATTR = {
   summaryFingerprint: "custom-summary-fingerprint",
   summaryTemplate: "custom-meeting-summary-template",
   summaryBasis: "custom-summary-basis",
+  hotwords: "custom-meeting-hotwords",
+  excludedHotwords: "custom-meeting-excluded-hotwords",
+  useGlobalHotwords: "custom-meeting-use-global-hotwords",
+  realtimeHotwords: "custom-recording-realtime-hotwords",
+  fileHotwords: "custom-recording-file-hotwords",
 };
 
 const MEETING_STATUS = {
@@ -3378,6 +3436,9 @@ function meetingFrom(row, attrs = {}) {
     preNotes: attrs[ATTR.preNotes] || "",
     isMeeting: Boolean(attrs[ATTR.id]),
     summaryTemplate: attrs[ATTR.summaryTemplate] || "general",
+    hotwords: parseHotwords(attrs[ATTR.hotwords]),
+    excludedHotwords: parseHotwords(attrs[ATTR.excludedHotwords]),
+    useGlobalHotwords: attrs[ATTR.useGlobalHotwords] !== "0",
   };
 }
 
@@ -3472,6 +3533,18 @@ async function savePreNotes(docId, markdown) {
   return value;
 }
 
+async function saveHotwords(docId, { hotwords, excludedHotwords, useGlobalHotwords }) {
+  if (!isBlockId(docId)) throw new Error("无法找到这场会议，请重新打开");
+  const saved = { hotwords: parseHotwords(hotwords), excludedHotwords: parseHotwords(excludedHotwords),
+    useGlobalHotwords: useGlobalHotwords !== false };
+  await api.setBlockAttrs(docId, {
+    [ATTR.hotwords]: saved.hotwords.join(" "),
+    [ATTR.excludedHotwords]: saved.excludedHotwords.join(" "),
+    [ATTR.useGlobalHotwords]: saved.useGlobalHotwords ? "1" : "0",
+  });
+  return saved;
+}
+
 async function renameMeeting(docId, title) {
   if (!isBlockId(docId)) throw new Error("无法找到这场会议，请从会议菜单重新打开");
   return api.renameDoc(docId, title);
@@ -3556,6 +3629,7 @@ async function ensureRecording(meeting, meta) {
     [ATTR.recordingSampleRate]: String(meta.sampleRate || 16000),
     [ATTR.recordingChannels]: String(meta.channels || 1),
     [ATTR.realtimeEnabled]: meta.realtimeEnabled ? "1" : "0",
+    [ATTR.realtimeHotwords]: parseHotwords(meta.hotwords).join(" "),
     [ATTR.recordingDevice]: meta.deviceId || "",
     [ATTR.transcriptionStatus]: "recording",
   };
@@ -3612,6 +3686,8 @@ async function readRecordings(meeting) {
         transcriptionFingerprint: attrs[ATTR.transcriptionFingerprint] || "",
         gaps: parseEvents(attrs[ATTR.transcriptionGaps]),
         realtimeEnabled: attrs[ATTR.realtimeEnabled] === "1",
+        realtimeHotwords: parseHotwords(attrs[ATTR.realtimeHotwords]),
+        fileHotwords: parseHotwords(attrs[ATTR.fileHotwords]),
         deviceId: attrs[ATTR.recordingDevice] || "",
       };
     })
@@ -3796,6 +3872,7 @@ async function updateRecordingTranscription(meeting, recordingId, patch) {
     transcriptionError: ATTR.transcriptionError,
     transcriptionIssue: ATTR.transcriptionIssue,
     transcriptionFingerprint: ATTR.transcriptionFingerprint,
+    fileHotwords: ATTR.fileHotwords,
     gaps: ATTR.transcriptionGaps,
     realtimeEnabled: ATTR.realtimeEnabled,
   };
@@ -3921,6 +3998,7 @@ module.exports = {
   setSegmentCount,
   markFirstRecorded,
   savePreNotes,
+  saveHotwords,
   renameMeeting,
   findChild,
   ensureTranscriptDoc,
@@ -4896,6 +4974,7 @@ module.exports = { createTemplatePicker, createTemplateManager, openTemplateMana
 
 const crypto = require("node:crypto");
 const cloud = require("./cloud");
+const { tencentHotwords } = require("./hotwords");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
@@ -4926,7 +5005,7 @@ const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
 
 // https://cloud.tencent.com/document/product/1093/48982
 // `now` is a Unix timestamp in seconds. Only the main window calls this function.
-function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
+function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large", hotwords = [],
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
   if (!/^\d+$/.test(String(config.appId || ""))) throw new Error("腾讯云账号信息尚未取得");
@@ -4946,8 +5025,11 @@ function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 1
     voice_format: 1,
     voice_id: voiceId,
   };
+  const hotwordList = tencentHotwords(hotwords);
+  if (hotwordList) params.hotword_list = hotwordList;
   const source = `${ASR_HOST}/asr/v2/${config.appId}?${queryString(params)}`;
-  return `wss://${source}&signature=${encodeURIComponent(signature(config.secretKey, source))}`;
+  const encoded = Object.keys(params).sort().map((key) => `${key}=${encodeURIComponent(params[key])}`).join("&");
+  return `wss://${ASR_HOST}/asr/v2/${config.appId}?${encoded}&signature=${encodeURIComponent(signature(config.secretKey, source))}`;
 }
 
 function serviceError(code, requestId = "") {
@@ -4979,11 +5061,13 @@ async function getAppId(config) {
   return String(result.AppId);
 }
 
-async function submit(config, url, requestId, signal) {
+async function submit(config, url, requestId, signal, hotwords = []) {
   requireConfig(config);
+  const hotwordList = tencentHotwords(hotwords);
   const result = await cloud.tcCall(config, "asr", "2019-06-14", "CreateRecTask", {
     EngineModelType: "16k_zh_en_2.0", ChannelNum: 1, ResTextFormat: 1,
     SourceType: 0, Url: url, SpeakerDiarization: 1,
+    ...(hotwordList ? { HotwordList: hotwordList } : {}),
   }, signal);
   if (!Number.isSafeInteger(result.Data?.TaskId)) throw cloud.failure("腾讯云未返回任务编号，请检查云端任务后再操作");
   return String(result.Data.TaskId);
@@ -5048,6 +5132,7 @@ const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const tencent = require("./tencent");
 const doubao = require("./doubao");
+const { effectiveHotwords, validateHotwords } = require("./hotwords");
 
 const CLIENTS = { doubao, tencent };
 const { wavParts } = require("./wav");
@@ -5225,7 +5310,7 @@ class TranscriptionManager {
     try {
       if (job?.saved) {
         publish("cleaning");
-        await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+        await this.setState(meeting, recording.recordingId, "done", "", { gaps: [], fileHotwords: (job.hotwords || []).join(" ") }, { publish: false });
         await this.cleanup(job, signal);
         outcome = { status: "done", error: "", progress: { phase: "done" } };
         if (resume) return;
@@ -5243,6 +5328,9 @@ class TranscriptionManager {
       if (!job) {
         if (queryOnly) return;
         if (!this.isFileConfigured()) throw cloud.failure("请先在会议设置中配置转写服务和腾讯云 COS");
+        const currentMeeting = await meetingStore.getMeeting(meeting.id);
+        const service = this.service();
+        const hotwords = validateHotwords(effectiveHotwords(this.plugin.controller.getPrefs().hotwords, currentMeeting), service);
         const absolute = await api.resolveAssetPath(recording.assetPath);
         if (!absolute) throw cloud.failure("录音尚未同步到本机，请同步后重试");
         const ranges = gapsOnly ? mergeGaps((recording.gaps || []).map((gap) => ({ ...gap, channel: 0 }))) : [{}];
@@ -5252,7 +5340,8 @@ class TranscriptionManager {
         }
         const cos = this.cosConfig();
         job = { id: crypto.randomUUID(), meetingId: meeting.id, recordingId: recording.recordingId,
-          service: this.service(), bucket: cos.bucket, region: cos.region, createdAt: Date.now(),
+          service, bucket: cos.bucket, region: cos.region, createdAt: Date.now(),
+          hotwords,
           fingerprint: expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId),
           gapsOnly, phase: "preparing", parts: [] };
         this.saveJob(job);
@@ -5305,7 +5394,7 @@ class TranscriptionManager {
           this.saveJob(job);
           publish("submitting");
           try {
-            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal);
+            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords);
           } catch (error) {
             if (error.rejected) { part.stage = "rejected"; job.failed = true; this.saveJob(job); }
             throw error;
@@ -5363,7 +5452,7 @@ class TranscriptionManager {
       job.saved = true;
       job.phase = "cleaning";
       this.saveJob(job);
-      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [], fileHotwords: (job.hotwords || []).join(" ") }, { publish: false });
       this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
       publish("cleaning");
       await this.cleanup(job, signal);
@@ -5442,6 +5531,7 @@ const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
 const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
+const { parseHotwords, effectiveHotwords, validateHotwords } = require("./hotwords");
 const prompts = require("./prompts");
 const { createTemplatePicker, createTemplateManager, openTemplateManager } = require("./template-ui");
 const ai = require("./ai");
@@ -5818,6 +5908,7 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
+    <div class="meeting-hotwords" data-field="hotwords"></div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
     <div class="meeting-body">
@@ -6318,6 +6409,7 @@ async function stopMeeting(state) {
 }
 
 function renderChrome(state, field, action) {
+  renderMeetingHotwords(state);
   const snapshot = state.snapshot || state.controller.snapshot();
   const phase = snapshot.phase || "idle";
   const activeHere = snapshot.meeting?.id === state.docId;
@@ -6334,7 +6426,7 @@ function renderChrome(state, field, action) {
 
   const hasSegments = Boolean(state.meeting?.segments) || state.recordings.length > 0;
   rootSetText(field("start-label"), hasSegments ? "补录" : "开始录音");
-  action("start").disabled = Boolean(anotherActive) || state.meeting?.isMeeting === false;
+  action("start").disabled = Boolean(anotherActive) || Boolean(state.hotwordsSaving) || state.meeting?.isMeeting === false;
   action("start").title = anotherActive ? "已有其他会议在录音" : hasSegments ? "在原会议下新增录音段" : "开始录音";
 
   state.root.querySelectorAll("[data-mode]").forEach((button) => {
@@ -8057,6 +8149,165 @@ async function refreshAll(state) {
 
 // ---- settings -------------------------------------------------------------
 
+function hotwordTag(word, remove) {
+  const tag = h("span", "meeting-hotword", word);
+  if (remove) {
+    const button = h("button", "meeting-hotword__remove", "×");
+    button.type = "button";
+    button.setAttribute("aria-label", `本场不使用 ${word}`);
+    button.title = "仅从本场会议移除";
+    button.onclick = remove;
+    tag.append(button);
+  }
+  return tag;
+}
+
+function hotwordServiceHint(service) {
+  return service === "doubao"
+    ? "豆包实时转写只使用前 100 tokens 内的热词，超出部分由服务端截断；请保留少量关键热词，本场补充优先。会后识别最多支持 5000 个词。"
+    : "腾讯云合并后最多支持 128 个热词，单词最多 10 个汉字或 30 个英文字母。";
+}
+
+function createHotwordEditor(initial, service) {
+  const element = h("div", "meeting-hotword-editor");
+  const preview = h("div", "meeting-hotwords__tags");
+  const input = h("textarea", "b3-text-field meeting-hotwords__input");
+  input.setAttribute("aria-label", "常用热词");
+  input.placeholder = "输入人名、产品名、专业术语，可一次粘贴多个";
+  input.rows = 4;
+  input.value = parseHotwords(initial).join("\n");
+  input.hidden = true;
+  const toggle = h("button", "meeting-link", "编辑");
+  toggle.type = "button";
+  const error = h("p", "meeting-hotwords__error");
+  error.setAttribute("role", "alert");
+  const render = () => {
+    const words = parseHotwords(input.value);
+    preview.replaceChildren(...words.map((word) => hotwordTag(word)));
+    if (!words.length) preview.append(h("span", "meeting-hotwords__hint", "尚未添加常用热词"));
+  };
+  const read = () => validateHotwords(input.value, service());
+  toggle.onclick = () => {
+    if (!input.hidden) {
+      try { input.value = read().join("\n"); } catch (failure) { error.textContent = failure.message; return; }
+      render();
+    }
+    input.hidden = !input.hidden;
+    preview.hidden = !input.hidden;
+    toggle.textContent = input.hidden ? "编辑" : "预览";
+    error.textContent = "";
+    if (!input.hidden) input.focus();
+  };
+  render();
+  element.append(preview, input, toggle,
+    h("p", "meeting-settings__hint", "空格、换行及中英文标点会自动切分为多个词，重复词自动合并。保存后用于后续转写，不改变已有文字。"), error);
+  return { element, read };
+}
+
+function renderMeetingHotwords(state) {
+  const container = state.root.querySelector('[data-field="hotwords"]');
+  if (!container || !state.meeting?.isMeeting || state.hotwordsSaving) return;
+  const prefs = state.controller.getPrefs();
+  const service = prefs.transcriptionService === "tencent" ? "tencent" : "doubao";
+  const key = JSON.stringify([prefs.hotwords, state.meeting.hotwords, state.meeting.excludedHotwords,
+    state.meeting.useGlobalHotwords, service]);
+  if (state.hotwordsKey === key) return;
+  state.hotwordsKey = key;
+  container.replaceChildren();
+  const tags = h("div", "meeting-hotwords__tags");
+  tags.append(h("span", "meeting-hotwords__label", "本场热词"));
+  const error = h("p", "meeting-hotwords__error");
+  error.setAttribute("role", "alert");
+  const save = async (change) => {
+    if (state.hotwordsSaving) return;
+    const restoreFocus = container.contains(document.activeElement);
+    let savedChanges = false;
+    state.hotwordsSaving = true;
+    const start = state.root.querySelector('[data-action="start"]');
+    start.disabled = true;
+    container.setAttribute("aria-busy", "true");
+    for (const control of container.querySelectorAll("button, input, textarea")) control.disabled = true;
+    try {
+      const current = await meetingStore.getMeeting(state.docId);
+      const next = change(current);
+      const globalWords = state.controller.getPrefs().hotwords;
+      const previousWords = new Set(effectiveHotwords(globalWords, current));
+      const nextWords = effectiveHotwords(globalWords, next);
+      // Removing terms must remain possible after switching to a service with a smaller limit.
+      if (nextWords.some((word) => !previousWords.has(word))) validateHotwords(nextWords, service);
+      const saved = await meetingStore.saveHotwords(state.docId, next);
+      Object.assign(state.meeting, saved);
+      savedChanges = true;
+      state.hotwordsKey = "";
+    } catch (failure) {
+      error.textContent = failure.message;
+    } finally {
+      state.hotwordsSaving = false;
+      container.removeAttribute("aria-busy");
+      for (const control of container.querySelectorAll("button, input, textarea")) control.disabled = false;
+      renderMeetingHotwords(state);
+      renderChrome(state, (name) => state.root.querySelector(`[data-field="${name}"]`),
+        (name) => state.root.querySelector(`[data-action="${name}"]`));
+      if (savedChanges && restoreFocus && !state.destroyed) container.querySelector(".meeting-hotword__add")?.focus();
+    }
+  };
+  const words = effectiveHotwords(prefs.hotwords, state.meeting);
+  try { validateHotwords(words, service); } catch (failure) { error.textContent = failure.message; }
+  for (const word of words) tags.append(hotwordTag(word, () => void save((current) => ({
+    ...current, hotwords: current.hotwords.filter((item) => item !== word),
+    excludedHotwords: parseHotwords([...current.excludedHotwords, word]),
+  }))));
+  const add = h("button", "meeting-hotword meeting-hotword__add", "+");
+  add.type = "button";
+  add.setAttribute("aria-label", "添加本场热词");
+  add.setAttribute("aria-expanded", "false");
+  add.title = "添加本场热词";
+  tags.append(add);
+  const editor = h("div", "meeting-hotwords__add-editor");
+  editor.hidden = true;
+  const input = h("textarea", "b3-text-field meeting-hotwords__input");
+  input.rows = 2;
+  input.setAttribute("aria-label", "添加本场热词");
+  input.placeholder = "可粘贴多个词，按空格、换行和标点自动切分";
+  const confirm = h("button", "meeting-btn meeting-btn--outline", "添加");
+  confirm.type = "button";
+  const cancel = h("button", "meeting-link", "取消");
+  cancel.type = "button";
+  add.onclick = () => { editor.hidden = false; add.setAttribute("aria-expanded", "true"); input.focus(); };
+  cancel.onclick = () => { editor.hidden = true; add.setAttribute("aria-expanded", "false"); input.value = ""; error.textContent = ""; add.focus(); };
+  confirm.onclick = () => {
+    const added = parseHotwords(input.value);
+    if (!added.length) { input.focus(); return; }
+    void save((current) => ({ ...current, hotwords: parseHotwords([...current.hotwords, ...added]),
+      excludedHotwords: current.excludedHotwords.filter((word) => !added.includes(word)) }));
+  };
+  input.onkeydown = (event) => {
+    if (event.isComposing) return;
+    if (event.key === "Escape") { event.preventDefault(); cancel.click(); }
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); confirm.click(); }
+  };
+  editor.append(input, confirm, cancel);
+  const options = h("details", "meeting-hotwords__options");
+  options.append(h("summary", "", "使用说明与选项"));
+  const label = h("label", "meeting-hotwords__global");
+  const useGlobal = h("input");
+  useGlobal.type = "checkbox";
+  useGlobal.checked = state.meeting.useGlobalHotwords !== false;
+  useGlobal.onchange = () => {
+    const checked = useGlobal.checked;
+    useGlobal.checked = state.meeting.useGlobalHotwords !== false;
+    void save((current) => ({ ...current, useGlobalHotwords: checked }));
+  };
+  label.append(useGlobal, document.createTextNode("使用全局常用词"));
+  const reset = h("button", "meeting-link", "恢复为全局词表");
+  reset.type = "button";
+  reset.onclick = () => void save((current) => ({ ...current, hotwords: [], excludedHotwords: [], useGlobalHotwords: true }));
+  options.append(label, reset,
+    h("p", "meeting-hotwords__hint", "× 和 + 仅调整本场会议。修改用于下一段录音或会后重新识别，不改变当前实时转写与已有文字。热词帮助识别，不保证命中。"),
+    h("p", "meeting-hotwords__hint", hotwordServiceHint(service)));
+  container.append(tags, editor, options, error);
+}
+
 function openSettings(plugin) {
   const prefs = plugin.controller.getPrefs();
   const notebooks = api.notebooks();
@@ -8131,6 +8382,9 @@ function openSettings(plugin) {
           <input type="checkbox" name="autoFillGaps"${prefs.autoFillGaps !== false ? " checked" : ""}>
         </label>
         <p class="meeting-settings__hint">只补齐实时转写缺口；关闭实时转写时，由你手动识别整段。</p>
+        <h3>常用热词</h3>
+        <div data-field="hotword-editor"></div>
+        <p class="meeting-settings__hint" data-field="hotword-service-hint"></p>
       </section>
       <section ${panel("cloud")}>
         <h3>腾讯云与 COS 临时录音</h3>
@@ -8191,11 +8445,15 @@ function openSettings(plugin) {
     };
   }
   const value = (name) => element.querySelector(`[name="${name}"]`)?.value || "";
+  const hotwordEditor = createHotwordEditor(prefs.hotwords, () => value("service"));
+  element.querySelector('[data-field="hotword-editor"]').append(hotwordEditor.element);
+  element.querySelector('[data-field="hotword-service-hint"]').textContent = hotwordServiceHint(value("service"));
   element.querySelector('[data-field="opacity-value"]').textContent = `${value("opacity")}%`;
   element.querySelector('[name="opacity"]').addEventListener("input", (event) => {
     element.querySelector('[data-field="opacity-value"]').textContent = `${event.target.value}%`;
   });
   element.querySelector('[name="service"]').addEventListener("change", (event) => {
+    element.querySelector('[data-field="hotword-service-hint"]').textContent = hotwordServiceHint(event.target.value);
     for (const group of element.querySelectorAll(".meeting-settings__group")) {
       group.hidden = group.dataset.service !== event.target.value;
     }
@@ -8220,6 +8478,7 @@ function openSettings(plugin) {
     const save = actions.querySelector('[data-action="save"]');
     save.disabled = true;
     try {
+      const hotwords = hotwordEditor.read();
       if (value("cosEndpoint").trim()) parseCosEndpoint(value("cosEndpoint"));
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
@@ -8229,6 +8488,7 @@ function openSettings(plugin) {
         { name: "meeting.tencent.secretKey", value: secretKey },
       ]);
       plugin.controller.setPrefs({
+        hotwords,
         notebookId: value("notebook"),
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,

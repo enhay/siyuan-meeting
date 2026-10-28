@@ -10,6 +10,7 @@ const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const tencent = require("./tencent");
 const doubao = require("./doubao");
+const { effectiveHotwords, validateHotwords, doubaoCorpus } = require("./hotwords");
 const { recover, finalizeInterrupted } = require("../capture/storage.cjs");
 const { clamp, isBlockId, isAssetPath } = require("./util");
 
@@ -180,6 +181,7 @@ class MeetingController {
       realtimeEngine: "large",
       floatCaptions: true,
       autoFillGaps: true,
+      hotwords: [],
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
     remote.ipcMain.on(this.channel, this.ipcListener);
@@ -414,6 +416,8 @@ class MeetingController {
     if (!doc) throw new Error("请先新建或打开一个会议");
     let meeting = await meetingStore.getMeeting(doc);
     if (!meeting.isMeeting) throw new Error("这篇文档不是会议文档");
+    const hotwords = effectiveHotwords(this.prefs.hotwords, meeting);
+    if (this.prefs.realtimeTranscription !== false) validateHotwords(hotwords, this.plugin.transcription.service());
 
     this.prefs.mode = online ? "online" : "offline";
     this.prefs.deviceId = deviceId;
@@ -443,6 +447,7 @@ class MeetingController {
     this.state.realtimeService = this.plugin.transcription.service();
     this.state.realtimeConfigured = this.plugin.transcription.isConfigured(this.state.realtimeService);
     this.state.realtimeEngine = this.prefs.realtimeEngine === "general" ? "general" : "large";
+    this.state.realtimeHotwords = hotwords;
     this.state.phase = "preparing";
     this.state.error = "";
     this.state.needsAttention = "";
@@ -479,12 +484,14 @@ class MeetingController {
             enabled: this.state.realtimeEnabled,
             configured: this.state.realtimeConfigured,
             engine: this.state.realtimeEngine,
+            ...(this.state.realtimeEnabled && this.state.realtimeService === "doubao" ? doubaoCorpus(this.state.realtimeHotwords) : {}),
           },
           meta: {
             recordingId: this.state.recordingId,
             meetingId: meeting.meetingId,
             docId: meeting.id,
             segmentNo: meeting.segments || 0,
+            hotwords: this.state.realtimeHotwords,
           },
         })})`,
       );
@@ -748,6 +755,7 @@ class MeetingController {
           reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
             : tencent.signRealtimeUrl(await this.plugin.transcription.realtimeConfig(), {
               voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
+              hotwords: this.state.realtimeHotwords,
             });
         } catch (error) {
           reply.error = error.userMessage || "实时转写暂时不可用，录音仍在保存。";

@@ -84,6 +84,7 @@ function realtimeUpdate(update) {
     recordingId: store.recordingId, startedAt: store.meta.startedAt,
     segmentNo: store.meta.segmentNo, sampleRate: store.meta.sampleRate,
     channels: store.meta.channels, realtimeEnabled: store.meta.realtimeEnabled,
+    hotwords: store.meta.hotwords,
   }, ...update });
 }
 
@@ -276,6 +277,7 @@ async function connect() {
       service: options.realtime?.service, sampleRate: store.meta.sampleRate, channels,
       enabled: Boolean(options.realtime?.enabled), configured: Boolean(options.realtime?.configured),
       engine: options.realtime?.engine, requestUrl: requestRealtimeUrl, emit: realtimeUpdate,
+      corpus: options.realtime?.corpus,
       caption: (caption) => send({ type: "realtime-caption", recordingId: store?.recordingId, ...caption }),
     });
     realtime.report();

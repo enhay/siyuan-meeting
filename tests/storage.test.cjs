@@ -23,7 +23,7 @@ test("process termination recovers appended PCM without trusting the stale heade
       const { RecordingStore } = require(process.argv[1]);
       const store = new RecordingStore({
         root: process.argv[2], sampleRate: 16000, channels: 2,
-        meta: { meetingId: "meeting-1", docId: "doc-1", segmentNo: 0, recordingId: "rec-1" },
+        meta: { meetingId: "meeting-1", docId: "doc-1", segmentNo: 0, recordingId: "rec-1", hotwords: ["星河"] },
       });
       const samples = new Float32Array(16000 * 2);
       for (let i = 0; i < samples.length; i += 2) {
@@ -46,6 +46,7 @@ test("process termination recovers appended PCM without trusting the stale heade
     assert.equal(recording.meta.phase, "recording");
     assert.equal(recording.meta.meetingId, "meeting-1");
     assert.equal(recording.meta.recordingId, "rec-1");
+    assert.deepEqual(recording.meta.hotwords, ["星河"]);
     assert.equal(recording.seconds, 1);
     assert.equal(recording.meta.events[0].type, "pause");
 

@@ -71,7 +71,8 @@ const PROTOCOLS = {
         user: { uid: "siyuan-meeting" },
         audio: { format: "pcm", codec: "raw", rate: channel.owner.sampleRate, bits: 16, channel: 1 },
         request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
-          result_type: "single", end_window_size: 600, enable_speaker_info: true },
+          result_type: "single", end_window_size: 600, enable_speaker_info: true,
+          ...(channel.owner.corpus ? { corpus: channel.owner.corpus } : {}) },
       })));
     },
     audio(data) { return this.frame(2, 0, 0, Buffer.from(data)); },
@@ -355,7 +356,7 @@ class RealtimeChannel {
 }
 
 class RealtimeTranscriber {
-  constructor({ service, sampleRate, channels, enabled, configured, engine = "large", requestUrl, emit, caption = () => {},
+  constructor({ service, sampleRate, channels, enabled, configured, engine = "large", corpus, requestUrl, emit, caption = () => {},
     WebSocket: Socket = globalThis.WebSocket }) {
     if (!Object.hasOwn(PROTOCOLS, service)) throw new Error("unknown transcription service");
     this.protocol = PROTOCOLS[service];
@@ -365,6 +366,7 @@ class RealtimeTranscriber {
     this.enabled = enabled;
     this.configured = configured;
     this.engine = engine;
+    this.corpus = corpus;
     this.requestUrl = requestUrl;
     this.emit = emit;
     this.caption = caption;

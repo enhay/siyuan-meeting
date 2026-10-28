@@ -4,6 +4,7 @@ const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
 const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
+const { parseHotwords, effectiveHotwords, validateHotwords } = require("./hotwords");
 const prompts = require("./prompts");
 const { createTemplatePicker, createTemplateManager, openTemplateManager } = require("./template-ui");
 const ai = require("./ai");
@@ -380,6 +381,7 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
+    <div class="meeting-hotwords" data-field="hotwords"></div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
     <div class="meeting-body">
@@ -880,6 +882,7 @@ async function stopMeeting(state) {
 }
 
 function renderChrome(state, field, action) {
+  renderMeetingHotwords(state);
   const snapshot = state.snapshot || state.controller.snapshot();
   const phase = snapshot.phase || "idle";
   const activeHere = snapshot.meeting?.id === state.docId;
@@ -896,7 +899,7 @@ function renderChrome(state, field, action) {
 
   const hasSegments = Boolean(state.meeting?.segments) || state.recordings.length > 0;
   rootSetText(field("start-label"), hasSegments ? "补录" : "开始录音");
-  action("start").disabled = Boolean(anotherActive) || state.meeting?.isMeeting === false;
+  action("start").disabled = Boolean(anotherActive) || Boolean(state.hotwordsSaving) || state.meeting?.isMeeting === false;
   action("start").title = anotherActive ? "已有其他会议在录音" : hasSegments ? "在原会议下新增录音段" : "开始录音";
 
   state.root.querySelectorAll("[data-mode]").forEach((button) => {
@@ -2619,6 +2622,165 @@ async function refreshAll(state) {
 
 // ---- settings -------------------------------------------------------------
 
+function hotwordTag(word, remove) {
+  const tag = h("span", "meeting-hotword", word);
+  if (remove) {
+    const button = h("button", "meeting-hotword__remove", "×");
+    button.type = "button";
+    button.setAttribute("aria-label", `本场不使用 ${word}`);
+    button.title = "仅从本场会议移除";
+    button.onclick = remove;
+    tag.append(button);
+  }
+  return tag;
+}
+
+function hotwordServiceHint(service) {
+  return service === "doubao"
+    ? "豆包实时转写只使用前 100 tokens 内的热词，超出部分由服务端截断；请保留少量关键热词，本场补充优先。会后识别最多支持 5000 个词。"
+    : "腾讯云合并后最多支持 128 个热词，单词最多 10 个汉字或 30 个英文字母。";
+}
+
+function createHotwordEditor(initial, service) {
+  const element = h("div", "meeting-hotword-editor");
+  const preview = h("div", "meeting-hotwords__tags");
+  const input = h("textarea", "b3-text-field meeting-hotwords__input");
+  input.setAttribute("aria-label", "常用热词");
+  input.placeholder = "输入人名、产品名、专业术语，可一次粘贴多个";
+  input.rows = 4;
+  input.value = parseHotwords(initial).join("\n");
+  input.hidden = true;
+  const toggle = h("button", "meeting-link", "编辑");
+  toggle.type = "button";
+  const error = h("p", "meeting-hotwords__error");
+  error.setAttribute("role", "alert");
+  const render = () => {
+    const words = parseHotwords(input.value);
+    preview.replaceChildren(...words.map((word) => hotwordTag(word)));
+    if (!words.length) preview.append(h("span", "meeting-hotwords__hint", "尚未添加常用热词"));
+  };
+  const read = () => validateHotwords(input.value, service());
+  toggle.onclick = () => {
+    if (!input.hidden) {
+      try { input.value = read().join("\n"); } catch (failure) { error.textContent = failure.message; return; }
+      render();
+    }
+    input.hidden = !input.hidden;
+    preview.hidden = !input.hidden;
+    toggle.textContent = input.hidden ? "编辑" : "预览";
+    error.textContent = "";
+    if (!input.hidden) input.focus();
+  };
+  render();
+  element.append(preview, input, toggle,
+    h("p", "meeting-settings__hint", "空格、换行及中英文标点会自动切分为多个词，重复词自动合并。保存后用于后续转写，不改变已有文字。"), error);
+  return { element, read };
+}
+
+function renderMeetingHotwords(state) {
+  const container = state.root.querySelector('[data-field="hotwords"]');
+  if (!container || !state.meeting?.isMeeting || state.hotwordsSaving) return;
+  const prefs = state.controller.getPrefs();
+  const service = prefs.transcriptionService === "tencent" ? "tencent" : "doubao";
+  const key = JSON.stringify([prefs.hotwords, state.meeting.hotwords, state.meeting.excludedHotwords,
+    state.meeting.useGlobalHotwords, service]);
+  if (state.hotwordsKey === key) return;
+  state.hotwordsKey = key;
+  container.replaceChildren();
+  const tags = h("div", "meeting-hotwords__tags");
+  tags.append(h("span", "meeting-hotwords__label", "本场热词"));
+  const error = h("p", "meeting-hotwords__error");
+  error.setAttribute("role", "alert");
+  const save = async (change) => {
+    if (state.hotwordsSaving) return;
+    const restoreFocus = container.contains(document.activeElement);
+    let savedChanges = false;
+    state.hotwordsSaving = true;
+    const start = state.root.querySelector('[data-action="start"]');
+    start.disabled = true;
+    container.setAttribute("aria-busy", "true");
+    for (const control of container.querySelectorAll("button, input, textarea")) control.disabled = true;
+    try {
+      const current = await meetingStore.getMeeting(state.docId);
+      const next = change(current);
+      const globalWords = state.controller.getPrefs().hotwords;
+      const previousWords = new Set(effectiveHotwords(globalWords, current));
+      const nextWords = effectiveHotwords(globalWords, next);
+      // Removing terms must remain possible after switching to a service with a smaller limit.
+      if (nextWords.some((word) => !previousWords.has(word))) validateHotwords(nextWords, service);
+      const saved = await meetingStore.saveHotwords(state.docId, next);
+      Object.assign(state.meeting, saved);
+      savedChanges = true;
+      state.hotwordsKey = "";
+    } catch (failure) {
+      error.textContent = failure.message;
+    } finally {
+      state.hotwordsSaving = false;
+      container.removeAttribute("aria-busy");
+      for (const control of container.querySelectorAll("button, input, textarea")) control.disabled = false;
+      renderMeetingHotwords(state);
+      renderChrome(state, (name) => state.root.querySelector(`[data-field="${name}"]`),
+        (name) => state.root.querySelector(`[data-action="${name}"]`));
+      if (savedChanges && restoreFocus && !state.destroyed) container.querySelector(".meeting-hotword__add")?.focus();
+    }
+  };
+  const words = effectiveHotwords(prefs.hotwords, state.meeting);
+  try { validateHotwords(words, service); } catch (failure) { error.textContent = failure.message; }
+  for (const word of words) tags.append(hotwordTag(word, () => void save((current) => ({
+    ...current, hotwords: current.hotwords.filter((item) => item !== word),
+    excludedHotwords: parseHotwords([...current.excludedHotwords, word]),
+  }))));
+  const add = h("button", "meeting-hotword meeting-hotword__add", "+");
+  add.type = "button";
+  add.setAttribute("aria-label", "添加本场热词");
+  add.setAttribute("aria-expanded", "false");
+  add.title = "添加本场热词";
+  tags.append(add);
+  const editor = h("div", "meeting-hotwords__add-editor");
+  editor.hidden = true;
+  const input = h("textarea", "b3-text-field meeting-hotwords__input");
+  input.rows = 2;
+  input.setAttribute("aria-label", "添加本场热词");
+  input.placeholder = "可粘贴多个词，按空格、换行和标点自动切分";
+  const confirm = h("button", "meeting-btn meeting-btn--outline", "添加");
+  confirm.type = "button";
+  const cancel = h("button", "meeting-link", "取消");
+  cancel.type = "button";
+  add.onclick = () => { editor.hidden = false; add.setAttribute("aria-expanded", "true"); input.focus(); };
+  cancel.onclick = () => { editor.hidden = true; add.setAttribute("aria-expanded", "false"); input.value = ""; error.textContent = ""; add.focus(); };
+  confirm.onclick = () => {
+    const added = parseHotwords(input.value);
+    if (!added.length) { input.focus(); return; }
+    void save((current) => ({ ...current, hotwords: parseHotwords([...current.hotwords, ...added]),
+      excludedHotwords: current.excludedHotwords.filter((word) => !added.includes(word)) }));
+  };
+  input.onkeydown = (event) => {
+    if (event.isComposing) return;
+    if (event.key === "Escape") { event.preventDefault(); cancel.click(); }
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); confirm.click(); }
+  };
+  editor.append(input, confirm, cancel);
+  const options = h("details", "meeting-hotwords__options");
+  options.append(h("summary", "", "使用说明与选项"));
+  const label = h("label", "meeting-hotwords__global");
+  const useGlobal = h("input");
+  useGlobal.type = "checkbox";
+  useGlobal.checked = state.meeting.useGlobalHotwords !== false;
+  useGlobal.onchange = () => {
+    const checked = useGlobal.checked;
+    useGlobal.checked = state.meeting.useGlobalHotwords !== false;
+    void save((current) => ({ ...current, useGlobalHotwords: checked }));
+  };
+  label.append(useGlobal, document.createTextNode("使用全局常用词"));
+  const reset = h("button", "meeting-link", "恢复为全局词表");
+  reset.type = "button";
+  reset.onclick = () => void save((current) => ({ ...current, hotwords: [], excludedHotwords: [], useGlobalHotwords: true }));
+  options.append(label, reset,
+    h("p", "meeting-hotwords__hint", "× 和 + 仅调整本场会议。修改用于下一段录音或会后重新识别，不改变当前实时转写与已有文字。热词帮助识别，不保证命中。"),
+    h("p", "meeting-hotwords__hint", hotwordServiceHint(service)));
+  container.append(tags, editor, options, error);
+}
+
 function openSettings(plugin) {
   const prefs = plugin.controller.getPrefs();
   const notebooks = api.notebooks();
@@ -2693,6 +2855,9 @@ function openSettings(plugin) {
           <input type="checkbox" name="autoFillGaps"${prefs.autoFillGaps !== false ? " checked" : ""}>
         </label>
         <p class="meeting-settings__hint">只补齐实时转写缺口；关闭实时转写时，由你手动识别整段。</p>
+        <h3>常用热词</h3>
+        <div data-field="hotword-editor"></div>
+        <p class="meeting-settings__hint" data-field="hotword-service-hint"></p>
       </section>
       <section ${panel("cloud")}>
         <h3>腾讯云与 COS 临时录音</h3>
@@ -2753,11 +2918,15 @@ function openSettings(plugin) {
     };
   }
   const value = (name) => element.querySelector(`[name="${name}"]`)?.value || "";
+  const hotwordEditor = createHotwordEditor(prefs.hotwords, () => value("service"));
+  element.querySelector('[data-field="hotword-editor"]').append(hotwordEditor.element);
+  element.querySelector('[data-field="hotword-service-hint"]').textContent = hotwordServiceHint(value("service"));
   element.querySelector('[data-field="opacity-value"]').textContent = `${value("opacity")}%`;
   element.querySelector('[name="opacity"]').addEventListener("input", (event) => {
     element.querySelector('[data-field="opacity-value"]').textContent = `${event.target.value}%`;
   });
   element.querySelector('[name="service"]').addEventListener("change", (event) => {
+    element.querySelector('[data-field="hotword-service-hint"]').textContent = hotwordServiceHint(event.target.value);
     for (const group of element.querySelectorAll(".meeting-settings__group")) {
       group.hidden = group.dataset.service !== event.target.value;
     }
@@ -2782,6 +2951,7 @@ function openSettings(plugin) {
     const save = actions.querySelector('[data-action="save"]');
     save.disabled = true;
     try {
+      const hotwords = hotwordEditor.read();
       if (value("cosEndpoint").trim()) parseCosEndpoint(value("cosEndpoint"));
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
@@ -2791,6 +2961,7 @@ function openSettings(plugin) {
         { name: "meeting.tencent.secretKey", value: secretKey },
       ]);
       plugin.controller.setPrefs({
+        hotwords,
         notebookId: value("notebook"),
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,

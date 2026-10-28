@@ -138,6 +138,7 @@ test("doubao frames become audio-relative sentences with speakers even when the 
     return frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
   };
   const reports = [], captions = [];
+  let sentRequest;
   class Socket {
     constructor() {
       this.readyState = 1;
@@ -146,6 +147,7 @@ test("doubao frames become audio-relative sentences with speakers even when the 
     }
     send(frame) {
       const type = frame[1] >> 4, flags = frame[1] & 15;
+      if (type === 1) sentRequest = JSON.parse(zlib.gunzipSync(frame.subarray(8)).toString());
       // Shapes observed from the live service on 2026-10-26.
       const replies = type === 1 ? [reply(0, null, { result: { text: "" } })]
         : flags === 2 ? [reply(3, 3, { audio_info: { duration: 200 }, result: { text: "" } })]
@@ -156,6 +158,7 @@ test("doubao frames become audio-relative sentences with speakers even when the 
     close() { this.readyState = 3; }
   }
   const realtime = new RealtimeTranscriber({ service: "doubao", sampleRate: 16000, channels: 1, enabled: true,
+    ...require("../src/hotwords").doubaoCorpus(["星河"]),
     configured: true, requestUrl: async () => "wss://synthetic", WebSocket: Socket,
     emit: report => reports.push(report), caption: caption => captions.push(caption) });
   realtime.push(new Float32Array(3200), 500);
@@ -164,5 +167,6 @@ test("doubao frames become audio-relative sentences with speakers even when the 
     [{ startMs: 500, endMs: 680, speakerLabel: "说话人 2", text: "预算已确认。" }]);
   assert.deepEqual(captions.map(caption => [caption.text, caption.final]), [["预算", false], ["预算已确认。", true]]);
   assert.equal(reports.at(-1).status, "done");
+  assert.deepEqual(JSON.parse(sentRequest.request.corpus.context).hotwords, [{ word: "星河" }]);
   assert.deepEqual(reports.at(-1).gaps, []);
 });

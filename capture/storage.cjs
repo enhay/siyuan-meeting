@@ -73,6 +73,7 @@ class RecordingStore {
       meetingId: meta.meetingId || "",
       docId: meta.docId || "",
       segmentNo: Number(meta.segmentNo || 0) || 0,
+      hotwords: Array.isArray(meta.hotwords) ? meta.hotwords.slice() : [],
       startedAt: meta.startedAt || new Date().toISOString(),
       sampleRate,
       channels,

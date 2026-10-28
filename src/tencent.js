@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const cloud = require("./cloud");
+const { tencentHotwords } = require("./hotwords");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
@@ -32,7 +33,7 @@ const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
 
 // https://cloud.tencent.com/document/product/1093/48982
 // `now` is a Unix timestamp in seconds. Only the main window calls this function.
-function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
+function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large", hotwords = [],
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
   if (!/^\d+$/.test(String(config.appId || ""))) throw new Error("腾讯云账号信息尚未取得");
@@ -52,8 +53,11 @@ function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 1
     voice_format: 1,
     voice_id: voiceId,
   };
+  const hotwordList = tencentHotwords(hotwords);
+  if (hotwordList) params.hotword_list = hotwordList;
   const source = `${ASR_HOST}/asr/v2/${config.appId}?${queryString(params)}`;
-  return `wss://${source}&signature=${encodeURIComponent(signature(config.secretKey, source))}`;
+  const encoded = Object.keys(params).sort().map((key) => `${key}=${encodeURIComponent(params[key])}`).join("&");
+  return `wss://${ASR_HOST}/asr/v2/${config.appId}?${encoded}&signature=${encodeURIComponent(signature(config.secretKey, source))}`;
 }
 
 function serviceError(code, requestId = "") {
@@ -85,11 +89,13 @@ async function getAppId(config) {
   return String(result.AppId);
 }
 
-async function submit(config, url, requestId, signal) {
+async function submit(config, url, requestId, signal, hotwords = []) {
   requireConfig(config);
+  const hotwordList = tencentHotwords(hotwords);
   const result = await cloud.tcCall(config, "asr", "2019-06-14", "CreateRecTask", {
     EngineModelType: "16k_zh_en_2.0", ChannelNum: 1, ResTextFormat: 1,
     SourceType: 0, Url: url, SpeakerDiarization: 1,
+    ...(hotwordList ? { HotwordList: hotwordList } : {}),
   }, signal);
   if (!Number.isSafeInteger(result.Data?.TaskId)) throw cloud.failure("腾讯云未返回任务编号，请检查云端任务后再操作");
   return String(result.Data.TaskId);

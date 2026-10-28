@@ -10,6 +10,7 @@ const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
 const tencent = require("./tencent");
 const doubao = require("./doubao");
+const { effectiveHotwords, validateHotwords } = require("./hotwords");
 
 const CLIENTS = { doubao, tencent };
 const { wavParts } = require("./wav");
@@ -187,7 +188,7 @@ class TranscriptionManager {
     try {
       if (job?.saved) {
         publish("cleaning");
-        await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+        await this.setState(meeting, recording.recordingId, "done", "", { gaps: [], fileHotwords: (job.hotwords || []).join(" ") }, { publish: false });
         await this.cleanup(job, signal);
         outcome = { status: "done", error: "", progress: { phase: "done" } };
         if (resume) return;
@@ -205,6 +206,9 @@ class TranscriptionManager {
       if (!job) {
         if (queryOnly) return;
         if (!this.isFileConfigured()) throw cloud.failure("请先在会议设置中配置转写服务和腾讯云 COS");
+        const currentMeeting = await meetingStore.getMeeting(meeting.id);
+        const service = this.service();
+        const hotwords = validateHotwords(effectiveHotwords(this.plugin.controller.getPrefs().hotwords, currentMeeting), service);
         const absolute = await api.resolveAssetPath(recording.assetPath);
         if (!absolute) throw cloud.failure("录音尚未同步到本机，请同步后重试");
         const ranges = gapsOnly ? mergeGaps((recording.gaps || []).map((gap) => ({ ...gap, channel: 0 }))) : [{}];
@@ -214,7 +218,8 @@ class TranscriptionManager {
         }
         const cos = this.cosConfig();
         job = { id: crypto.randomUUID(), meetingId: meeting.id, recordingId: recording.recordingId,
-          service: this.service(), bucket: cos.bucket, region: cos.region, createdAt: Date.now(),
+          service, bucket: cos.bucket, region: cos.region, createdAt: Date.now(),
+          hotwords,
           fingerprint: expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId),
           gapsOnly, phase: "preparing", parts: [] };
         this.saveJob(job);
@@ -267,7 +272,7 @@ class TranscriptionManager {
           this.saveJob(job);
           publish("submitting");
           try {
-            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal);
+            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords);
           } catch (error) {
             if (error.rejected) { part.stage = "rejected"; job.failed = true; this.saveJob(job); }
             throw error;
@@ -325,7 +330,7 @@ class TranscriptionManager {
       job.saved = true;
       job.phase = "cleaning";
       this.saveJob(job);
-      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+      await this.setState(meeting, recording.recordingId, "done", "", { gaps: [], fileHotwords: (job.hotwords || []).join(" ") }, { publish: false });
       this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
       publish("cleaning");
       await this.cleanup(job, signal);

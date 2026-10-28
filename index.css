@@ -955,3 +955,23 @@
   .meeting-banner { flex-wrap: wrap; }
   .meeting-all-row { grid-template-areas: "title" "meta" "state"; grid-template-columns: minmax(0, 1fr); }
 }
+/* Hotwords share the meeting theme and remain usable in narrow split panes. */
+.meeting-hotwords { padding: 8px 20px; border-bottom: 1px solid var(--b3-border-color); }
+.meeting-hotwords__tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.meeting-hotwords__tags[hidden], .meeting-hotwords__input[hidden], .meeting-hotwords__add-editor[hidden] { display: none; }
+.meeting-hotwords__label { font-size: 12px; color: var(--b3-theme-on-surface); margin-right: 4px; }
+.meeting-hotword { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 3px 8px; border-radius: 12px; background: var(--b3-theme-surface); color: var(--b3-theme-on-background); font-size: 12px; overflow-wrap: anywhere; }
+.meeting-hotword__remove, .meeting-hotword__add { border: 0; cursor: pointer; font: inherit; color: inherit; }
+.meeting-hotword__remove { background: transparent; min-width: 24px; min-height: 24px; padding: 0; border-radius: 50%; }
+.meeting-hotword__add { min-width: 30px; min-height: 30px; justify-content: center; }
+.meeting-hotword__remove:hover, .meeting-hotword__add:hover { background: var(--b3-list-hover); }
+.meeting-hotword button:focus-visible, .meeting-hotword__add:focus-visible { outline: 2px solid var(--b3-theme-primary); outline-offset: 2px; }
+.meeting-hotwords__input { display: block; box-sizing: border-box; width: 100%; resize: vertical; margin: 8px 0; }
+.meeting-hotwords__add-editor > button { margin-right: 10px; }
+.meeting-hotwords__options { margin-top: 6px; font-size: 12px; color: var(--b3-theme-on-surface); }
+.meeting-hotwords__options > summary { cursor: pointer; width: fit-content; }
+.meeting-hotwords__global { display: inline-flex; align-items: center; gap: 4px; margin: 8px 12px 0 0; }
+.meeting-hotwords__hint { font-size: 12px; color: var(--b3-theme-on-surface); margin: 6px 0; }
+.meeting-hotwords__error { color: var(--b3-theme-error); font-size: 12px; margin: 6px 0; }
+.meeting-hotwords__error:empty { display: none; }
+.meeting-hotword-editor > .meeting-link { margin-top: 8px; }

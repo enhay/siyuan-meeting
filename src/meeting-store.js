@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const api = require("./siyuan-api");
+const { parseHotwords } = require("./hotwords");
 const {
   sha256,
   escapeIal,
@@ -49,6 +50,11 @@ const ATTR = {
   summaryFingerprint: "custom-summary-fingerprint",
   summaryTemplate: "custom-meeting-summary-template",
   summaryBasis: "custom-summary-basis",
+  hotwords: "custom-meeting-hotwords",
+  excludedHotwords: "custom-meeting-excluded-hotwords",
+  useGlobalHotwords: "custom-meeting-use-global-hotwords",
+  realtimeHotwords: "custom-recording-realtime-hotwords",
+  fileHotwords: "custom-recording-file-hotwords",
 };
 
 const MEETING_STATUS = {
@@ -73,6 +79,9 @@ function meetingFrom(row, attrs = {}) {
     preNotes: attrs[ATTR.preNotes] || "",
     isMeeting: Boolean(attrs[ATTR.id]),
     summaryTemplate: attrs[ATTR.summaryTemplate] || "general",
+    hotwords: parseHotwords(attrs[ATTR.hotwords]),
+    excludedHotwords: parseHotwords(attrs[ATTR.excludedHotwords]),
+    useGlobalHotwords: attrs[ATTR.useGlobalHotwords] !== "0",
   };
 }
 
@@ -167,6 +176,18 @@ async function savePreNotes(docId, markdown) {
   return value;
 }
 
+async function saveHotwords(docId, { hotwords, excludedHotwords, useGlobalHotwords }) {
+  if (!isBlockId(docId)) throw new Error("无法找到这场会议，请重新打开");
+  const saved = { hotwords: parseHotwords(hotwords), excludedHotwords: parseHotwords(excludedHotwords),
+    useGlobalHotwords: useGlobalHotwords !== false };
+  await api.setBlockAttrs(docId, {
+    [ATTR.hotwords]: saved.hotwords.join(" "),
+    [ATTR.excludedHotwords]: saved.excludedHotwords.join(" "),
+    [ATTR.useGlobalHotwords]: saved.useGlobalHotwords ? "1" : "0",
+  });
+  return saved;
+}
+
 async function renameMeeting(docId, title) {
   if (!isBlockId(docId)) throw new Error("无法找到这场会议，请从会议菜单重新打开");
   return api.renameDoc(docId, title);
@@ -251,6 +272,7 @@ async function ensureRecording(meeting, meta) {
     [ATTR.recordingSampleRate]: String(meta.sampleRate || 16000),
     [ATTR.recordingChannels]: String(meta.channels || 1),
     [ATTR.realtimeEnabled]: meta.realtimeEnabled ? "1" : "0",
+    [ATTR.realtimeHotwords]: parseHotwords(meta.hotwords).join(" "),
     [ATTR.recordingDevice]: meta.deviceId || "",
     [ATTR.transcriptionStatus]: "recording",
   };
@@ -307,6 +329,8 @@ async function readRecordings(meeting) {
         transcriptionFingerprint: attrs[ATTR.transcriptionFingerprint] || "",
         gaps: parseEvents(attrs[ATTR.transcriptionGaps]),
         realtimeEnabled: attrs[ATTR.realtimeEnabled] === "1",
+        realtimeHotwords: parseHotwords(attrs[ATTR.realtimeHotwords]),
+        fileHotwords: parseHotwords(attrs[ATTR.fileHotwords]),
         deviceId: attrs[ATTR.recordingDevice] || "",
       };
     })
@@ -491,6 +515,7 @@ async function updateRecordingTranscription(meeting, recordingId, patch) {
     transcriptionError: ATTR.transcriptionError,
     transcriptionIssue: ATTR.transcriptionIssue,
     transcriptionFingerprint: ATTR.transcriptionFingerprint,
+    fileHotwords: ATTR.fileHotwords,
     gaps: ATTR.transcriptionGaps,
     realtimeEnabled: ATTR.realtimeEnabled,
   };
@@ -616,6 +641,7 @@ module.exports = {
   setSegmentCount,
   markFirstRecorded,
   savePreNotes,
+  saveHotwords,
   renameMeeting,
   findChild,
   ensureTranscriptDoc,

@@ -96,6 +96,7 @@ test("transcription acknowledges before IO, reports real work, and releases the 
   t.mock.method(cloud, "remove", async () => {});
   t.mock.method(tencent, "submit", async () => "12345");
   const events = [], persisted = {};
+  t.mock.method(store, "getMeeting", async () => meeting);
   manager.subscribe((event) => events.push({ ...event, running: manager.isRunning(recording.recordingId) }));
   t.mock.method(api, "resolveAssetPath", () => asset.promise);
   t.mock.method(store, "transcriptFingerprint", async () => "original");
@@ -148,6 +149,8 @@ test("restart queries the submitted task and retries COS cleanup without resubmi
   const create = () => { const manager = new TranscriptionManager(plugin); manager.isFileConfigured = () => true; return manager; };
   const meeting = { id: "meeting" }, recording = { recordingId: "audio", assetPath: "assets/source.wav", channels: 2 };
   const calls = [], persisted = {};
+  let currentWords = ["星河"];
+  t.mock.method(store, "getMeeting", async () => ({ ...meeting, hotwords: currentWords }));
   t.mock.method(api, "resolveAssetPath", async () => file);
   t.mock.method(store, "transcriptFingerprint", async () => "old");
   t.mock.method(store, "updateRecordingTranscription", async (_m, _r, patch) => Object.assign(persisted, patch));
@@ -155,7 +158,9 @@ test("restart queries the submitted task and retries COS cleanup without resubmi
     assert.equal(require("../src/wav").readWavInfo(audio).channels, 1);
   });
   t.mock.method(cloud, "downloadUrl", () => "https://synthetic.invalid/audio.wav");
-  t.mock.method(tencent, "submit", async () => { calls.push("submit"); return "1245"; });
+  t.mock.method(tencent, "submit", async (_config, _url, _request, _signal, words) => {
+    assert.deepEqual(words, ["星河"]); calls.push("submit"); return "1245";
+  });
   t.mock.method(tencent, "query", async () => { throw cloud.failure("连接中断"); });
   t.mock.method(store, "writeTranscript", async () => { calls.push("save"); });
   t.mock.method(cloud, "remove", async () => { throw cloud.failure("清理失败"); });
@@ -163,6 +168,8 @@ test("restart queries the submitted task and retries COS cleanup without resubmi
   await manager.start(meeting, recording);
   assert.equal(manager.readJob(meeting.id, recording.recordingId).parts[0].taskId, "1245");
   assert.equal(persisted.transcriptionStatus, "incomplete");
+  assert.deepEqual(manager.readJob(meeting.id, recording.recordingId).hotwords, ["星河"]);
+  currentWords = ["新项目"];
   manager = create();
   t.mock.method(tencent, "query", async (_c, id) => {
     calls.push(`query:${id}`);
@@ -170,6 +177,7 @@ test("restart queries the submitted task and retries COS cleanup without resubmi
   });
   await manager.start(meeting, recording, { resume: true, queryOnly: true });
   assert.equal(persisted.transcriptionStatus, "done");
+  assert.equal(persisted.fileHotwords, "星河");
   assert.equal(manager.readJob(meeting.id, recording.recordingId).saved, true);
   assert.equal(manager.statusFor(meeting.id, recording.recordingId).progress.phase, "cleanup-failed");
   t.mock.method(cloud, "remove", async () => { calls.push("delete"); });
@@ -193,6 +201,7 @@ test("a lost submit response stays uncertain and reopening never resubmits audio
   const manager = new TranscriptionManager({ controller: { storageRoot: root, recordTranscriptionFailure() {}, getPrefs: () => ({ transcriptionService: "tencent", cosEndpoint: "https://meeting-1250000000.cos.ap-shanghai.myqcloud.com" }) } });
   manager.isFileConfigured = () => true;
   const meeting = { id: "meeting" }, recording = { recordingId: "audio", assetPath: "assets/source.wav" };
+  t.mock.method(store, "getMeeting", async () => meeting);
   t.mock.method(api, "resolveAssetPath", async () => file);
   t.mock.method(store, "transcriptFingerprint", async () => "old");
   t.mock.method(store, "updateRecordingTranscription", async () => {});
@@ -219,6 +228,7 @@ test("saved recognition results survive a document outage without a second recog
   const manager = new TranscriptionManager({ controller: { storageRoot: root, recordTranscriptionFailure() {}, getPrefs: () => ({ transcriptionService: "tencent", cosEndpoint: "https://meeting-1250000000.cos.ap-shanghai.myqcloud.com" }) } });
   manager.isFileConfigured = () => true;
   const meeting = { id: "meeting" }, recording = { recordingId: "audio", assetPath: "assets/source.wav" };
+  t.mock.method(store, "getMeeting", async () => meeting);
   t.mock.method(api, "resolveAssetPath", async () => file);
   t.mock.method(store, "transcriptFingerprint", async () => "old");
   t.mock.method(store, "updateRecordingTranscription", async () => {});

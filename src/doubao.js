@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const cloud = require("./cloud");
+const { doubaoCorpus } = require("./hotwords");
 
 const HOST = "openspeech.bytedance.com";
 // https://docs.volcengine.com/docs/DoubaoVoice/bidirectional-streaming-automatic-speech-recognition-websocket
@@ -92,11 +93,11 @@ async function fileRequest(config, action, requestId, body, signal) {
   return { status, body: response.text ? cloud.json(response) : {} };
 }
 
-async function submit(config, url, requestId, signal) {
+async function submit(config, url, requestId, signal, hotwords = []) {
   const result = await fileRequest(config, "submit", requestId, {
     user: { uid: "siyuan-meeting" }, audio: { url, format: "wav", rate: 16000, bits: 16, channel: 1 },
     request: { model_name: "bigmodel", enable_itn: true, enable_punc: true,
-      enable_speaker_info: true, show_utterances: true, ssd_version: "300" },
+      enable_speaker_info: true, show_utterances: true, ssd_version: "300", ...doubaoCorpus(hotwords) },
   }, signal);
   if (result.status !== 20000000 || typeof result.body.task_id !== "string" || !result.body.task_id) {
     throw cloud.failure("豆包未返回任务编号，请检查云端任务后再操作");
