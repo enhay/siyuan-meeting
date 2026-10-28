@@ -25,11 +25,11 @@ test("device preference migration keeps browser choices and local service config
   const controller = new MeetingController({});
   try {
     fs.mkdirSync(controller.storageRoot, { recursive: true });
-    fs.writeFileSync(controller.preferencesPath, JSON.stringify({ tencentAppId: "12345" }));
+    fs.writeFileSync(controller.preferencesPath, JSON.stringify({ cosEndpoint: "https://meeting-1250000000.cos.ap-shanghai.myqcloud.com" }));
     await controller.init();
     clearTimeout(controller.retryTimer);
     const saved = JSON.parse(fs.readFileSync(controller.preferencesPath, "utf8"));
-    assert.equal(saved.tencentAppId, "12345");
+    assert.equal(saved.cosEndpoint, "https://meeting-1250000000.cos.ap-shanghai.myqcloud.com");
     assert.equal(saved.mode, "online");
     assert.equal(saved.deviceId, "selected-mic");
     assert.equal(saved.opacity, 0.6);

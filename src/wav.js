@@ -2,27 +2,11 @@
 
 const fs = require("node:fs");
 
-// Tencent and Doubao flash ASR both accept at most 100 MB and two hours per request.
-const MAX_FILE_BYTES = 100000000;
-const MAX_DURATION_SECONDS = 2 * 60 * 60;
+const path = require("node:path");
 const HEADER_BYTES = 44;
 
 function invalidAudio() {
   return new Error("录音文件不完整或无法读取，请重新归档录音后再试");
-}
-
-// One request carries one complete 16-bit PCM WAV part produced by wavParts.
-function isUploadableWav(data, channels, sampleRate) {
-  return Buffer.isBuffer(data) && data.length > HEADER_BYTES && data.length <= MAX_FILE_BYTES &&
-    [1, 2].includes(channels) && data.toString("ascii", 0, 4) === "RIFF" &&
-    data.toString("ascii", 8, 12) === "WAVE" && data.toString("ascii", 12, 16) === "fmt " &&
-    data.readUInt32LE(16) === 16 && data.readUInt16LE(20) === 1 &&
-    data.readUInt16LE(22) === channels && data.readUInt32LE(24) === sampleRate &&
-    data.readUInt32LE(28) === sampleRate * channels * 2 && data.readUInt16LE(32) === channels * 2 &&
-    data.readUInt16LE(34) === 16 && data.toString("ascii", 36, 40) === "data" &&
-    data.readUInt32LE(40) === data.length - HEADER_BYTES && data.readUInt32LE(4) === data.length - 8 &&
-    !((data.length - HEADER_BYTES) % (channels * 2)) &&
-    (data.length - HEADER_BYTES) / (sampleRate * channels * 2) <= MAX_DURATION_SECONDS;
 }
 
 function readExact(fd, buffer, position) {
@@ -113,23 +97,19 @@ function checkAbort(signal) {
   }
 }
 
-/** Produce complete WAV requests, keeping offsets on the original audio timeline. */
-async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = {}) {
+/** Write mono requests incrementally; the archived source is never changed. */
+async function* wavParts(file, { startMs = 0, endMs, signal, directory, prefix = "part", maxBytes, maxSeconds = 5 * 3600 } = {}) {
   checkAbort(signal);
   const info = readWavInfo(file);
+  if (info.sampleRate !== 16000) throw new Error("请使用会议插件保存的 16 kHz 原录音进行识别");
   const end = endMs === undefined ? info.durationMs : Number(endMs);
   const start = Number(startMs);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start ||
-      start > info.durationMs || end > info.durationMs + 1 / info.sampleRate * 1000 ||
-      (channel !== null && (!Number.isInteger(channel) || channel < 0 || channel >= info.channels))) {
+  if (!directory || !/^[a-z0-9-]+$/.test(prefix) || !Number.isSafeInteger(maxBytes) || maxBytes <= HEADER_BYTES ||
+      !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start ||
+      start > info.durationMs || end > info.durationMs + 1 / info.sampleRate * 1000) {
     throw new Error("所选转写时段无效，请重新选择录音后再试");
   }
-  const outputChannels = channel === null ? info.channels : 1;
-  const outputAlign = outputChannels * 2;
-  const framesPerPart = Math.min(
-    Math.floor((MAX_FILE_BYTES - HEADER_BYTES) / outputAlign),
-    MAX_DURATION_SECONDS * info.sampleRate,
-  );
+  const framesPerPart = Math.min(Math.floor((maxBytes - HEADER_BYTES) / 2), maxSeconds * info.sampleRate);
   const firstFrame = Math.round(start / 1000 * info.sampleRate);
   const finalFrame = Math.min(info.frames, Math.round(end / 1000 * info.sampleRate));
   const partCount = Math.ceil((finalFrame - firstFrame) / framesPerPart);
@@ -139,41 +119,36 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
     for (let frame = firstFrame; frame < finalFrame; frame += framesPerPart) {
       checkAbort(signal);
       const frames = Math.min(framesPerPart, finalFrame - frame);
-      const data = Buffer.allocUnsafe(HEADER_BYTES + frames * outputAlign);
-      wavHeader({ frames, channels: outputChannels, sampleRate: info.sampleRate }).copy(data);
-      // A channel-only gap must not upload or bill the other channel. Read the
-      // source in bounded blocks instead of allocating a second full request.
-      const framesPerRead = Math.floor(1024 * 1024 / info.blockAlign);
-      const source = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * info.blockAlign);
-      for (let consumed = 0; consumed < frames;) {
-        checkAbort(signal);
-        const count = Math.min(framesPerRead, frames - consumed);
-        const bytes = count * info.blockAlign;
-        let read = 0;
-        while (read < bytes) {
-          const result = await handle.read(source, read, bytes - read,
-            info.dataOffset + (frame + consumed) * info.blockAlign + read);
-          if (!result.bytesRead) throw invalidAudio();
-          read += result.bytesRead;
-        }
-        if (channel === null) {
-          source.copy(data, HEADER_BYTES + consumed * outputAlign, 0, bytes);
-        } else {
-          for (let index = 0; index < count; index++) {
-            data.writeInt16LE(source.readInt16LE(index * info.blockAlign + channel * 2),
-              HEADER_BYTES + (consumed + index) * 2);
+      const output = path.join(directory, `${prefix}-${partIndex}.wav`);
+      const target = await fs.promises.open(output, "w", 0o600);
+      try {
+        await target.writeFile(wavHeader({ frames, channels: 1, sampleRate: info.sampleRate }));
+        const framesPerRead = Math.floor(1024 * 1024 / info.blockAlign);
+        const source = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * info.blockAlign);
+        const mono = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * 2);
+        for (let consumed = 0; consumed < frames;) {
+          checkAbort(signal);
+          const count = Math.min(framesPerRead, frames - consumed);
+          const bytes = count * info.blockAlign;
+          let read = 0;
+          while (read < bytes) {
+            const result = await handle.read(source, read, bytes - read, info.dataOffset + (frame + consumed) * info.blockAlign + read);
+            if (!result.bytesRead) throw invalidAudio();
+            read += result.bytesRead;
           }
+          for (let index = 0; index < count; index++) {
+            const left = source.readInt16LE(index * info.blockAlign);
+            const sample = info.channels === 1 ? left : Math.round((left + source.readInt16LE(index * info.blockAlign + 2)) / 2);
+            mono.writeInt16LE(sample, index * 2);
+          }
+          await target.writeFile(mono.subarray(0, count * 2));
+          consumed += count;
         }
-        consumed += count;
-      }
-      checkAbort(signal);
-      yield { data, startMs: frame * 1000 / info.sampleRate,
-        endMs: (frame + frames) * 1000 / info.sampleRate, channel, partIndex: partIndex++, partCount,
-        channels: outputChannels, sampleRate: info.sampleRate };
+      } finally { await target.close(); }
+      yield { file: output, startMs: frame * 1000 / info.sampleRate, endMs: (frame + frames) * 1000 / info.sampleRate,
+        partIndex: partIndex++, partCount, channels: 1, sampleRate: info.sampleRate };
     }
-  } finally {
-    await handle.close();
-  }
+  } finally { await handle.close(); }
 }
 
-module.exports = { isUploadableWav, readWavInfo, wavParts, wavHeader };
+module.exports = { readWavInfo, wavParts, wavHeader };

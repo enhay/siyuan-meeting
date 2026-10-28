@@ -1,14 +1,12 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const https = require("node:https");
-const { isUploadableWav } = require("./wav");
+const cloud = require("./cloud");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
 function isConfigured(config) {
-  return /^\d+$/.test(String(config?.appId || "")) &&
-    /^[A-Za-z0-9_-]+$/.test(String(config?.secretId || "")) &&
+  return /^[A-Za-z0-9_-]+$/.test(String(config?.secretId || "")) &&
     typeof config?.secretKey === "string" && Boolean(config.secretKey.trim()) &&
     !/[\r\n]/.test(config.secretKey);
 }
@@ -18,12 +16,6 @@ function requireConfig(config) {
     const message = "请先在会议设置中完善腾讯云配置";
     throw Object.assign(new Error(message), { code: "INVALID_CONFIGURATION", userMessage: message });
   }
-}
-
-function engineForSampleRate(sampleRate) {
-  if (Number(sampleRate) === 16000) return "16k_zh";
-  if (Number(sampleRate) === 8000) return "8k_zh";
-  throw new Error("这份录音暂不支持转写，请使用会议录音功能保存的原始录音");
 }
 
 function queryString(params) {
@@ -43,6 +35,7 @@ const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
 function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
+  if (!/^\d+$/.test(String(config.appId || ""))) throw new Error("腾讯云账号信息尚未取得");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0 ||
       Number(sampleRate) !== 16000 || !Object.hasOwn(REALTIME_ENGINES, engine)) {
     throw new Error("无法开始实时转写，请重新开始录音后再试");
@@ -85,147 +78,42 @@ function serviceError(code, requestId = "") {
   return error;
 }
 
-function parseFlashResult(result, channels = 1) {
-  if (!Array.isArray(result?.flash_result)) {
-    throw responseError("missing-result");
-  }
-  const segments = [];
-  for (const track of result.flash_result) {
-    const channel = track.channel_id;
-    if (!Number.isInteger(channel) || channel < 0 || channel >= channels ||
-        !Array.isArray(track.sentence_list)) {
-      throw responseError("invalid-channel");
-    }
-    const speakers = new Set(track.sentence_list.filter((sentence) => String(sentence.text || "").trim())
-      .map((sentence) => Number(sentence.speaker_id ?? 0)));
-    for (const sentence of track.sentence_list) {
-      if (typeof sentence.text !== "string") {
-        throw responseError("invalid-sentence");
-      }
-      const text = sentence.text.trim();
-      if (!text) continue;
-      const startMs = sentence.start_time;
-      const endMs = sentence.end_time;
-      const speaker = sentence.speaker_id ?? 0;
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs ||
-          !Number.isInteger(speaker) || speaker < 0) {
-        throw responseError("invalid-timestamp");
-      }
-      const speakerLabel = channels === 2
-        ? channel === 0 ? "我" : `其他参会者${speakers.size > 1 ? ` ${speaker + 1}` : ""}`
-        : `说话人 ${speaker + 1}`;
-      segments.push({ startMs, endMs, speaker, channel, text, speakerLabel });
-    }
-  }
-  return segments.sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
-}
-
-function responseError(responseIssue) {
-  const message = "腾讯云返回的转写不完整，请稍后手动重试";
-  return Object.assign(new Error(message), { code: "INVALID_RESPONSE", responseIssue, userMessage: message });
-}
-
-function aborted() {
-  const error = new Error("已取消转写");
-  error.name = "AbortError";
-  return error;
-}
-
-// https://cloud.tencent.com/document/product/1093/52097
-async function flashRecognize(config) {
+async function getAppId(config) {
   requireConfig(config);
-  const { data, signal } = config;
-  const channels = Number(config.channels);
-  const sampleRate = Number(config.sampleRate);
-  const engine = engineForSampleRate(sampleRate);
-  if (!isUploadableWav(data, channels, sampleRate)) {
-    const message = "这段录音无法直接转写，请检查录音后重试";
-    throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
-  }
-  if (signal?.aborted) throw aborted();
-  const params = {
-    engine_type: engine,
-    first_channel_only: channels === 2 ? 0 : 1,
-    secretid: config.secretId,
-    speaker_diarization: 1,
-    timestamp: Math.floor(Date.now() / 1000),
-    voice_format: "wav",
-  };
-  const path = `/asr/flash/v1/${config.appId}?${queryString(params)}`;
-  const authorization = signature(config.secretKey, `POST${ASR_HOST}${path}`);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let request;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const abort = () => {
-      request?.destroy();
-      finish(aborted());
-    };
-    request = https.request({
-      hostname: ASR_HOST, path, method: "POST",
-      headers: { Authorization: authorization, "Content-Type": "application/octet-stream",
-        "Content-Length": data.length },
-      // A synchronous upload can take minutes on a meeting participant's connection.
-      // Stop a stalled connection without resubmitting a billable request.
-      timeout: 10 * 60 * 1000,
-    }, (response) => {
-      const chunks = [];
-      let received = 0;
-      response.on("data", (chunk) => {
-        received += chunk.length;
-        // Bound untrusted response data independently of the audio upload size.
-        if (received > 16 * 1024 * 1024) {
-          finish(new Error("腾讯云返回的转写无法处理，请稍后手动重试"));
-          response.destroy();
-          return;
-        }
-        chunks.push(chunk);
-      });
-      const responseFailure = (code) => {
-        const message = "转写连接已断开，请检查网络后手动重试";
-        finish(Object.assign(new Error(message), { code, userMessage: message, httpStatus: response.statusCode, responseBytes: received }));
-      };
-      response.on("aborted", () => responseFailure("ECONNRESET"));
-      response.on("error", (cause) => responseFailure(cause.code));
-      response.on("end", () => {
-        try {
-          const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if (result.code !== 0) throw serviceError(result.code, result.request_id);
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            throw Object.assign(new Error("腾讯云暂时未能完成转写，请稍后手动重试"), { responseIssue: "http-error" });
-          }
-          finish(null, parseFlashResult(result, channels));
-        } catch (error) {
-          const failure = error instanceof SyntaxError ? responseError("invalid-json") : error;
-          failure.httpStatus = response.statusCode;
-          failure.responseBytes = received;
-          finish(failure);
-        }
-      });
-    });
-    request.on("timeout", () => {
-      const message = "转写等待时间过长，请检查网络后手动重试";
-      finish(Object.assign(new Error(message), { code: "ETIMEDOUT", userMessage: message }));
-      request.destroy();
-    });
-    request.on("error", (cause) => {
-      const message = "转写连接未完成，请检查网络后手动重试";
-      finish(signal?.aborted ? aborted() : Object.assign(new Error(message), { code: cause.code, userMessage: message }));
-    });
-    request.on("finish", () => {
-      if (!settled && !signal?.aborted) config.onUploadComplete?.();
-    });
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
-    else request.end(data);
-  });
+  const result = await cloud.tcCall(config, "cam", "2019-01-16", "GetUserAppId", {});
+  if (!Number.isSafeInteger(result.AppId) || result.AppId <= 0) throw cloud.failure("腾讯云未返回有效账号信息");
+  return String(result.AppId);
 }
 
-module.exports = { ASR_HOST, isConfigured, engineForSampleRate, signRealtimeUrl,
-  serviceError, parseFlashResult, flashRecognize };
+async function submit(config, url, requestId, signal) {
+  requireConfig(config);
+  const result = await cloud.tcCall(config, "asr", "2019-06-14", "CreateRecTask", {
+    EngineModelType: "16k_zh_en_2.0", ChannelNum: 1, ResTextFormat: 1,
+    SourceType: 0, Url: url, SpeakerDiarization: 1,
+  }, signal);
+  if (!Number.isSafeInteger(result.Data?.TaskId)) throw cloud.failure("腾讯云未返回任务编号，请检查云端任务后再操作");
+  return String(result.Data.TaskId);
+}
+
+function parseResult(data) {
+  if (!Array.isArray(data?.ResultDetail) || (!data.ResultDetail.length && String(data.Result || "").trim())) throw cloud.failure("腾讯云返回的转写缺少分句，未覆盖已有文字");
+  return data.ResultDetail.map((sentence) => {
+    const { StartMs: startMs, EndMs: endMs, SpeakerId: speaker = 0, FinalSentence: text } = sentence;
+    if (typeof text !== "string" || !Number.isFinite(startMs) || !Number.isFinite(endMs) ||
+        startMs < 0 || endMs < startMs || !Number.isInteger(speaker) || speaker < 0) {
+      throw cloud.failure("腾讯云返回的转写分句无效，未覆盖已有文字");
+    }
+    return { startMs, endMs, speaker, channel: 0, text: text.trim(), speakerLabel: `说话人 ${speaker + 1}` };
+  }).filter((sentence) => sentence.text);
+}
+
+async function query(config, taskId, signal) {
+  if (!/^\d+$/.test(taskId)) throw cloud.failure("腾讯云任务编号无效");
+  const result = await cloud.tcCall(config, "asr", "2019-06-14", "DescribeTaskStatus", { TaskId: Number(taskId) }, signal);
+  if ([0, 1].includes(result.Data?.Status)) return null;
+  if (result.Data?.Status === 3) throw cloud.failure("腾讯云识别失败，请检查服务额度及录音后重新识别", { terminal: true, requestId: result.RequestId });
+  if (result.Data?.Status !== 2) throw cloud.failure("腾讯云返回了未知任务状态，未覆盖已有文字");
+  return parseResult(result.Data);
+}
+
+module.exports = { ASR_HOST, isConfigured, signRealtimeUrl, serviceError, getAppId, submit, query, parseResult };

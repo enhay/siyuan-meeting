@@ -504,35 +504,36 @@
 .meeting-summary-missing ul { margin: 0 0 6px; padding-left: 20px; }
 
 /* ---- recordings --------------------------------------------------------- */
-/* A quiet one-line picker: the transcript text, not the recordings, leads this view. */
+/* Keep the selected audio and its actions visible beside the transcript. */
 .meeting-recordings-section { margin-bottom: 6px; }
-.meeting-segments { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.meeting-segments { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }
 .meeting-segment {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  max-width: 100%;
-  border-radius: 999px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+  max-width: 100%; padding: 6px; border: 1px solid var(--meeting-border); border-radius: 8px;
 }
-.meeting-segment__select { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 2px 8px; border: 0; border-radius: 999px; background: transparent; color: var(--meeting-muted); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
-.meeting-segment__select:hover { background: var(--meeting-hover); color: var(--b3-theme-on-background); }
-.meeting-segment.is-selected .meeting-segment__select { background: var(--meeting-faint); color: var(--b3-theme-on-background); }
+.meeting-segment.is-selected { border-color: var(--b3-theme-primary); background: var(--meeting-faint); }
+.meeting-segment__select { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; min-width: 0; padding: 4px 6px; border: 0; border-radius: 4px; background: transparent; color: var(--b3-theme-on-background); font: inherit; font-size: 12px; cursor: pointer; }
+.meeting-segment__select:hover { background: var(--meeting-hover); }
+.meeting-segment__select:focus-visible { outline: 2px solid var(--b3-theme-primary); outline-offset: 2px; }
+.meeting-segment__current { font-size: 11px; color: var(--b3-theme-primary); }
 .meeting-segment__top { display: inline-flex; align-items: center; gap: 6px; }
 .meeting-segment__title { font-weight: 500; }
 .meeting-segment__badge { font-size: 11px; color: var(--meeting-muted); white-space: nowrap; }
-.meeting-segment__badge.status-done { display: none; }
+.meeting-segment__badge.status-done { color: var(--meeting-muted); }
 .meeting-segment__badge.status-failed,
 .meeting-segment__badge.status-incomplete { color: var(--b3-card-error-color); }
 .meeting-segment__badge.status-uploading,
 .meeting-segment__badge.status-queued,
 .meeting-segment__badge.status-processing { color: var(--b3-theme-primary); }
-.meeting-segment__meta { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.meeting-segment__meta { display: inline-flex; flex-wrap: wrap; color: var(--meeting-muted); align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
 .meeting-segment__warn { color: var(--meeting-error); font-size: 11px; }
 .meeting-segment__notice { color: var(--b3-card-warning-color); font-size: 11px; }
-.meeting-segment__actions { display: inline-flex; gap: 8px; padding: 0 4px; font-size: 12px; }
+.meeting-segment__actions { display: inline-flex; flex-wrap: wrap; gap: 8px; padding: 0 4px; font-size: 12px; }
+.meeting-segment__actions[hidden] { display: none; }
 .meeting-segment__actions .meeting-link { margin-left: 0; padding: 0; }
 
 /* ---- player ------------------------------------------------------------- */
+.meeting-player__title { margin-bottom: 6px; font-size: 12px; color: var(--meeting-muted); }
 .meeting-player {
   margin-top: 10px;
   padding: 8px 10px;

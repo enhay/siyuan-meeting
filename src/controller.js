@@ -175,11 +175,11 @@ class MeetingController {
       opacity: 0.9,
       notebookId: "",
       transcriptionService: "doubao",
-      tencentAppId: "",
+      cosEndpoint: "",
       realtimeTranscription: true,
       realtimeEngine: "large",
       floatCaptions: true,
-      autoTranscribe: false,
+      autoFillGaps: true,
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
     remote.ipcMain.on(this.channel, this.ipcListener);
@@ -730,7 +730,7 @@ class MeetingController {
     this.emit();
   }
 
-  onIpc(event, message) {
+  async onIpc(event, message) {
     const senderId = event?.sender?.id;
     const idOf = (win) => {
       try {
@@ -746,12 +746,13 @@ class MeetingController {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
           reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
-            : tencent.signRealtimeUrl(this.plugin.transcription.config("tencent"), {
+            : tencent.signRealtimeUrl(await this.plugin.transcription.realtimeConfig(), {
               voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
             });
-        } catch {
-          reply.error = "实时转写暂时不可用，录音仍在保存。";
+        } catch (error) {
+          reply.error = error.userMessage || "实时转写暂时不可用，录音仍在保存。";
         }
+        if (!this.isBusy() || message.recordingId !== this.state.recordingId || event.sender.isDestroyed?.()) return;
         event.sender.send(this.channel, reply);
         return;
       }
@@ -1193,9 +1194,7 @@ class MeetingController {
       const through = Number(repaired.meta.realtimeThroughMs || 0);
       const endMs = repaired.seconds * 1000;
       if (endMs > through) {
-        for (let channel = 0; channel < repaired.meta.channels; channel++) {
-          gaps.push({ startMs: through, endMs, channel });
-        }
+        gaps.push({ startMs: through, endMs, channel: 0 });
       }
       await this.plugin.transcription.onRealtime(meeting, repaired.meta.recordingId, {
         meta: repaired.meta, gaps, status: "incomplete", final: true,

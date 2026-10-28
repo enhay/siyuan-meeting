@@ -78,12 +78,11 @@ const PROTOCOLS = {
       return frame;
     },
     open(socket, channel) {
-      const speakers = channel.owner.channels === 1 || channel.channel === 1;
       socket.send(this.frame(1, 0, 1, JSON.stringify({
         user: { uid: "siyuan-meeting" },
         audio: { format: "pcm", codec: "raw", rate: channel.owner.sampleRate, bits: 16, channel: 1 },
         request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
-          result_type: "single", end_window_size: 600, ...(speakers ? { enable_speaker_info: true } : {}) },
+          result_type: "single", end_window_size: 600, enable_speaker_info: true },
       })));
     },
     audio(data) { return this.frame(2, 0, 0, Buffer.from(data)); },
@@ -121,11 +120,7 @@ const PROTOCOLS = {
   },
 };
 
-function speakerLabel(owner, channel, speaker) {
-  if (owner.channels === 2) {
-    if (channel === 0) return "我";
-    return speaker > 0 ? `其他参会者 ${speaker + 1}` : "其他参会者";
-  }
+function speakerLabel(speaker) {
   return speaker === null ? "说话人" : `说话人 ${speaker + 1}`;
 }
 
@@ -209,7 +204,7 @@ class RealtimeChannel {
                 this.owner.error = "";
               }
             }
-            const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
+            const label = "";
             if (typeof item.partial === "string" && this.base !== null) {
               this.owner.caption({ channel: this.channel, label, text: item.partial, final: false });
             }
@@ -233,11 +228,11 @@ class RealtimeChannel {
                   endMs: Math.min(this.sentEnd, this.base + end),
                   speaker: speaker ?? 0,
                   channel: this.channel,
-                  speakerLabel: speakerLabel(this.owner, this.channel, speaker),
+                  speakerLabel: speakerLabel(speaker),
                   text,
                 });
               }
-              this.owner.caption({ channel: this.channel, label, text, final: true });
+              this.owner.caption({ channel: this.channel, label: speaker === null ? "" : speakerLabel(speaker), text, final: true });
             }
             if (item.done) {
               this.confirmedEnd = this.sentEnd;
@@ -376,7 +371,8 @@ class RealtimeTranscriber {
     if (!Object.hasOwn(PROTOCOLS, service)) throw new Error("unknown transcription service");
     this.protocol = PROTOCOLS[service];
     this.sampleRate = sampleRate;
-    this.channels = channels;
+    this.sourceChannels = channels;
+    this.channels = 1;
     this.enabled = enabled;
     this.configured = configured;
     this.engine = engine;
@@ -431,7 +427,7 @@ class RealtimeTranscriber {
   }
 
   push(samples, startMs) {
-    const frames = samples.length / this.channels;
+    const frames = samples.length / this.sourceChannels;
     const endMs = startMs + frames / this.sampleRate * 1000;
     if (!this.enabled) return;
     if (!this.configured) {
@@ -444,7 +440,9 @@ class RealtimeTranscriber {
           const data = new ArrayBuffer(count * 2);
           const view = new DataView(data);
           for (let i = 0; i < count; i++) {
-            const sample = Math.max(-1, Math.min(1, samples[(offset + i) * this.channels + channel]));
+            const frame = (offset + i) * this.sourceChannels;
+            const mixed = this.sourceChannels === 2 ? (samples[frame] + samples[frame + 1]) / 2 : samples[frame];
+            const sample = Math.max(-1, Math.min(1, mixed));
             view.setInt16(i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
           }
           this.connections[channel]?.push({
@@ -1127,6 +1125,140 @@ module.exports = {
 };
 
   },
+  "src/cloud.js": function (module, exports, require) {
+"use strict";
+
+const crypto = require("node:crypto");
+const https = require("node:https");
+const fs = require("node:fs");
+
+const hash = (algorithm, value) => crypto.createHash(algorithm).update(value).digest("hex");
+const hmac = (algorithm, key, value, encoding) => crypto.createHmac(algorithm, key).update(value).digest(encoding);
+const encode = (value) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+function failure(message, fields = {}) {
+  return Object.assign(new Error(message), { userMessage: message, ...fields });
+}
+
+// Hosts are selected by the adapters, never from a response or an audio URL.
+function request({ hostname, path = "/", method = "POST", headers = {}, body, file, signal }) {
+  return new Promise((resolve, reject) => {
+    let source;
+    const req = https.request({ hostname, path, method, headers, signal, timeout: 120000 }, (res) => {
+      const chunks = [];
+      let bytes = 0;
+      res.on("data", (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024 * 1024) {
+          res.destroy(failure("云端返回内容过大，未覆盖已有转写", { code: "INVALID_RESPONSE" }));
+        } else chunks.push(chunk);
+      });
+      res.on("error", reject);
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("timeout", () => req.destroy(failure("云端连接等待超时，请稍后继续原任务", { code: "ETIMEDOUT" })));
+    req.on("error", (error) => {
+      source?.destroy();
+      reject(error.userMessage ? error : failure("云端连接中断，请检查网络后继续原任务", { code: error.code || "NETWORK_ERROR" }));
+    });
+    if (file) {
+      source = fs.createReadStream(file);
+      source.on("error", (error) => req.destroy(error));
+      source.pipe(req);
+    } else req.end(body);
+  });
+}
+
+function json(response) {
+  try { return JSON.parse(response.text); }
+  catch { throw failure("云端返回格式异常，未覆盖已有转写", { code: "INVALID_RESPONSE", httpStatus: response.status }); }
+}
+
+function tcHeaders(config, service, version, action, body, now = Math.floor(Date.now() / 1000)) {
+  const host = `${service}.tencentcloudapi.com`;
+  const date = new Date(now * 1000).toISOString().slice(0, 10);
+  const scope = `${date}/${service}/tc3_request`;
+  const canonical = `POST\n/\n\ncontent-type:application/json; charset=utf-8\nhost:${host}\nx-tc-action:${action.toLowerCase()}\n\ncontent-type;host;x-tc-action\n${hash("sha256", body)}`;
+  const string = `TC3-HMAC-SHA256\n${now}\n${scope}\n${hash("sha256", canonical)}`;
+  const key = hmac("sha256", hmac("sha256", hmac("sha256", `TC3${config.secretKey}`, date), service), "tc3_request");
+  return {
+    "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(body),
+    "X-TC-Action": action, "X-TC-Version": version, "X-TC-Timestamp": String(now),
+    Authorization: `TC3-HMAC-SHA256 Credential=${config.secretId}/${scope}, SignedHeaders=content-type;host;x-tc-action, Signature=${hmac("sha256", key, string, "hex")}`,
+  };
+}
+
+async function tcCall(config, service, version, action, payload, signal) {
+  const body = JSON.stringify(payload);
+  const response = await request({ hostname: `${service}.tencentcloudapi.com`,
+    headers: tcHeaders(config, service, version, action, body), body, signal });
+  const result = json(response)?.Response;
+  if (!result || response.status !== 200 || result.Error) {
+    const code = result?.Error?.Code || "INVALID_RESPONSE";
+    const auth = /AuthFailure|UnauthorizedOperation/.test(code);
+    throw failure(auth ? "腾讯云鉴权或权限不足，请检查密钥及所需服务权限"
+      : "腾讯云未能完成请求，请检查服务开通、额度和任务状态", {
+      code, requestId: result?.RequestId, httpStatus: response.status, rejected: Boolean(result?.Error),
+    });
+  }
+  return result;
+}
+
+function parseCosEndpoint(value) {
+  try {
+    const input = String(value || "").trim();
+    const url = new URL(input.includes("://") ? input : `https://${input}`);
+    const match = /^([a-z0-9][a-z0-9-]*-\d+)\.cos\.([a-z]{2}-[a-z]+(?:-\d+)?)\.myqcloud\.com$/.exec(url.hostname);
+    if (!match || url.protocol !== "https:" || url.port || url.username || url.password ||
+        url.pathname !== "/" || url.search || url.hash) throw new Error("invalid endpoint");
+    return { bucket: match[1], region: match[2] };
+  } catch {
+    throw failure("请填写 COS 控制台中的存储桶默认域名，例如 https://meeting-1250000000.cos.ap-shanghai.myqcloud.com");
+  }
+}
+
+function cosHost({ bucket, region }) {
+  if (!/^[a-z0-9][a-z0-9-]*-\d+$/.test(bucket || "") || !/^[a-z]{2}-[a-z]+(?:-\d+)?$/.test(region || "")) {
+    throw failure("COS 存储桶地址无效，请检查设置");
+  }
+  return `${bucket}.cos.${region}.myqcloud.com`;
+}
+
+function cosSignature(config, method, key, headers = {}, seconds = 3600, now = Math.floor(Date.now() / 1000)) {
+  if (!/^siyuan-meeting\/[a-f0-9-]+\/\d+\.wav$/.test(key)) throw failure("云端录音路径无效，已停止操作");
+  if (!/^[A-Za-z0-9_-]+$/.test(config.secretId || "") || !config.secretKey) throw failure("请先配置 COS 密钥");
+  const time = `${now - 60};${now + seconds}`;
+  const signed = { host: cosHost(config), ...headers };
+  const names = Object.keys(signed).sort();
+  const headerString = names.map((name) => `${encode(name)}=${encode(String(signed[name]))}`).join("&");
+  const httpString = `${method.toLowerCase()}\n/${key}\n\n${headerString}\n`;
+  const signKey = hmac("sha1", config.secretKey, time, "hex");
+  const signature = hmac("sha1", signKey, `sha1\n${time}\n${hash("sha1", httpString)}\n`, "hex");
+  return `q-sign-algorithm=sha1&q-ak=${encode(config.secretId)}&q-sign-time=${time}&q-key-time=${time}&q-header-list=${names.join(";")}&q-url-param-list=&q-signature=${signature}`;
+}
+
+async function upload(config, key, file, signal) {
+  const headers = { "content-type": "audio/wav", "content-length": fs.statSync(file).size, "x-cos-acl": "private" };
+  const response = await request({ hostname: cosHost(config), path: `/${key}`, method: "PUT",
+    headers: { ...headers, Authorization: cosSignature(config, "PUT", key, headers) }, file, signal });
+  if (response.status !== 200) throw failure("录音上传 COS 失败，请检查桶、地域及写入权限", { httpStatus: response.status });
+}
+
+function downloadUrl(config, key) {
+  // Covers provider download/queue time; COS objects are deleted after the saved result.
+  const query = new URLSearchParams(cosSignature(config, "GET", key, {}, 24 * 3600)).toString();
+  return `https://${cosHost(config)}/${key}?${query}`;
+}
+
+async function remove(config, key, signal) {
+  const response = await request({ hostname: cosHost(config), path: `/${key}`, method: "DELETE",
+    headers: { Authorization: cosSignature(config, "DELETE", key) }, signal });
+  if (![204, 404].includes(response.status)) throw failure("COS 临时录音尚未删除，请检查删除权限后重试清理", { httpStatus: response.status });
+}
+
+module.exports = { request, json, failure, tcHeaders, tcCall, parseCosEndpoint, cosHost, cosSignature, upload, downloadUrl, remove };
+
+  },
   "src/controller.js": function (module, exports, require) {
 "use strict";
 
@@ -1305,11 +1437,11 @@ class MeetingController {
       opacity: 0.9,
       notebookId: "",
       transcriptionService: "doubao",
-      tencentAppId: "",
+      cosEndpoint: "",
       realtimeTranscription: true,
       realtimeEngine: "large",
       floatCaptions: true,
-      autoTranscribe: false,
+      autoFillGaps: true,
     };
     this.ipcListener = (event, message) => this.onIpc(event, message);
     remote.ipcMain.on(this.channel, this.ipcListener);
@@ -1860,7 +1992,7 @@ class MeetingController {
     this.emit();
   }
 
-  onIpc(event, message) {
+  async onIpc(event, message) {
     const senderId = event?.sender?.id;
     const idOf = (win) => {
       try {
@@ -1876,12 +2008,13 @@ class MeetingController {
           if (!this.isBusy() || message.recordingId !== this.state.recordingId ||
               ![0, 1].includes(message.audioChannel) || (!this.state.online && message.audioChannel !== 0)) return;
           reply.url = this.state.realtimeService === "doubao" ? doubao.REALTIME_URL
-            : tencent.signRealtimeUrl(this.plugin.transcription.config("tencent"), {
+            : tencent.signRealtimeUrl(await this.plugin.transcription.realtimeConfig(), {
               voiceId: crypto.randomUUID(), sampleRate: 16000, engine: this.state.realtimeEngine,
             });
-        } catch {
-          reply.error = "实时转写暂时不可用，录音仍在保存。";
+        } catch (error) {
+          reply.error = error.userMessage || "实时转写暂时不可用，录音仍在保存。";
         }
+        if (!this.isBusy() || message.recordingId !== this.state.recordingId || event.sender.isDestroyed?.()) return;
         event.sender.send(this.channel, reply);
         return;
       }
@@ -2323,9 +2456,7 @@ class MeetingController {
       const through = Number(repaired.meta.realtimeThroughMs || 0);
       const endMs = repaired.seconds * 1000;
       if (endMs > through) {
-        for (let channel = 0; channel < repaired.meta.channels; channel++) {
-          gaps.push({ startMs: through, endMs, channel });
-        }
+        gaps.push({ startMs: through, endMs, channel: 0 });
       }
       await this.plugin.transcription.onRealtime(meeting, repaired.meta.recordingId, {
         meta: repaired.meta, gaps, status: "incomplete", final: true,
@@ -2573,8 +2704,7 @@ module.exports = { MeetingController, ACTIVE_PHASES };
 "use strict";
 
 const crypto = require("node:crypto");
-const https = require("node:https");
-const { isUploadableWav } = require("./wav");
+const cloud = require("./cloud");
 
 const HOST = "openspeech.bytedance.com";
 // https://docs.volcengine.com/docs/DoubaoVoice/bidirectional-streaming-automatic-speech-recognition-websocket
@@ -2582,9 +2712,7 @@ const HOST = "openspeech.bytedance.com";
 // capture window's connection.
 const REALTIME_URL = `wss://${HOST}/api/v3/sauc/bigmodel_async`;
 const REALTIME_RESOURCE = "volc.seedasr.sauc.duration";
-// https://www.volcengine.com/docs/6561/1631584
-const FLASH_PATH = "/api/v3/auc/bigmodel/recognize/flash";
-const FLASH_RESOURCE = "volc.bigasr.auc_turbo";
+const FILE_RESOURCE = "volc.seedasr.auc";
 
 function isConfigured(config) {
   const apiKey = config?.apiKey;
@@ -2613,7 +2741,7 @@ function serviceError(code, requestId = "") {
     45000001: "豆包无法处理这次转写，请稍后手动重试",
     45000002: "这次提交的录音没有内容，请检查录音后重试",
     45000010: "豆包验证未通过，请检查会议设置中的 API Key",
-    45000030: "豆包录音文件极速版尚未开通，请在火山引擎控制台开通后重试",
+    45000030: "豆包录音文件标准版 2.0 尚未开通，请在火山引擎控制台开通后重试",
     45000151: "豆包无法读取这段录音，请检查录音能否正常播放后重试",
     45000292: "豆包转写额度不足，请补充额度后重试",
     55000031: "豆包当前繁忙，请稍后手动重试",
@@ -2631,9 +2759,9 @@ function responseError(responseIssue) {
 }
 
 // The service omits zero-valued fields, so a missing start time means 0.
-function parseFlashResult(result, channels = 1) {
-  const utterances = result?.result?.utterances ?? [];
-  if (!Array.isArray(utterances)) throw responseError("missing-result");
+function parseResult(result) {
+  const utterances = result?.result?.utterances;
+  if (!Array.isArray(utterances) || (!utterances.length && String(result.result.text || "").trim())) throw responseError("missing-result");
   const sentences = [];
   for (const utterance of utterances) {
     if (typeof utterance?.text !== "string") throw responseError("invalid-sentence");
@@ -2642,145 +2770,51 @@ function parseFlashResult(result, channels = 1) {
     const startMs = Number(utterance.start_time ?? 0);
     const endMs = Number(utterance.end_time);
     const speaker = Number(utterance.additions?.speaker_id ?? 0);
-    const channelId = Number(utterance.channel_id ?? utterance.additions?.channel_id ?? 1);
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs ||
-        !Number.isInteger(speaker) || speaker < 0 || !Number.isInteger(channelId) ||
-        channelId < 1 || channelId > channels) {
-      throw responseError("invalid-timestamp");
-    }
-    sentences.push({ startMs, endMs, speaker, channel: channelId - 1, text });
+        !Number.isInteger(speaker) || speaker < 0) throw responseError("invalid-timestamp");
+    sentences.push({ startMs, endMs, speaker, channel: 0, text });
   }
-  const others = new Set(sentences.filter((sentence) => sentence.channel === 1).map((sentence) => sentence.speaker));
-  return sentences.map((sentence) => ({
-    ...sentence,
-    speakerLabel: channels === 2
-      ? sentence.channel === 0 ? "我" : `其他参会者${others.size > 1 ? ` ${sentence.speaker + 1}` : ""}`
-      : `说话人 ${sentence.speaker + 1}`,
-  })).sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+  return sentences.map((sentence) => ({ ...sentence, speakerLabel: `说话人 ${sentence.speaker + 1}` }))
+    .sort((a, b) => a.startMs - b.startMs);
 }
 
-function aborted() {
-  const error = new Error("已取消转写");
-  error.name = "AbortError";
-  return error;
-}
-
-async function flashRecognize(config) {
+async function fileRequest(config, action, requestId, body, signal) {
   requireConfig(config);
-  const { data, signal } = config;
-  const channels = Number(config.channels);
-  const sampleRate = Number(config.sampleRate);
-  if (!isUploadableWav(data, channels, sampleRate)) {
-    const message = "这段录音无法直接转写，请检查录音后重试";
-    throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
+  const payload = JSON.stringify(body);
+  const response = await cloud.request({ hostname: HOST, path: `/api/v3/auc/bigmodel/${action}`,
+    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload),
+      "X-Api-Key": config.apiKey.trim(), "X-Api-Resource-Id": FILE_RESOURCE,
+      "X-Api-Request-Id": requestId, "X-Api-Sequence": "-1" }, body: payload, signal });
+  const status = Number(response.headers["x-api-status-code"]);
+  if (response.status !== 200 || ![20000000, 20000001, 20000002, 20000003].includes(status)) {
+    throw Object.assign(serviceError(status, response.headers["x-tt-logid"]), {
+      httpStatus: response.status, rejected: status >= 45000000 && status < 50000000,
+      terminal: action === "query" && [45000002, 45000131, 45000132, 45000151].includes(status),
+    });
   }
-  if (signal?.aborted) throw aborted();
-  // The audio is streamed as base64 inside the JSON body so a 100 MB part never
-  // exists twice in memory as a string.
-  const prefix = Buffer.from('{"user":{"uid":"siyuan-meeting"},"audio":{"format":"wav","data":"');
-  const suffix = Buffer.from(`"},"request":${JSON.stringify({
-    model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
-    enable_speaker_info: true, ...(channels === 2 ? { enable_channel_split: true } : {}),
-  })}}`);
-  const encodedBytes = Math.ceil(data.length / 3) * 4;
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let request;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const abort = () => {
-      request?.destroy();
-      finish(aborted());
-    };
-    request = https.request({
-      hostname: HOST, path: FLASH_PATH, method: "POST",
-      headers: {
-        "Content-Type": "application/json", "Content-Length": prefix.length + encodedBytes + suffix.length,
-        "X-Api-Key": config.apiKey.trim(), "X-Api-Resource-Id": FLASH_RESOURCE,
-        "X-Api-Request-Id": crypto.randomUUID(), "X-Api-Sequence": "-1",
-      },
-      // A synchronous upload can take minutes on a meeting participant's connection.
-      // Stop a stalled connection without resubmitting a billable request.
-      timeout: 10 * 60 * 1000,
-    }, (response) => {
-      const chunks = [];
-      let received = 0;
-      const status = Number(response.headers["x-api-status-code"]);
-      const requestId = response.headers["x-tt-logid"] || "";
-      response.on("data", (chunk) => {
-        received += chunk.length;
-        // Bound untrusted response data independently of the audio upload size.
-        if (received > 16 * 1024 * 1024) {
-          finish(new Error("豆包返回的转写无法处理，请稍后手动重试"));
-          response.destroy();
-          return;
-        }
-        chunks.push(chunk);
-      });
-      const responseFailure = (code) => {
-        const message = "转写连接已断开，请检查网络后手动重试";
-        finish(Object.assign(new Error(message), { code, userMessage: message, httpStatus: response.statusCode, responseBytes: received }));
-      };
-      response.on("aborted", () => responseFailure("ECONNRESET"));
-      response.on("error", (cause) => responseFailure(cause.code));
-      response.on("end", () => {
-        try {
-          if (status === 20000003) {
-            finish(null, []);
-            return;
-          }
-          if (status !== 20000000) throw serviceError(status, requestId);
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            throw Object.assign(new Error("豆包暂时未能完成转写，请稍后手动重试"), { responseIssue: "http-error" });
-          }
-          finish(null, parseFlashResult(JSON.parse(Buffer.concat(chunks).toString("utf8")), channels));
-        } catch (error) {
-          const failure = error instanceof SyntaxError ? responseError("invalid-json") : error;
-          failure.httpStatus = response.statusCode;
-          failure.responseBytes = received;
-          failure.requestId ||= String(requestId);
-          finish(failure);
-        }
-      });
-    });
-    request.on("timeout", () => {
-      const message = "转写等待时间过长，请检查网络后手动重试";
-      finish(Object.assign(new Error(message), { code: "ETIMEDOUT", userMessage: message }));
-      request.destroy();
-    });
-    request.on("error", (cause) => {
-      const message = "转写连接未完成，请检查网络后手动重试";
-      finish(signal?.aborted ? aborted() : Object.assign(new Error(message), { code: cause.code, userMessage: message }));
-    });
-    request.on("finish", () => {
-      if (!settled && !signal?.aborted) config.onUploadComplete?.();
-    });
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) {
-      abort();
-      return;
-    }
-    void (async () => {
-      const write = (chunk) => new Promise((done) => {
-        if (request.write(chunk)) done();
-        else request.once("drain", done);
-      });
-      await write(prefix);
-      // Multiples of three bytes encode without padding until the final chunk.
-      for (let offset = 0; offset < data.length && !settled; offset += 3 * 1024 * 1024) {
-        await write(data.toString("base64", offset, Math.min(data.length, offset + 3 * 1024 * 1024)));
-      }
-      if (!settled) request.end(suffix);
-    })();
-  });
+  return { status, body: response.text ? cloud.json(response) : {} };
 }
 
-module.exports = { REALTIME_URL, isConfigured, realtimeHeaders, serviceError, parseFlashResult, flashRecognize };
+async function submit(config, url, requestId, signal) {
+  const result = await fileRequest(config, "submit", requestId, {
+    user: { uid: "siyuan-meeting" }, audio: { url, format: "wav", rate: 16000, bits: 16, channel: 1 },
+    request: { model_name: "bigmodel", enable_itn: true, enable_punc: true,
+      enable_speaker_info: true, show_utterances: true, ssd_version: "300" },
+  }, signal);
+  if (result.status !== 20000000 || typeof result.body.task_id !== "string" || !result.body.task_id) {
+    throw cloud.failure("豆包未返回任务编号，请检查云端任务后再操作");
+  }
+  return result.body.task_id;
+}
+
+async function query(config, taskId, signal) {
+  const result = await fileRequest(config, "query", taskId, {}, signal);
+  if ([20000001, 20000002].includes(result.status)) return null;
+  if (result.status === 20000003) return [];
+  return parseResult(result.body);
+}
+
+module.exports = { REALTIME_URL, isConfigured, realtimeHeaders, serviceError, parseResult, submit, query };
 
   },
   "src/icons.js": function (module, exports, require) {
@@ -4853,14 +4887,12 @@ module.exports = { createTemplatePicker, openTemplateManager };
 "use strict";
 
 const crypto = require("node:crypto");
-const https = require("node:https");
-const { isUploadableWav } = require("./wav");
+const cloud = require("./cloud");
 
 const ASR_HOST = "asr.cloud.tencent.com";
 
 function isConfigured(config) {
-  return /^\d+$/.test(String(config?.appId || "")) &&
-    /^[A-Za-z0-9_-]+$/.test(String(config?.secretId || "")) &&
+  return /^[A-Za-z0-9_-]+$/.test(String(config?.secretId || "")) &&
     typeof config?.secretKey === "string" && Boolean(config.secretKey.trim()) &&
     !/[\r\n]/.test(config.secretKey);
 }
@@ -4870,12 +4902,6 @@ function requireConfig(config) {
     const message = "请先在会议设置中完善腾讯云配置";
     throw Object.assign(new Error(message), { code: "INVALID_CONFIGURATION", userMessage: message });
   }
-}
-
-function engineForSampleRate(sampleRate) {
-  if (Number(sampleRate) === 16000) return "16k_zh";
-  if (Number(sampleRate) === 8000) return "8k_zh";
-  throw new Error("这份录音暂不支持转写，请使用会议录音功能保存的原始录音");
 }
 
 function queryString(params) {
@@ -4895,6 +4921,7 @@ const REALTIME_ENGINES = { large: "16k_zh_en", general: "16k_zh" };
 function signRealtimeUrl(config, { voiceId = crypto.randomUUID(), sampleRate = 16000, engine = "large",
   now = Math.floor(Date.now() / 1000) } = {}) {
   requireConfig(config);
+  if (!/^\d+$/.test(String(config.appId || ""))) throw new Error("腾讯云账号信息尚未取得");
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId) || !Number.isSafeInteger(now) || now < 0 ||
       Number(sampleRate) !== 16000 || !Object.hasOwn(REALTIME_ENGINES, engine)) {
     throw new Error("无法开始实时转写，请重新开始录音后再试");
@@ -4937,150 +4964,45 @@ function serviceError(code, requestId = "") {
   return error;
 }
 
-function parseFlashResult(result, channels = 1) {
-  if (!Array.isArray(result?.flash_result)) {
-    throw responseError("missing-result");
-  }
-  const segments = [];
-  for (const track of result.flash_result) {
-    const channel = track.channel_id;
-    if (!Number.isInteger(channel) || channel < 0 || channel >= channels ||
-        !Array.isArray(track.sentence_list)) {
-      throw responseError("invalid-channel");
-    }
-    const speakers = new Set(track.sentence_list.filter((sentence) => String(sentence.text || "").trim())
-      .map((sentence) => Number(sentence.speaker_id ?? 0)));
-    for (const sentence of track.sentence_list) {
-      if (typeof sentence.text !== "string") {
-        throw responseError("invalid-sentence");
-      }
-      const text = sentence.text.trim();
-      if (!text) continue;
-      const startMs = sentence.start_time;
-      const endMs = sentence.end_time;
-      const speaker = sentence.speaker_id ?? 0;
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs ||
-          !Number.isInteger(speaker) || speaker < 0) {
-        throw responseError("invalid-timestamp");
-      }
-      const speakerLabel = channels === 2
-        ? channel === 0 ? "我" : `其他参会者${speakers.size > 1 ? ` ${speaker + 1}` : ""}`
-        : `说话人 ${speaker + 1}`;
-      segments.push({ startMs, endMs, speaker, channel, text, speakerLabel });
-    }
-  }
-  return segments.sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
-}
-
-function responseError(responseIssue) {
-  const message = "腾讯云返回的转写不完整，请稍后手动重试";
-  return Object.assign(new Error(message), { code: "INVALID_RESPONSE", responseIssue, userMessage: message });
-}
-
-function aborted() {
-  const error = new Error("已取消转写");
-  error.name = "AbortError";
-  return error;
-}
-
-// https://cloud.tencent.com/document/product/1093/52097
-async function flashRecognize(config) {
+async function getAppId(config) {
   requireConfig(config);
-  const { data, signal } = config;
-  const channels = Number(config.channels);
-  const sampleRate = Number(config.sampleRate);
-  const engine = engineForSampleRate(sampleRate);
-  if (!isUploadableWav(data, channels, sampleRate)) {
-    const message = "这段录音无法直接转写，请检查录音后重试";
-    throw Object.assign(new Error(message), { code: "INVALID_AUDIO", userMessage: message });
-  }
-  if (signal?.aborted) throw aborted();
-  const params = {
-    engine_type: engine,
-    first_channel_only: channels === 2 ? 0 : 1,
-    secretid: config.secretId,
-    speaker_diarization: 1,
-    timestamp: Math.floor(Date.now() / 1000),
-    voice_format: "wav",
-  };
-  const path = `/asr/flash/v1/${config.appId}?${queryString(params)}`;
-  const authorization = signature(config.secretKey, `POST${ASR_HOST}${path}`);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let request;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const abort = () => {
-      request?.destroy();
-      finish(aborted());
-    };
-    request = https.request({
-      hostname: ASR_HOST, path, method: "POST",
-      headers: { Authorization: authorization, "Content-Type": "application/octet-stream",
-        "Content-Length": data.length },
-      // A synchronous upload can take minutes on a meeting participant's connection.
-      // Stop a stalled connection without resubmitting a billable request.
-      timeout: 10 * 60 * 1000,
-    }, (response) => {
-      const chunks = [];
-      let received = 0;
-      response.on("data", (chunk) => {
-        received += chunk.length;
-        // Bound untrusted response data independently of the audio upload size.
-        if (received > 16 * 1024 * 1024) {
-          finish(new Error("腾讯云返回的转写无法处理，请稍后手动重试"));
-          response.destroy();
-          return;
-        }
-        chunks.push(chunk);
-      });
-      const responseFailure = (code) => {
-        const message = "转写连接已断开，请检查网络后手动重试";
-        finish(Object.assign(new Error(message), { code, userMessage: message, httpStatus: response.statusCode, responseBytes: received }));
-      };
-      response.on("aborted", () => responseFailure("ECONNRESET"));
-      response.on("error", (cause) => responseFailure(cause.code));
-      response.on("end", () => {
-        try {
-          const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if (result.code !== 0) throw serviceError(result.code, result.request_id);
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            throw Object.assign(new Error("腾讯云暂时未能完成转写，请稍后手动重试"), { responseIssue: "http-error" });
-          }
-          finish(null, parseFlashResult(result, channels));
-        } catch (error) {
-          const failure = error instanceof SyntaxError ? responseError("invalid-json") : error;
-          failure.httpStatus = response.statusCode;
-          failure.responseBytes = received;
-          finish(failure);
-        }
-      });
-    });
-    request.on("timeout", () => {
-      const message = "转写等待时间过长，请检查网络后手动重试";
-      finish(Object.assign(new Error(message), { code: "ETIMEDOUT", userMessage: message }));
-      request.destroy();
-    });
-    request.on("error", (cause) => {
-      const message = "转写连接未完成，请检查网络后手动重试";
-      finish(signal?.aborted ? aborted() : Object.assign(new Error(message), { code: cause.code, userMessage: message }));
-    });
-    request.on("finish", () => {
-      if (!settled && !signal?.aborted) config.onUploadComplete?.();
-    });
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
-    else request.end(data);
-  });
+  const result = await cloud.tcCall(config, "cam", "2019-01-16", "GetUserAppId", {});
+  if (!Number.isSafeInteger(result.AppId) || result.AppId <= 0) throw cloud.failure("腾讯云未返回有效账号信息");
+  return String(result.AppId);
 }
 
-module.exports = { ASR_HOST, isConfigured, engineForSampleRate, signRealtimeUrl,
-  serviceError, parseFlashResult, flashRecognize };
+async function submit(config, url, requestId, signal) {
+  requireConfig(config);
+  const result = await cloud.tcCall(config, "asr", "2019-06-14", "CreateRecTask", {
+    EngineModelType: "16k_zh_en_2.0", ChannelNum: 1, ResTextFormat: 1,
+    SourceType: 0, Url: url, SpeakerDiarization: 1,
+  }, signal);
+  if (!Number.isSafeInteger(result.Data?.TaskId)) throw cloud.failure("腾讯云未返回任务编号，请检查云端任务后再操作");
+  return String(result.Data.TaskId);
+}
+
+function parseResult(data) {
+  if (!Array.isArray(data?.ResultDetail) || (!data.ResultDetail.length && String(data.Result || "").trim())) throw cloud.failure("腾讯云返回的转写缺少分句，未覆盖已有文字");
+  return data.ResultDetail.map((sentence) => {
+    const { StartMs: startMs, EndMs: endMs, SpeakerId: speaker = 0, FinalSentence: text } = sentence;
+    if (typeof text !== "string" || !Number.isFinite(startMs) || !Number.isFinite(endMs) ||
+        startMs < 0 || endMs < startMs || !Number.isInteger(speaker) || speaker < 0) {
+      throw cloud.failure("腾讯云返回的转写分句无效，未覆盖已有文字");
+    }
+    return { startMs, endMs, speaker, channel: 0, text: text.trim(), speakerLabel: `说话人 ${speaker + 1}` };
+  }).filter((sentence) => sentence.text);
+}
+
+async function query(config, taskId, signal) {
+  if (!/^\d+$/.test(taskId)) throw cloud.failure("腾讯云任务编号无效");
+  const result = await cloud.tcCall(config, "asr", "2019-06-14", "DescribeTaskStatus", { TaskId: Number(taskId) }, signal);
+  if ([0, 1].includes(result.Data?.Status)) return null;
+  if (result.Data?.Status === 3) throw cloud.failure("腾讯云识别失败，请检查服务额度及录音后重新识别", { terminal: true, requestId: result.RequestId });
+  if (result.Data?.Status !== 2) throw cloud.failure("腾讯云返回了未知任务状态，未覆盖已有文字");
+  return parseResult(result.Data);
+}
+
+module.exports = { ASR_HOST, isConfigured, signRealtimeUrl, serviceError, getAppId, submit, query, parseResult };
 
   },
   "src/transcript-view.js": function (module, exports, require) {
@@ -5109,6 +5031,10 @@ module.exports = { findTranscriptMatches, playbackSegments };
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { setTimeout: delay } = require("node:timers/promises");
+const cloud = require("./cloud");
 const { EventEmitter } = require("node:events");
 const api = require("./siyuan-api");
 const meetingStore = require("./meeting-store");
@@ -5133,6 +5059,7 @@ class TranscriptionManager {
     this.progress = new Map();
     this.closing = false;
     this.persistenceGaps = new Map();
+    this.appIds = new Map();
     this.deviceId = globalThis.localStorage?.getItem("siyuan-meeting.device") || crypto.randomUUID();
     globalThis.localStorage?.setItem("siyuan-meeting.device", this.deviceId);
   }
@@ -5166,7 +5093,6 @@ class TranscriptionManager {
     if (service === "doubao") return { service, apiKey: secret(this.plugin, "meeting.doubao.apiKey") };
     return {
       service,
-      appId: String(this.plugin.controller.getPrefs().tencentAppId || "").trim(),
       secretId: secret(this.plugin, "meeting.tencent.secretId"),
       secretKey: secret(this.plugin, "meeting.tencent.secretKey"),
     };
@@ -5174,6 +5100,70 @@ class TranscriptionManager {
 
   isConfigured(service = this.service()) {
     return CLIENTS[service].isConfigured(this.config(service));
+  }
+
+  cosConfig() {
+    const prefs = this.plugin.controller.getPrefs();
+    return { ...this.config("tencent"), ...cloud.parseCosEndpoint(prefs.cosEndpoint) };
+  }
+
+  isFileConfigured() {
+    try { return this.isConfigured() && tencent.isConfigured(this.cosConfig()); }
+    catch { return false; }
+  }
+
+  async realtimeConfig() {
+    const config = this.config("tencent");
+    const key = crypto.createHash("sha256").update(`${config.secretId}:${config.secretKey}`).digest("hex");
+    if (!this.appIds.has(key)) {
+      const promise = tencent.getAppId(config).catch((error) => { this.appIds.delete(key); throw error; });
+      this.appIds.set(key, promise);
+    }
+    return { ...config, appId: await this.appIds.get(key) };
+  }
+
+  jobDirectory(meetingId, recordingId) {
+    const key = crypto.createHash("sha256").update(`${meetingId}:${recordingId}`).digest("hex");
+    return path.join(this.plugin.controller.storageRoot, "transcriptions", key);
+  }
+
+  readJob(meetingId, recordingId) {
+    const file = path.join(this.jobDirectory(meetingId, recordingId), "job.json");
+    try {
+      const job = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (job.meetingId !== meetingId || job.recordingId !== recordingId ||
+          !Object.hasOwn(CLIENTS, job.service) || !/^[a-f0-9-]{36}$/.test(job.id) || !Array.isArray(job.parts) ||
+          job.parts.some((part, index) => part.key !== `siyuan-meeting/${job.id}/${index}.wav`)) throw new Error("invalid job");
+      return job;
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw cloud.failure("本机转写任务记录无法读取，已停止重新提交，请保留任务文件检查");
+    }
+  }
+
+  saveJob(job) {
+    const dir = this.jobDirectory(job.meetingId, job.recordingId);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, "job.json");
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(job), { mode: 0o600 });
+    fs.renameSync(`${file}.tmp`, file);
+  }
+
+  pendingFor(meetingId, recordingId) {
+    const job = this.readJob(meetingId, recordingId);
+    return job ? { saved: Boolean(job.saved), failed: Boolean(job.failed), phase: job.phase, canDiscard: job.failed || job.parts.every((part) => part.stage === "done") } : null;
+  }
+
+  async cleanup(job, signal) {
+    const config = { ...this.config("tencent"), bucket: job.bucket, region: job.region };
+    for (const part of job.parts) {
+      if (!part.deleted && part.stage !== "prepared") {
+        await cloud.remove(config, part.key, signal);
+        part.deleted = true;
+        this.saveJob(job);
+      }
+    }
+    fs.rmSync(this.jobDirectory(job.meetingId, job.recordingId), { recursive: true, force: true });
   }
 
   async setState(meeting, recordingId, status, error = "", patch = {}, { publish = true, progress = null, appended } = {}) {
@@ -5208,98 +5198,190 @@ class TranscriptionManager {
     return { gaps, status, error };
   }
 
-  async start(meeting, recording, { gapsOnly = false, expectedFingerprint } = {}) {
+  async start(meeting, recording, { gapsOnly = false, expectedFingerprint, resume = false, queryOnly = false } = {}) {
     if (!meeting?.id || !recording?.recordingId) throw new Error("没有可转写的录音");
     if (this.closing || this.jobs.has(recording.recordingId)) return;
-    const config = this.config();
-    if (!this.isConfigured(config.service)) throw new Error("请先在会议设置中配置转写服务");
     if (!recording.assetPath) throw new Error("录音保存完成后才能转写");
+    let job = this.readJob(meeting.id, recording.recordingId);
+    if (!resume && job && !job.failed && !job.saved) throw new Error("这段录音还有未完成任务，请先继续原任务，避免重复识别");
     const controller = new AbortController();
     const { signal } = controller;
     this.jobs.set(recording.recordingId, controller);
-    let persisted = false;
     let outcome = { status: "incomplete", error: "", progress: null };
     let progress = { phase: "preparing" };
-    this.notify(meeting, recording.recordingId, "processing", "", progress);
+    const publish = (phase, patch = {}) => {
+      progress = { ...progress, ...patch, phase };
+      this.notify(meeting, recording.recordingId, "processing", "", progress);
+    };
+    publish("preparing");
     try {
-      const absolute = await api.resolveAssetPath(recording.assetPath);
-      if (!absolute) throw Object.assign(new Error("录音尚未同步到本机，请同步后重试"), { userMessage: "录音尚未同步到本机，请同步后重试" });
-      const fingerprint = expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId);
-      await this.setState(meeting, recording.recordingId, "processing", "", {}, { progress });
-      const results = [];
-      const ranges = gapsOnly ? recording.gaps || [] : [{}];
-      if (!ranges.length) {
-        outcome = { status: recording.transcriptionStatus || "incomplete", error: "", progress: null };
-        await this.setState(meeting, recording.recordingId, outcome.status, "", {}, { publish: false });
-        return;
+      if (job?.saved) {
+        publish("cleaning");
+        await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
+        await this.cleanup(job, signal);
+        outcome = { status: "done", error: "", progress: { phase: "done" } };
+        if (resume) return;
+        job = null;
       }
-      let requestIndex = 0;
-      for (const [rangeIndex, range] of ranges.entries()) {
-        for await (const part of wavParts(absolute, { ...range, signal })) {
-          signal.throwIfAborted();
-          progress = { phase: "uploading", partIndex: part.partIndex + 1, partCount: part.partCount,
-            completedParts: part.partIndex, rangeIndex: rangeIndex + 1, rangeCount: ranges.length };
-          this.notify(meeting, recording.recordingId, "processing", "", progress);
-          const segments = await CLIENTS[config.service].flashRecognize({
-            ...config, data: part.data, channels: part.channels,
-            sampleRate: part.sampleRate, signal,
-            onUploadComplete: () => {
-              progress = { ...progress, phase: "recognizing" };
-              this.notify(meeting, recording.recordingId, "processing", "", progress);
-            },
-          });
-          signal.throwIfAborted();
-          const multipleSpeakers = new Set(segments.map((segment) => segment.speaker)).size > 1;
-          for (const segment of segments) {
-            const channel = range.channel ?? segment.channel;
-            results.push({
-              ...segment, channel,
-              startMs: part.startMs + segment.startMs,
-              endMs: Math.min(part.endMs, part.startMs + segment.endMs),
-              speakerLabel: recording.channels === 2
-                ? channel === 0 ? "我" : (part.channels === 2 ? segment.speakerLabel : `其他参会者${multipleSpeakers ? ` ${Number(segment.speaker || 0) + 1}` : ""}`)
-                : segment.speakerLabel || `说话人 ${Number(segment.speaker || 0) + 1}`,
-            });
-          }
-          if (requestIndex > 0 || gapsOnly) {
-            results.push({ startMs: part.startMs, endMs: part.startMs, speaker: 0,
-              channel: range.channel ?? 0, speakerLabel: "说明", notice: true,
-              text: "从这里开始单独转写，说话人编号重新开始。" });
-          }
-          requestIndex++;
-          progress = { ...progress, phase: "preparing", completedParts: part.partIndex + 1 };
-          this.notify(meeting, recording.recordingId, "processing", "", progress);
+      if (job?.failed) {
+        await this.cleanup(job, signal);
+        job = null;
+        if (resume) {
+          outcome = { status: "incomplete", error: "原任务已结束，临时录音已清理；可重新识别整段", progress: null };
+          await this.setState(meeting, recording.recordingId, outcome.status, outcome.error, {}, { publish: false });
+          return;
         }
       }
-      signal.throwIfAborted();
-      progress = { ...progress, phase: "saving" };
-      this.notify(meeting, recording.recordingId, "processing", "", progress);
-      await meetingStore.writeTranscript(meeting, recording.recordingId, results, { append: gapsOnly, expectedFingerprint: fingerprint });
-      persisted = true;
+      if (!job) {
+        if (queryOnly) return;
+        if (!this.isFileConfigured()) throw cloud.failure("请先在会议设置中配置转写服务和腾讯云 COS");
+        const absolute = await api.resolveAssetPath(recording.assetPath);
+        if (!absolute) throw cloud.failure("录音尚未同步到本机，请同步后重试");
+        const ranges = gapsOnly ? mergeGaps((recording.gaps || []).map((gap) => ({ ...gap, channel: 0 }))) : [{}];
+        if (!ranges.length) {
+          outcome = { status: recording.transcriptionStatus || "done", error: "", progress: null };
+          return;
+        }
+        const cos = this.cosConfig();
+        job = { id: crypto.randomUUID(), meetingId: meeting.id, recordingId: recording.recordingId,
+          service: this.service(), bucket: cos.bucket, region: cos.region, createdAt: Date.now(),
+          fingerprint: expectedFingerprint ?? await meetingStore.transcriptFingerprint(meeting, recording.recordingId),
+          gapsOnly, phase: "preparing", parts: [] };
+        this.saveJob(job);
+        const dir = this.jobDirectory(meeting.id, recording.recordingId);
+        for (const [index, range] of ranges.entries()) {
+          for await (const part of wavParts(absolute, { ...range, signal, directory: dir, prefix: `range-${index}`,
+            maxBytes: job.service === "doubao" ? 512000000 - 1 : 1000000000 })) {
+            job.parts.push({ name: path.basename(part.file), startMs: part.startMs, endMs: part.endMs,
+              key: `siyuan-meeting/${job.id}/${job.parts.length}.wav`, stage: "prepared", requestId: crypto.randomUUID() });
+          }
+        }
+        job.phase = "ready";
+        this.saveJob(job);
+      }
+      if (job.phase === "preparing") {
+        job.failed = true;
+        this.saveJob(job);
+        throw cloud.failure("上次录音准备未完成，请重新识别整段");
+      }
+      if (job.phase === "saving") {
+        const current = await meetingStore.transcriptFingerprint(meeting, recording.recordingId);
+        if (current !== job.fingerprint) throw cloud.failure("上次保存结果时中断，文字已有变化；请先检查现有文字，再决定是否放弃本次结果");
+        job.phase = "ready";
+        this.saveJob(job);
+      }
+      const config = this.config(job.service);
+      const cos = { ...this.config("tencent"), bucket: job.bucket, region: job.region };
+      await this.setState(meeting, recording.recordingId, "processing", "", {}, { publish: false });
+      publish("preparing", { partCount: job.parts.length, completedParts: job.parts.filter((part) => part.stage === "done").length });
+      for (const part of job.parts) {
+        if (part.stage === "done") continue;
+        signal.throwIfAborted();
+        if (part.stage === "submitting" && !part.taskId) {
+          // A lost submit response cannot prove whether a billable task exists.
+          if (Date.now() - part.submittedAt >= 24 * 3600 * 1000) {
+            job.failed = true;
+            this.saveJob(job);
+          }
+          throw cloud.failure("上次提交结果不确定，未自动再次计费；请核对云端调用。24 小时后可重新识别");
+        }
+        if (!part.taskId) {
+          if (queryOnly) throw cloud.failure("上次任务尚未全部提交，点击「继续原任务」完成剩余部分");
+          publish("uploading");
+          if (!/^range-\d+-\d+\.wav$/.test(part.name)) throw cloud.failure("本机录音临时文件名无效");
+          part.stage = "uploading";
+          this.saveJob(job);
+          await cloud.upload(cos, part.key, path.join(this.jobDirectory(meeting.id, recording.recordingId), part.name), signal);
+          part.stage = "submitting";
+          part.submittedAt = Date.now();
+          this.saveJob(job);
+          publish("submitting");
+          try {
+            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal);
+          } catch (error) {
+            if (error.rejected) { part.stage = "rejected"; job.failed = true; this.saveJob(job); }
+            throw error;
+          }
+          part.stage = "submitted";
+          this.saveJob(job);
+          fs.rmSync(path.join(this.jobDirectory(meeting.id, recording.recordingId), part.name), { force: true });
+        }
+        publish("recognizing");
+        while (true) {
+          signal.throwIfAborted();
+          if (job.service === "tencent" && Date.now() - part.submittedAt >= 24 * 3600 * 1000) {
+            job.failed = true;
+            this.saveJob(job);
+            throw cloud.failure("云端任务已超过查询有效期，请重新识别整段");
+          }
+          let segments;
+          try { segments = await CLIENTS[job.service].query(config, part.taskId, signal); }
+          catch (error) {
+            if (error.terminal) { job.failed = true; this.saveJob(job); }
+            throw error;
+          }
+          if (segments !== null) {
+            const duration = part.endMs - part.startMs;
+            if (segments.some((segment) => segment.startMs > duration || segment.endMs > duration + 1000)) {
+              throw cloud.failure("识别结果时间超出录音范围，未覆盖已有文字");
+            }
+            part.segments = segments.map((segment) => ({ ...segment, channel: 0,
+              startMs: part.startMs + segment.startMs, endMs: Math.min(part.endMs, part.startMs + segment.endMs) }));
+            part.stage = "done";
+            this.saveJob(job);
+            break;
+          }
+          await delay(5000, undefined, { signal });
+        }
+        publish("recognizing", { completedParts: job.parts.filter((part) => part.stage === "done").length });
+      }
+      const results = job.parts.flatMap((part, index) => [
+        ...(index || job.gapsOnly ? [{ startMs: part.startMs, endMs: part.startMs, channel: 0, speaker: 0,
+          speakerLabel: "说明", notice: true, text: "从这里开始单独转写，说话人编号重新开始。" }] : []), ...part.segments,
+      ]);
+      publish("saving");
+      job.phase = "saving";
+      this.saveJob(job);
+      try {
+        await meetingStore.writeTranscript(meeting, recording.recordingId, results, {
+          append: job.gapsOnly, expectedFingerprint: job.fingerprint,
+        });
+      } catch (error) {
+        // Retry saving only when the previous text is still exactly intact.
+        const current = await meetingStore.transcriptFingerprint(meeting, recording.recordingId).catch(() => null);
+        if (current === job.fingerprint) { job.phase = "ready"; this.saveJob(job); }
+        throw error;
+      }
+      job.saved = true;
+      job.phase = "cleaning";
+      this.saveJob(job);
       await this.setState(meeting, recording.recordingId, "done", "", { gaps: [] }, { publish: false });
-      outcome = { status: "done", error: "", progress: { ...progress, phase: "done" } };
       this.persistenceGaps.delete(`${meeting.id}:${recording.recordingId}`);
+      publish("cleaning");
+      await this.cleanup(job, signal);
+      outcome = { status: "done", error: "", progress: { ...progress, phase: "done" } };
     } catch (error) {
-      this.plugin.controller.recordTranscriptionFailure({
-        meetingId: meeting.id, recordingId: recording.recordingId, phase: progress.phase, error,
-      });
-      // Service messages are translated by the client. Raw transport failures
-      // never become a user-facing error or a reason to resubmit automatically.
-      const message = signal.aborted
-        ? "转写已中断，录音和已有文字已保留；可手动重试"
-        : error.userMessage || (error.code === "TRANSCRIPT_CHANGED"
-          ? "转写文字在处理期间被修改，已保留修改，请确认后重新转写"
-          : progress.phase === "saving" ? "识别已完成，但转写文字未能保存；录音和已有文字已保留，请检查思源后重试"
-          : progress.phase === "preparing" ? "未能读取录音或转写内容，请确认录音已同步后重新打开会议重试"
-          : "这段转写未完成，录音和已有文字已保留；请检查网络与转写服务设置后手动重试");
-      outcome = { status: "incomplete", error: persisted
-        ? "文字已保存，但完成情况未能保存；请重新打开会议检查" : message,
-        progress: { ...progress, phase: "incomplete" } };
-      await this.setState(meeting, recording.recordingId, "incomplete", outcome.error, {}, { publish: false }).catch(() => {});
+      this.plugin.controller.recordTranscriptionFailure({ meetingId: meeting.id, recordingId: recording.recordingId, phase: progress.phase, error });
+      const message = signal.aborted ? "本机处理已停止；重开会议后可继续查询原任务"
+        : error.code === "TRANSCRIPT_CHANGED" ? "识别期间文字被修改，已保留修改；请先处理原任务"
+          : error.userMessage || "转写未完成，录音和已有文字已保留；可继续原任务";
+      outcome = { status: job?.saved ? "done" : "incomplete", error: message,
+        progress: { ...progress, phase: job?.saved ? "cleanup-failed" : "incomplete" } };
+      await this.setState(meeting, recording.recordingId, outcome.status, message, {}, { publish: false }).catch(() => {});
     } finally {
       this.jobs.delete(recording.recordingId);
       this.notify(meeting, recording.recordingId, outcome.status, outcome.error, outcome.progress);
     }
+  }
+
+  async discard(meeting, recording) {
+    if (this.isRunning(recording.recordingId)) return;
+    const job = this.readJob(meeting.id, recording.recordingId);
+    if (!job) return;
+    // Only completed recognition can be discarded without cutting off a provider download.
+    if (!job.parts.every((part) => part.stage === "done") && !job.failed) throw new Error("原任务尚未结束，请先继续原任务");
+    await this.cleanup(job);
+    await this.setState(meeting, recording.recordingId, job.saved ? "done" : "incomplete", "");
   }
 
   async afterRecording(meeting, recording) {
@@ -5310,11 +5392,9 @@ class TranscriptionManager {
     }
     if (recording.realtimeEnabled) {
       if (!recording.gaps?.length && recording.transcriptionStatus === "done") return;
-      if (this.plugin.controller.getPrefs().autoTranscribe && recording.gaps?.length) {
+      if (this.plugin.controller.getPrefs().autoFillGaps !== false && recording.gaps?.length) {
         return this.start(meeting, recording, { gapsOnly: true });
       }
-    } else if (this.plugin.controller.getPrefs().autoTranscribe) {
-      return this.start(meeting, recording);
     }
   }
 
@@ -5323,6 +5403,11 @@ class TranscriptionManager {
     const { recordings } = await meetingStore.readRecordings(meeting);
     for (const recording of recordings) {
       if (this.jobs.has(recording.recordingId)) continue;
+      const pending = this.readJob(meeting.id, recording.recordingId);
+      if (pending) {
+        void this.start(meeting, recording, { resume: true, queryOnly: true }).catch(() => {});
+        continue;
+      }
       if (recording.deviceId !== this.deviceId) continue;
       const active = this.plugin.controller.snapshot?.();
       if (active?.recordingId === recording.recordingId && this.plugin.controller.isBusy()) continue;
@@ -5347,6 +5432,7 @@ module.exports = { TranscriptionManager };
 
 const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
+const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
 const { createTemplatePicker, openTemplateManager } = require("./template-ui");
@@ -5455,7 +5541,7 @@ function actualTimeFor(recording, startMs) {
 }
 
 function statusLabel(status, phase = "") {
-  const phases = { checking: "准备中", confirming: "待确认", preparing: "准备中", uploading: "发送中", recognizing: "等待结果", saving: "保存中" };
+  const phases = { checking: "准备中", confirming: "待确认", preparing: "准备中", uploading: "发送中", recognizing: "等待结果", saving: "保存中", submitting: "提交中", cleaning: "清理中" };
   if (phases[phase]) return phases[phase];
   switch (status) {
     case "uploading":
@@ -5504,6 +5590,8 @@ function transcriptionTaskText(task) {
     preparing: "正在准备录音…",
     uploading: "正在发送录音…",
     recognizing: "等待识别结果…",
+    submitting: "正在提交识别任务…",
+    cleaning: "文字已保存，正在删除云端临时录音…",
     saving: "识别已完成，正在保存文字…",
     done: "转写完成，文字已保存。",
   };
@@ -6722,11 +6810,12 @@ function segmentCard(state, recording) {
   const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status, task.phase));
   badge.title = task.error;
   top.append(title, badge);
+  if (recording.recordingId === state.selectedRecordingId) top.append(h("span", "meeting-segment__current", "当前选中"));
 
   const meta = h(
     "span",
     "meeting-segment__meta",
-    formatDuration(Number(recording.seconds || 0) * 1000, {
+    `${recordingRange(recording)} · ` + formatDuration(Number(recording.seconds || 0) * 1000, {
       alwaysHours: Number(recording.seconds || 0) >= 3600,
     }),
   );
@@ -6736,7 +6825,7 @@ function segmentCard(state, recording) {
   }
   if (recording.gaps?.length && state.plugin.transcription.isConfigured()) {
     const gaps = h("span", "meeting-segment__notice", "部分未转写");
-    gaps.title = `尚未转写：${recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、")}`;
+    gaps.title = `尚未转写：${recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}`).join("、")}`;
     meta.append(gaps);
   }
   if (!recording.assetPath) {
@@ -6745,30 +6834,35 @@ function segmentCard(state, recording) {
   }
 
   const actions = h("div", "meeting-segment__actions");
-  // Only the selected recording offers transcription actions; the row stays a quiet picker.
   actions.hidden = recording.recordingId !== state.selectedRecordingId;
+  const taskPending = state.plugin.transcription.pendingFor?.(state.docId, recording.recordingId);
   const button = h("button", "meeting-link", "");
   const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
-  const fillGaps = recording.realtimeEnabled && recording.gaps?.length > 0;
   button.textContent = running ? `${statusLabel("processing", task.phase)}…`
-    : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : ["failed", "incomplete"].includes(status) ? "重试转写" : "转写";
-  button.disabled = running || !recording.assetPath;
+    : hasText || status === "done" ? "重新识别整段" : "识别整段";
+  button.disabled = running || !recording.assetPath || Boolean(taskPending && !taskPending.saved && !taskPending.failed);
   button.setAttribute("aria-busy", String(running));
-  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试"
-    : `使用${state.plugin.transcription.service() === "tencent" ? "腾讯云" : "豆包"}转写服务`;
+  button.title = `${recordingTitle(recording.index)}：识别整段后替换该段转写`;
   button.onclick = (event) => {
     event.stopPropagation();
-    void startTranscription(state, recording, { gapsOnly: fillGaps });
+    void startTranscription(state, recording);
   };
-  if (fillGaps && hasText) {
-    const redo = h("button", "meeting-link", "重新转写整段");
-    redo.disabled = running || !recording.assetPath;
-    redo.onclick = (event) => {
-      event.stopPropagation();
-      void startTranscription(state, recording);
-    };
-    actions.append(redo);
+  if (taskPending) {
+    const resume = h("button", "meeting-link", taskPending.saved ? "重试清理云端录音" : taskPending.failed ? "清理失败任务" : "继续原任务");
+    resume.disabled = running;
+    resume.onclick = () => void continueTranscription(state, recording);
+    actions.append(resume);
+    if (taskPending.canDiscard && !taskPending.saved && !taskPending.failed) {
+      const discard = h("button", "meeting-link", "保留现有文字，放弃本次结果");
+      discard.disabled = running;
+      discard.onclick = async () => {
+        if (!await confirmDialog("放弃本次识别结果", "保留现有转写，清理本次任务及云端临时录音。", "放弃结果")) return;
+        try { await state.plugin.transcription.discard(state.meeting, recording); renderRecordings(state); }
+        catch (error) { showMessage(error.message, 6000, "error"); }
+      };
+      actions.append(discard);
+    }
   }
   actions.append(button);
   selectButton.append(top, meta);
@@ -6780,11 +6874,20 @@ function segmentCard(state, recording) {
   return card;
 }
 
-async function startTranscription(state, recording, { gapsOnly = false } = {}) {
+async function continueTranscription(state, recording) {
+  state.transcriptionRequests.delete(recording.recordingId);
+  try {
+    await state.plugin.transcription.start(state.meeting, recording, { resume: true });
+    await refreshRecordings(state);
+    renderTranscriptionFeedback(state);
+  } catch (error) { showMessage(error.message, 6000, "error"); }
+}
+
+async function startTranscription(state, recording) {
   const recordingId = recording.recordingId;
   const task = transcriptionTask(state, recording);
   if (task.running) return;
-  if (!state.plugin.transcription.isConfigured()) {
+  if (!state.plugin.transcription.isFileConfigured()) {
     openSettings(state.plugin);
     return;
   }
@@ -6796,22 +6899,18 @@ async function startTranscription(state, recording, { gapsOnly = false } = {}) {
     const { segments } = await meetingStore.readTranscript(state.meeting);
     const hasText = segments.some((item) => item.recordingId === recording.recordingId);
     const fingerprint = await meetingStore.transcriptFingerprint(state.meeting, recording.recordingId);
-    if (!gapsOnly && (hasText || recording.transcriptionStatus === "done")) {
+    if (hasText || recording.transcriptionStatus === "done") {
       state.transcriptionRequests.set(recordingId, { phase: "confirming" });
       renderTranscriptionFeedback(state);
       const edited = !recording.transcriptionFingerprint || fingerprint !== recording.transcriptionFingerprint;
       const accepted = await confirmDialog("重新转写", edited
-        ? "这段转写已被修改。重新转写会再次计费并替换现有转写，你的修改会丢失。"
-        : "重新转写会再次计费，并替换这段录音的现有转写。", "重新转写");
+        ? "这段转写已被修改。重新识别整段会替换现有转写，你的修改会丢失。"
+        : "重新识别整段会替换这段录音的现有转写。", "重新转写");
       if (!accepted) return;
-    } else if (recording.transcriptionStatus === "incomplete" && !gapsOnly) {
-      state.transcriptionRequests.set(recordingId, { phase: "confirming" });
-      renderTranscriptionFeedback(state);
-      if (!await confirmDialog("重试转写", "上次转写未完成。重新提交可能再次计费，是否继续？", "继续转写")) return;
     }
     if (state.destroyed) return;
     state.transcriptionRequests.delete(recordingId);
-    await state.plugin.transcription.start(state.meeting, recording, { gapsOnly, expectedFingerprint: fingerprint });
+    await state.plugin.transcription.start(state.meeting, recording, { expectedFingerprint: fingerprint });
   } catch (error) {
     state.transcriptionRequests.set(recordingId, { phase: "failed", error: error.message });
   } finally {
@@ -6822,6 +6921,8 @@ async function startTranscription(state, recording, { gapsOnly = false } = {}) {
 
 function playerView(state, recording) {
   const wrapper = h("div", "meeting-player");
+  wrapper.dataset.recordingId = recording.recordingId;
+  wrapper.append(h("div", "meeting-player__title", `当前回听：${recordingTitle(recording.index)} · ${recordingRange(recording)}`));
   if (state.audio.dataset.recordingId !== recording.recordingId) {
     try {
       state.audio.pause();
@@ -7204,7 +7305,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   for (const recording of state.recordings) {
     const task = transcriptionTask(state, recording);
     const active = task.running || task.status === "processing";
-    const failed = ["failed", "incomplete"].includes(task.status) && task.error;
+    const failed = Boolean(task.error);
     if (active) activeTasks.push({ recording, task });
     if (!failed || active) continue;
     const feedback = h("div", "meeting-transcription-feedback");
@@ -7213,10 +7314,9 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     feedback.dataset.phase = task.phase;
     feedback.setAttribute("role", "alert");
     feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
-    const retry = h("button", "meeting-link", "重试转写");
-    retry.onclick = () => void startTranscription(state, recording, {
-      gapsOnly: Boolean(recording.realtimeEnabled && recording.gaps?.length),
-    });
+    const pending = state.plugin.transcription.pendingFor?.(state.docId, recording.recordingId);
+    const retry = h("button", "meeting-link", pending ? pending.saved ? "重试清理" : "继续原任务" : "重新识别整段");
+    retry.onclick = () => pending ? void continueTranscription(state, recording) : void startTranscription(state, recording);
     feedback.append(retry);
     section.append(feedback);
   }
@@ -7992,34 +8092,41 @@ function openSettings(plugin) {
           <label class="meeting-settings__row"><span>API Key</span>
             <input class="b3-text-field" type="password" name="apiKey" placeholder="${hasApiKey ? "已保存，留空不修改" : "填写 API Key"}" autocomplete="off">
           </label>
-          <p class="meeting-settings__hint">需在火山引擎控制台开通豆包流式语音识别 2.0（按小时计费）和录音文件识别极速版。</p>
+          <p class="meeting-settings__hint">需开通豆包流式语音识别 2.0 和录音文件识别标准版 2.0。</p>
         </div>
         <div class="meeting-settings__group" data-service="tencent"${service === "tencent" ? "" : " hidden"}>
-          <label class="meeting-settings__row"><span>AppId</span>
-            <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
-          </label>
-          <label class="meeting-settings__row"><span>SecretId</span>
-            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
-          </label>
-          <label class="meeting-settings__row"><span>SecretKey</span>
-            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
-          </label>
           <label class="meeting-settings__row"><span>实时识别引擎</span>
             <select class="b3-select" name="realtimeEngine">
               <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
               <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
             </select>
           </label>
-          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写分不出线下会议的说话人，需要时可在会后重新转写。</p>
+          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写不区分说话人，会后使用录音文件大模型 2.0 识别。密钥需具备 ASR 和 GetUserAppId 权限，账号信息自动获取，无需填写 AppId。</p>
         </div>
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议两路声音分别计费。</p>
-        <label class="meeting-settings__row"><span>结束后自动转写</span>
-          <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
+        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议混合为单声道识别，原录音保留双声道。</p>
+        <label class="meeting-settings__row"><span>结束后自动补齐缺口</span>
+          <input type="checkbox" name="autoFillGaps"${prefs.autoFillGaps !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">开启实时转写时只补齐缺口；关闭实时转写时，结束后转写整段。</p>
+        <p class="meeting-settings__hint">只补齐实时转写缺口；关闭实时转写时，由你手动识别整段。</p>
+      </section>
+      <section>
+        <h3>腾讯云与 COS 临时录音</h3>
+        <p class="meeting-settings__hint">COS 与腾讯语音共用以下密钥，只需填写一次。两家会后识别均使用私有 COS，密钥需具备指定桶临时目录的上传、下载和删除权限。</p>
+          <label class="meeting-settings__row"><span>SecretId</span>
+            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretKey</span>
+            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
+          </label>
+        <label class="meeting-settings__row"><span>COS 存储桶地址</span>
+          <input class="b3-text-field" name="cosEndpoint" value="${escapeHtml(prefs.cosEndpoint || "")}" placeholder="https://meeting-1250000000.cos.ap-shanghai.myqcloud.com">
+        </label>
+        <p class="meeting-settings__hint">从 COS 控制台复制存储桶默认域名，桶名和地域自动识别。请使用私有桶。</p>
+        <p class="meeting-settings__hint">录音通过限时链接供识别服务读取，文字成功保存后删除 COS 临时录音，思源原录音保留。中断任务保留至继续处理；清理失败可重试。</p>
+        <p class="meeting-settings__hint">计费：实时识别、会后识别分别按服务商规则收费；自动补齐只提交缺口，手动识别提交整段，会再次产生识别费用。COS 存储、请求及下载流量另计。继续查询原任务或重试清理不会新建识别任务。</p>
       </section>
       <section>
         <h3>AI 纪要</h3>
@@ -8059,6 +8166,7 @@ function openSettings(plugin) {
     const save = element.querySelector('[data-action="save"]');
     save.disabled = true;
     try {
+      if (value("cosEndpoint").trim()) parseCosEndpoint(value("cosEndpoint"));
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
       await api.writeSecrets([
@@ -8071,10 +8179,10 @@ function openSettings(plugin) {
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,
         transcriptionService: value("service") === "tencent" ? "tencent" : "doubao",
-        tencentAppId: value("appId").trim(),
+        cosEndpoint: value("cosEndpoint").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
         realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",
-        autoTranscribe: element.querySelector('[name="autoTranscribe"]').checked,
+        autoFillGaps: element.querySelector('[name="autoFillGaps"]').checked,
       });
       showMessage("设置已保存", 3000);
       dialog.destroy();
@@ -8378,27 +8486,11 @@ module.exports = {
 
 const fs = require("node:fs");
 
-// Tencent and Doubao flash ASR both accept at most 100 MB and two hours per request.
-const MAX_FILE_BYTES = 100000000;
-const MAX_DURATION_SECONDS = 2 * 60 * 60;
+const path = require("node:path");
 const HEADER_BYTES = 44;
 
 function invalidAudio() {
   return new Error("录音文件不完整或无法读取，请重新归档录音后再试");
-}
-
-// One request carries one complete 16-bit PCM WAV part produced by wavParts.
-function isUploadableWav(data, channels, sampleRate) {
-  return Buffer.isBuffer(data) && data.length > HEADER_BYTES && data.length <= MAX_FILE_BYTES &&
-    [1, 2].includes(channels) && data.toString("ascii", 0, 4) === "RIFF" &&
-    data.toString("ascii", 8, 12) === "WAVE" && data.toString("ascii", 12, 16) === "fmt " &&
-    data.readUInt32LE(16) === 16 && data.readUInt16LE(20) === 1 &&
-    data.readUInt16LE(22) === channels && data.readUInt32LE(24) === sampleRate &&
-    data.readUInt32LE(28) === sampleRate * channels * 2 && data.readUInt16LE(32) === channels * 2 &&
-    data.readUInt16LE(34) === 16 && data.toString("ascii", 36, 40) === "data" &&
-    data.readUInt32LE(40) === data.length - HEADER_BYTES && data.readUInt32LE(4) === data.length - 8 &&
-    !((data.length - HEADER_BYTES) % (channels * 2)) &&
-    (data.length - HEADER_BYTES) / (sampleRate * channels * 2) <= MAX_DURATION_SECONDS;
 }
 
 function readExact(fd, buffer, position) {
@@ -8489,23 +8581,19 @@ function checkAbort(signal) {
   }
 }
 
-/** Produce complete WAV requests, keeping offsets on the original audio timeline. */
-async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = {}) {
+/** Write mono requests incrementally; the archived source is never changed. */
+async function* wavParts(file, { startMs = 0, endMs, signal, directory, prefix = "part", maxBytes, maxSeconds = 5 * 3600 } = {}) {
   checkAbort(signal);
   const info = readWavInfo(file);
+  if (info.sampleRate !== 16000) throw new Error("请使用会议插件保存的 16 kHz 原录音进行识别");
   const end = endMs === undefined ? info.durationMs : Number(endMs);
   const start = Number(startMs);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start ||
-      start > info.durationMs || end > info.durationMs + 1 / info.sampleRate * 1000 ||
-      (channel !== null && (!Number.isInteger(channel) || channel < 0 || channel >= info.channels))) {
+  if (!directory || !/^[a-z0-9-]+$/.test(prefix) || !Number.isSafeInteger(maxBytes) || maxBytes <= HEADER_BYTES ||
+      !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start ||
+      start > info.durationMs || end > info.durationMs + 1 / info.sampleRate * 1000) {
     throw new Error("所选转写时段无效，请重新选择录音后再试");
   }
-  const outputChannels = channel === null ? info.channels : 1;
-  const outputAlign = outputChannels * 2;
-  const framesPerPart = Math.min(
-    Math.floor((MAX_FILE_BYTES - HEADER_BYTES) / outputAlign),
-    MAX_DURATION_SECONDS * info.sampleRate,
-  );
+  const framesPerPart = Math.min(Math.floor((maxBytes - HEADER_BYTES) / 2), maxSeconds * info.sampleRate);
   const firstFrame = Math.round(start / 1000 * info.sampleRate);
   const finalFrame = Math.min(info.frames, Math.round(end / 1000 * info.sampleRate));
   const partCount = Math.ceil((finalFrame - firstFrame) / framesPerPart);
@@ -8515,44 +8603,39 @@ async function* wavParts(file, { startMs = 0, endMs, channel = null, signal } = 
     for (let frame = firstFrame; frame < finalFrame; frame += framesPerPart) {
       checkAbort(signal);
       const frames = Math.min(framesPerPart, finalFrame - frame);
-      const data = Buffer.allocUnsafe(HEADER_BYTES + frames * outputAlign);
-      wavHeader({ frames, channels: outputChannels, sampleRate: info.sampleRate }).copy(data);
-      // A channel-only gap must not upload or bill the other channel. Read the
-      // source in bounded blocks instead of allocating a second full request.
-      const framesPerRead = Math.floor(1024 * 1024 / info.blockAlign);
-      const source = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * info.blockAlign);
-      for (let consumed = 0; consumed < frames;) {
-        checkAbort(signal);
-        const count = Math.min(framesPerRead, frames - consumed);
-        const bytes = count * info.blockAlign;
-        let read = 0;
-        while (read < bytes) {
-          const result = await handle.read(source, read, bytes - read,
-            info.dataOffset + (frame + consumed) * info.blockAlign + read);
-          if (!result.bytesRead) throw invalidAudio();
-          read += result.bytesRead;
-        }
-        if (channel === null) {
-          source.copy(data, HEADER_BYTES + consumed * outputAlign, 0, bytes);
-        } else {
-          for (let index = 0; index < count; index++) {
-            data.writeInt16LE(source.readInt16LE(index * info.blockAlign + channel * 2),
-              HEADER_BYTES + (consumed + index) * 2);
+      const output = path.join(directory, `${prefix}-${partIndex}.wav`);
+      const target = await fs.promises.open(output, "w", 0o600);
+      try {
+        await target.writeFile(wavHeader({ frames, channels: 1, sampleRate: info.sampleRate }));
+        const framesPerRead = Math.floor(1024 * 1024 / info.blockAlign);
+        const source = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * info.blockAlign);
+        const mono = Buffer.allocUnsafe(Math.min(frames, framesPerRead) * 2);
+        for (let consumed = 0; consumed < frames;) {
+          checkAbort(signal);
+          const count = Math.min(framesPerRead, frames - consumed);
+          const bytes = count * info.blockAlign;
+          let read = 0;
+          while (read < bytes) {
+            const result = await handle.read(source, read, bytes - read, info.dataOffset + (frame + consumed) * info.blockAlign + read);
+            if (!result.bytesRead) throw invalidAudio();
+            read += result.bytesRead;
           }
+          for (let index = 0; index < count; index++) {
+            const left = source.readInt16LE(index * info.blockAlign);
+            const sample = info.channels === 1 ? left : Math.round((left + source.readInt16LE(index * info.blockAlign + 2)) / 2);
+            mono.writeInt16LE(sample, index * 2);
+          }
+          await target.writeFile(mono.subarray(0, count * 2));
+          consumed += count;
         }
-        consumed += count;
-      }
-      checkAbort(signal);
-      yield { data, startMs: frame * 1000 / info.sampleRate,
-        endMs: (frame + frames) * 1000 / info.sampleRate, channel, partIndex: partIndex++, partCount,
-        channels: outputChannels, sampleRate: info.sampleRate };
+      } finally { await target.close(); }
+      yield { file: output, startMs: frame * 1000 / info.sampleRate, endMs: (frame + frames) * 1000 / info.sampleRate,
+        partIndex: partIndex++, partCount, channels: 1, sampleRate: info.sampleRate };
     }
-  } finally {
-    await handle.close();
-  }
+  } finally { await handle.close(); }
 }
 
-module.exports = { isUploadableWav, readWavInfo, wavParts, wavHeader };
+module.exports = { readWavInfo, wavParts, wavHeader };
 
   }
   };

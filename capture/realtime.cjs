@@ -67,12 +67,11 @@ const PROTOCOLS = {
       return frame;
     },
     open(socket, channel) {
-      const speakers = channel.owner.channels === 1 || channel.channel === 1;
       socket.send(this.frame(1, 0, 1, JSON.stringify({
         user: { uid: "siyuan-meeting" },
         audio: { format: "pcm", codec: "raw", rate: channel.owner.sampleRate, bits: 16, channel: 1 },
         request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, show_utterances: true,
-          result_type: "single", end_window_size: 600, ...(speakers ? { enable_speaker_info: true } : {}) },
+          result_type: "single", end_window_size: 600, enable_speaker_info: true },
       })));
     },
     audio(data) { return this.frame(2, 0, 0, Buffer.from(data)); },
@@ -110,11 +109,7 @@ const PROTOCOLS = {
   },
 };
 
-function speakerLabel(owner, channel, speaker) {
-  if (owner.channels === 2) {
-    if (channel === 0) return "我";
-    return speaker > 0 ? `其他参会者 ${speaker + 1}` : "其他参会者";
-  }
+function speakerLabel(speaker) {
   return speaker === null ? "说话人" : `说话人 ${speaker + 1}`;
 }
 
@@ -198,7 +193,7 @@ class RealtimeChannel {
                 this.owner.error = "";
               }
             }
-            const label = this.owner.channels === 2 ? (this.channel === 0 ? "我" : "其他参会者") : "";
+            const label = "";
             if (typeof item.partial === "string" && this.base !== null) {
               this.owner.caption({ channel: this.channel, label, text: item.partial, final: false });
             }
@@ -222,11 +217,11 @@ class RealtimeChannel {
                   endMs: Math.min(this.sentEnd, this.base + end),
                   speaker: speaker ?? 0,
                   channel: this.channel,
-                  speakerLabel: speakerLabel(this.owner, this.channel, speaker),
+                  speakerLabel: speakerLabel(speaker),
                   text,
                 });
               }
-              this.owner.caption({ channel: this.channel, label, text, final: true });
+              this.owner.caption({ channel: this.channel, label: speaker === null ? "" : speakerLabel(speaker), text, final: true });
             }
             if (item.done) {
               this.confirmedEnd = this.sentEnd;
@@ -365,7 +360,8 @@ class RealtimeTranscriber {
     if (!Object.hasOwn(PROTOCOLS, service)) throw new Error("unknown transcription service");
     this.protocol = PROTOCOLS[service];
     this.sampleRate = sampleRate;
-    this.channels = channels;
+    this.sourceChannels = channels;
+    this.channels = 1;
     this.enabled = enabled;
     this.configured = configured;
     this.engine = engine;
@@ -420,7 +416,7 @@ class RealtimeTranscriber {
   }
 
   push(samples, startMs) {
-    const frames = samples.length / this.channels;
+    const frames = samples.length / this.sourceChannels;
     const endMs = startMs + frames / this.sampleRate * 1000;
     if (!this.enabled) return;
     if (!this.configured) {
@@ -433,7 +429,9 @@ class RealtimeTranscriber {
           const data = new ArrayBuffer(count * 2);
           const view = new DataView(data);
           for (let i = 0; i < count; i++) {
-            const sample = Math.max(-1, Math.min(1, samples[(offset + i) * this.channels + channel]));
+            const frame = (offset + i) * this.sourceChannels;
+            const mixed = this.sourceChannels === 2 ? (samples[frame] + samples[frame + 1]) / 2 : samples[frame];
+            const sample = Math.max(-1, Math.min(1, mixed));
             view.setInt16(i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
           }
           this.connections[channel]?.push({

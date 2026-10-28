@@ -71,7 +71,7 @@ test("a lost realtime acknowledgement becomes an audio-relative gap while pause 
 });
 
 test("cleanup after a confirmed realtime finish preserves completion", async () => {
-  const reports = [];
+  const reports = [], audioPackets = [];
   class Socket {
     constructor() {
       this.readyState = 1;
@@ -79,6 +79,7 @@ test("cleanup after a confirmed realtime finish preserves completion", async () 
       queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ code: 0 }) }));
     }
     send(data) {
+      if (typeof data !== "string") audioPackets.push(Buffer.from(data));
       const result = typeof data === "string"
         ? { code: 0, final: 1 }
         : { code: 0, result: { slice_type: 2, index: 0, start_time: 0, end_time: 200, voice_text_str: "确认内容" } };
@@ -89,8 +90,10 @@ test("cleanup after a confirmed realtime finish preserves completion", async () 
   const realtime = new RealtimeTranscriber({ service: "tencent", sampleRate: 16000, channels: 2,
     enabled: true, configured: true, requestUrl: async () => "wss://synthetic",
     WebSocket: Socket, emit: report => reports.push(report) });
-  realtime.push(new Float32Array(3200 * 2), 0);
+  const samples = Float32Array.from({ length: 3200 * 2 }, (_, index) => index % 2 ? -0.2 : 0.6);
+  realtime.push(samples, 0);
   await realtime.finish();
+  assert.deepEqual(audioPackets.map((packet) => [packet.length, packet.readInt16LE(0)]), [[6400, 6553]]);
   assert.equal(reports.at(-1).status, "done");
   realtime.abort();
   assert.equal(reports.at(-1).status, "done");

@@ -2,6 +2,7 @@
 
 const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
+const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
 const { createTemplatePicker, openTemplateManager } = require("./template-ui");
@@ -110,7 +111,7 @@ function actualTimeFor(recording, startMs) {
 }
 
 function statusLabel(status, phase = "") {
-  const phases = { checking: "准备中", confirming: "待确认", preparing: "准备中", uploading: "发送中", recognizing: "等待结果", saving: "保存中" };
+  const phases = { checking: "准备中", confirming: "待确认", preparing: "准备中", uploading: "发送中", recognizing: "等待结果", saving: "保存中", submitting: "提交中", cleaning: "清理中" };
   if (phases[phase]) return phases[phase];
   switch (status) {
     case "uploading":
@@ -159,6 +160,8 @@ function transcriptionTaskText(task) {
     preparing: "正在准备录音…",
     uploading: "正在发送录音…",
     recognizing: "等待识别结果…",
+    submitting: "正在提交识别任务…",
+    cleaning: "文字已保存，正在删除云端临时录音…",
     saving: "识别已完成，正在保存文字…",
     done: "转写完成，文字已保存。",
   };
@@ -1377,11 +1380,12 @@ function segmentCard(state, recording) {
   const badge = h("span", `meeting-segment__badge status-${status || "none"}`, statusLabel(status, task.phase));
   badge.title = task.error;
   top.append(title, badge);
+  if (recording.recordingId === state.selectedRecordingId) top.append(h("span", "meeting-segment__current", "当前选中"));
 
   const meta = h(
     "span",
     "meeting-segment__meta",
-    formatDuration(Number(recording.seconds || 0) * 1000, {
+    `${recordingRange(recording)} · ` + formatDuration(Number(recording.seconds || 0) * 1000, {
       alwaysHours: Number(recording.seconds || 0) >= 3600,
     }),
   );
@@ -1391,7 +1395,7 @@ function segmentCard(state, recording) {
   }
   if (recording.gaps?.length && state.plugin.transcription.isConfigured()) {
     const gaps = h("span", "meeting-segment__notice", "部分未转写");
-    gaps.title = `尚未转写：${recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}${recording.channels === 2 ? (gap.channel === 0 ? "（我）" : "（其他参会者）") : ""}`).join("、")}`;
+    gaps.title = `尚未转写：${recording.gaps.map((gap) => `${formatDuration(gap.startMs)}–${formatDuration(gap.endMs)}`).join("、")}`;
     meta.append(gaps);
   }
   if (!recording.assetPath) {
@@ -1400,30 +1404,35 @@ function segmentCard(state, recording) {
   }
 
   const actions = h("div", "meeting-segment__actions");
-  // Only the selected recording offers transcription actions; the row stays a quiet picker.
   actions.hidden = recording.recordingId !== state.selectedRecordingId;
+  const taskPending = state.plugin.transcription.pendingFor?.(state.docId, recording.recordingId);
   const button = h("button", "meeting-link", "");
   const running = task.running;
   const hasText = state.transcript.some((item) => item.recordingId === recording.recordingId);
-  const fillGaps = recording.realtimeEnabled && recording.gaps?.length > 0;
   button.textContent = running ? `${statusLabel("processing", task.phase)}…`
-    : fillGaps ? "补齐缺口" : hasText || status === "done" ? "重新转写" : ["failed", "incomplete"].includes(status) ? "重试转写" : "转写";
-  button.disabled = running || !recording.assetPath;
+    : hasText || status === "done" ? "重新识别整段" : "识别整段";
+  button.disabled = running || !recording.assetPath || Boolean(taskPending && !taskPending.saved && !taskPending.failed);
   button.setAttribute("aria-busy", String(running));
-  button.title = running ? "关闭思源或断网会中断转写，之后需手动重试"
-    : `使用${state.plugin.transcription.service() === "tencent" ? "腾讯云" : "豆包"}转写服务`;
+  button.title = `${recordingTitle(recording.index)}：识别整段后替换该段转写`;
   button.onclick = (event) => {
     event.stopPropagation();
-    void startTranscription(state, recording, { gapsOnly: fillGaps });
+    void startTranscription(state, recording);
   };
-  if (fillGaps && hasText) {
-    const redo = h("button", "meeting-link", "重新转写整段");
-    redo.disabled = running || !recording.assetPath;
-    redo.onclick = (event) => {
-      event.stopPropagation();
-      void startTranscription(state, recording);
-    };
-    actions.append(redo);
+  if (taskPending) {
+    const resume = h("button", "meeting-link", taskPending.saved ? "重试清理云端录音" : taskPending.failed ? "清理失败任务" : "继续原任务");
+    resume.disabled = running;
+    resume.onclick = () => void continueTranscription(state, recording);
+    actions.append(resume);
+    if (taskPending.canDiscard && !taskPending.saved && !taskPending.failed) {
+      const discard = h("button", "meeting-link", "保留现有文字，放弃本次结果");
+      discard.disabled = running;
+      discard.onclick = async () => {
+        if (!await confirmDialog("放弃本次识别结果", "保留现有转写，清理本次任务及云端临时录音。", "放弃结果")) return;
+        try { await state.plugin.transcription.discard(state.meeting, recording); renderRecordings(state); }
+        catch (error) { showMessage(error.message, 6000, "error"); }
+      };
+      actions.append(discard);
+    }
   }
   actions.append(button);
   selectButton.append(top, meta);
@@ -1435,11 +1444,20 @@ function segmentCard(state, recording) {
   return card;
 }
 
-async function startTranscription(state, recording, { gapsOnly = false } = {}) {
+async function continueTranscription(state, recording) {
+  state.transcriptionRequests.delete(recording.recordingId);
+  try {
+    await state.plugin.transcription.start(state.meeting, recording, { resume: true });
+    await refreshRecordings(state);
+    renderTranscriptionFeedback(state);
+  } catch (error) { showMessage(error.message, 6000, "error"); }
+}
+
+async function startTranscription(state, recording) {
   const recordingId = recording.recordingId;
   const task = transcriptionTask(state, recording);
   if (task.running) return;
-  if (!state.plugin.transcription.isConfigured()) {
+  if (!state.plugin.transcription.isFileConfigured()) {
     openSettings(state.plugin);
     return;
   }
@@ -1451,22 +1469,18 @@ async function startTranscription(state, recording, { gapsOnly = false } = {}) {
     const { segments } = await meetingStore.readTranscript(state.meeting);
     const hasText = segments.some((item) => item.recordingId === recording.recordingId);
     const fingerprint = await meetingStore.transcriptFingerprint(state.meeting, recording.recordingId);
-    if (!gapsOnly && (hasText || recording.transcriptionStatus === "done")) {
+    if (hasText || recording.transcriptionStatus === "done") {
       state.transcriptionRequests.set(recordingId, { phase: "confirming" });
       renderTranscriptionFeedback(state);
       const edited = !recording.transcriptionFingerprint || fingerprint !== recording.transcriptionFingerprint;
       const accepted = await confirmDialog("重新转写", edited
-        ? "这段转写已被修改。重新转写会再次计费并替换现有转写，你的修改会丢失。"
-        : "重新转写会再次计费，并替换这段录音的现有转写。", "重新转写");
+        ? "这段转写已被修改。重新识别整段会替换现有转写，你的修改会丢失。"
+        : "重新识别整段会替换这段录音的现有转写。", "重新转写");
       if (!accepted) return;
-    } else if (recording.transcriptionStatus === "incomplete" && !gapsOnly) {
-      state.transcriptionRequests.set(recordingId, { phase: "confirming" });
-      renderTranscriptionFeedback(state);
-      if (!await confirmDialog("重试转写", "上次转写未完成。重新提交可能再次计费，是否继续？", "继续转写")) return;
     }
     if (state.destroyed) return;
     state.transcriptionRequests.delete(recordingId);
-    await state.plugin.transcription.start(state.meeting, recording, { gapsOnly, expectedFingerprint: fingerprint });
+    await state.plugin.transcription.start(state.meeting, recording, { expectedFingerprint: fingerprint });
   } catch (error) {
     state.transcriptionRequests.set(recordingId, { phase: "failed", error: error.message });
   } finally {
@@ -1477,6 +1491,8 @@ async function startTranscription(state, recording, { gapsOnly = false } = {}) {
 
 function playerView(state, recording) {
   const wrapper = h("div", "meeting-player");
+  wrapper.dataset.recordingId = recording.recordingId;
+  wrapper.append(h("div", "meeting-player__title", `当前回听：${recordingTitle(recording.index)} · ${recordingRange(recording)}`));
   if (state.audio.dataset.recordingId !== recording.recordingId) {
     try {
       state.audio.pause();
@@ -1859,7 +1875,7 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
   for (const recording of state.recordings) {
     const task = transcriptionTask(state, recording);
     const active = task.running || task.status === "processing";
-    const failed = ["failed", "incomplete"].includes(task.status) && task.error;
+    const failed = Boolean(task.error);
     if (active) activeTasks.push({ recording, task });
     if (!failed || active) continue;
     const feedback = h("div", "meeting-transcription-feedback");
@@ -1868,10 +1884,9 @@ function renderTranscript(state, section = state.root.querySelector('[data-secti
     feedback.dataset.phase = task.phase;
     feedback.setAttribute("role", "alert");
     feedback.append(h("span", "", `${recordingTitle(recording.index)} · ${transcriptionTaskText(task)}`));
-    const retry = h("button", "meeting-link", "重试转写");
-    retry.onclick = () => void startTranscription(state, recording, {
-      gapsOnly: Boolean(recording.realtimeEnabled && recording.gaps?.length),
-    });
+    const pending = state.plugin.transcription.pendingFor?.(state.docId, recording.recordingId);
+    const retry = h("button", "meeting-link", pending ? pending.saved ? "重试清理" : "继续原任务" : "重新识别整段");
+    retry.onclick = () => pending ? void continueTranscription(state, recording) : void startTranscription(state, recording);
     feedback.append(retry);
     section.append(feedback);
   }
@@ -2647,34 +2662,41 @@ function openSettings(plugin) {
           <label class="meeting-settings__row"><span>API Key</span>
             <input class="b3-text-field" type="password" name="apiKey" placeholder="${hasApiKey ? "已保存，留空不修改" : "填写 API Key"}" autocomplete="off">
           </label>
-          <p class="meeting-settings__hint">需在火山引擎控制台开通豆包流式语音识别 2.0（按小时计费）和录音文件识别极速版。</p>
+          <p class="meeting-settings__hint">需开通豆包流式语音识别 2.0 和录音文件识别标准版 2.0。</p>
         </div>
         <div class="meeting-settings__group" data-service="tencent"${service === "tencent" ? "" : " hidden"}>
-          <label class="meeting-settings__row"><span>AppId</span>
-            <input class="b3-text-field" name="appId" value="${escapeHtml(prefs.tencentAppId || "")}" autocomplete="off">
-          </label>
-          <label class="meeting-settings__row"><span>SecretId</span>
-            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
-          </label>
-          <label class="meeting-settings__row"><span>SecretKey</span>
-            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
-          </label>
           <label class="meeting-settings__row"><span>实时识别引擎</span>
             <select class="b3-select" name="realtimeEngine">
               <option value="large"${prefs.realtimeEngine !== "general" ? " selected" : ""}>大模型（更准确）</option>
               <option value="general"${prefs.realtimeEngine === "general" ? " selected" : ""}>通用</option>
             </select>
           </label>
-          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写分不出线下会议的说话人，需要时可在会后重新转写。</p>
+          <p class="meeting-settings__hint">大模型在腾讯云单独计费、没有免费额度，需要先开通。腾讯云实时转写不区分说话人，会后使用录音文件大模型 2.0 识别。密钥需具备 ASR 和 GetUserAppId 权限，账号信息自动获取，无需填写 AppId。</p>
         </div>
         <label class="meeting-settings__row"><span>实时转写</span>
           <input type="checkbox" name="realtime"${prefs.realtimeTranscription !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议两路声音分别计费。</p>
-        <label class="meeting-settings__row"><span>结束后自动转写</span>
-          <input type="checkbox" name="autoTranscribe"${prefs.autoTranscribe ? " checked" : ""}>
+        <p class="meeting-settings__hint">从下一段录音开始生效。线上会议混合为单声道识别，原录音保留双声道。</p>
+        <label class="meeting-settings__row"><span>结束后自动补齐缺口</span>
+          <input type="checkbox" name="autoFillGaps"${prefs.autoFillGaps !== false ? " checked" : ""}>
         </label>
-        <p class="meeting-settings__hint">开启实时转写时只补齐缺口；关闭实时转写时，结束后转写整段。</p>
+        <p class="meeting-settings__hint">只补齐实时转写缺口；关闭实时转写时，由你手动识别整段。</p>
+      </section>
+      <section>
+        <h3>腾讯云与 COS 临时录音</h3>
+        <p class="meeting-settings__hint">COS 与腾讯语音共用以下密钥，只需填写一次。两家会后识别均使用私有 COS，密钥需具备指定桶临时目录的上传、下载和删除权限。</p>
+          <label class="meeting-settings__row"><span>SecretId</span>
+            <input class="b3-text-field" type="password" name="secretId" placeholder="${hasSecretId ? "已保存，留空不修改" : "填写 SecretId"}" autocomplete="off">
+          </label>
+          <label class="meeting-settings__row"><span>SecretKey</span>
+            <input class="b3-text-field" type="password" name="secretKey" placeholder="${hasSecretKey ? "已保存，留空不修改" : "填写 SecretKey"}" autocomplete="off">
+          </label>
+        <label class="meeting-settings__row"><span>COS 存储桶地址</span>
+          <input class="b3-text-field" name="cosEndpoint" value="${escapeHtml(prefs.cosEndpoint || "")}" placeholder="https://meeting-1250000000.cos.ap-shanghai.myqcloud.com">
+        </label>
+        <p class="meeting-settings__hint">从 COS 控制台复制存储桶默认域名，桶名和地域自动识别。请使用私有桶。</p>
+        <p class="meeting-settings__hint">录音通过限时链接供识别服务读取，文字成功保存后删除 COS 临时录音，思源原录音保留。中断任务保留至继续处理；清理失败可重试。</p>
+        <p class="meeting-settings__hint">计费：实时识别、会后识别分别按服务商规则收费；自动补齐只提交缺口，手动识别提交整段，会再次产生识别费用。COS 存储、请求及下载流量另计。继续查询原任务或重试清理不会新建识别任务。</p>
       </section>
       <section>
         <h3>AI 纪要</h3>
@@ -2714,6 +2736,7 @@ function openSettings(plugin) {
     const save = element.querySelector('[data-action="save"]');
     save.disabled = true;
     try {
+      if (value("cosEndpoint").trim()) parseCosEndpoint(value("cosEndpoint"));
       const secretId = value("secretId").trim();
       const secretKey = value("secretKey").trim();
       await api.writeSecrets([
@@ -2726,10 +2749,10 @@ function openSettings(plugin) {
         mode: value("mode"),
         opacity: Number(value("opacity")) / 100,
         transcriptionService: value("service") === "tencent" ? "tencent" : "doubao",
-        tencentAppId: value("appId").trim(),
+        cosEndpoint: value("cosEndpoint").trim(),
         realtimeTranscription: element.querySelector('[name="realtime"]').checked,
         realtimeEngine: value("realtimeEngine") === "general" ? "general" : "large",
-        autoTranscribe: element.querySelector('[name="autoTranscribe"]').checked,
+        autoFillGaps: element.querySelector('[name="autoFillGaps"]').checked,
       });
       showMessage("设置已保存", 3000);
       dialog.destroy();
