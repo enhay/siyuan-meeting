@@ -4743,13 +4743,12 @@ function createTemplatePicker({ store, selectedId, disabled = false, onSelect, o
   return wrapper;
 }
 
-function openTemplateManager({ store, selectedId = "general", onUse, confirm }) {
+function createTemplateManager({ store, selectedId = "general", onUse, onClose, confirm }) {
   let currentId = store.get(selectedId)?.id || "general";
   let original = null;
   let busy = false;
-  const dialog = new Dialog({
-    title: "纪要模板", width: "720px", hideCloseIcon: true,
-    content: `<div class="b3-dialog__content meeting-template-manager">
+  const element = node("div", "meeting-template-manager");
+  element.innerHTML = `
       <div class="meeting-template-manager__toolbar">
         <select class="b3-select" aria-label="管理的模板" data-field="templates"></select>
         <button type="button" class="meeting-link" data-action="new">新建</button>
@@ -4763,9 +4762,7 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
       <p class="meeting-inline-notice" data-field="notice"></p>
       <p class="meeting-template-manager__error" role="alert" data-field="error"></p>
       <div class="meeting-confirm__actions"><button type="button" class="b3-button b3-button--cancel" data-action="close">关闭</button><button type="button" class="b3-button" data-action="save"></button></div>
-    </div>`,
-  });
-  const element = dialog.element;
+    `;
   const field = (name) => element.querySelector(`[data-field="${name}"]`);
   const action = (name) => element.querySelector(`[data-action="${name}"]`);
   const input = (name) => element.querySelector(`[name="${name}"]`);
@@ -4825,8 +4822,9 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
     render({ ...copy, name: `${copy.name || "模板"}（副本）` });
     input("name").focus();
   };
+  action("close").hidden = !onClose;
   action("close").onclick = async () => {
-    if (!busy && await allowDiscard()) dialog.destroy();
+    if (!busy && await allowDiscard()) onClose();
   };
   action("save").onclick = async () => {
     if (busy) return;
@@ -4847,7 +4845,7 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
       }
       if (onUse) {
         await onUse(saved.id);
-        dialog.destroy();
+        onClose();
       } else {
         render(saved);
         field("notice").textContent = "模板已保存。";
@@ -4877,10 +4875,20 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
     }
   };
   render(store.get(currentId));
+  return { element, canClose: async () => !busy && await allowDiscard() };
+}
+
+function openTemplateManager(options) {
+  const dialog = new Dialog({
+    title: "纪要模板", width: "720px", hideCloseIcon: true,
+    content: '<div class="b3-dialog__content"></div>',
+  });
+  const manager = createTemplateManager({ ...options, onClose: () => dialog.destroy() });
+  dialog.element.querySelector(".b3-dialog__content").append(manager.element);
   return dialog;
 }
 
-module.exports = { createTemplatePicker, openTemplateManager };
+module.exports = { createTemplatePicker, createTemplateManager, openTemplateManager };
 
   },
   "src/tencent.js": function (module, exports, require) {
@@ -5435,7 +5443,7 @@ const api = require("./siyuan-api");
 const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
 const prompts = require("./prompts");
-const { createTemplatePicker, openTemplateManager } = require("./template-ui");
+const { createTemplatePicker, createTemplateManager, openTemplateManager } = require("./template-ui");
 const ai = require("./ai");
 const { findTranscriptMatches, playbackSegments } = require("./transcript-view");
 const {
@@ -8142,9 +8150,8 @@ function openSettings(plugin) {
       </section>
       <section ${panel("summary")}>
         <h3>AI 纪要</h3>
-        <p class="meeting-settings__hint">纪要使用思源设置中的 AI 模型；本插件不保存模型密钥。</p>
-        <button class="b3-button b3-button--outline" type="button" data-action="open-ai">打开思源设置</button>
-        <button class="b3-button b3-button--outline" type="button" data-action="templates">管理纪要模板</button>
+        <p class="meeting-settings__hint">纪要使用思源设置中的 AI 模型；本插件不保存模型密钥。<button class="meeting-link" type="button" data-action="open-ai">打开思源设置</button></p>
+        <div data-field="template-manager"></div>
       </section>
       </div>
     </div>
@@ -8152,7 +8159,7 @@ function openSettings(plugin) {
       <button class="b3-button b3-button--cancel">取消</button>
       <button class="b3-button b3-button--text" data-action="save">保存</button>
     </div>`;
-  const dialog = new Dialog({ title: "会议录音设置", width: "800px", content });
+  const dialog = new Dialog({ title: "会议录音设置", width: "800px", hideCloseIcon: true, content });
   const element = dialog.element;
   const tabs = Array.from(element.querySelectorAll("[data-settings-tab]"));
   const selectCategory = (tab) => {
@@ -8164,6 +8171,8 @@ function openSettings(plugin) {
     for (const item of element.querySelectorAll("[data-settings-panel]")) {
       item.hidden = item.dataset.settingsPanel !== tab.dataset.settingsTab;
     }
+    element.querySelector('.meeting-settings__actions [data-action="save"]').hidden = tab.dataset.settingsTab === "summary";
+    element.querySelector(".meeting-settings__actions .b3-button--cancel").textContent = tab.dataset.settingsTab === "summary" ? "关闭" : "取消";
     element.querySelector(".meeting-settings__content").scrollTop = 0;
   };
   for (const tab of tabs) {
@@ -8198,12 +8207,17 @@ function openSettings(plugin) {
       showMessage("请打开思源设置 → AI", 5000);
     }
   };
-  element.querySelector('[data-action="templates"]').onclick = () => openTemplateManager({
+  const templateManager = createTemplateManager({
     store: plugin.summaryTemplates, confirm: confirmDialog,
   });
-  element.querySelector(".b3-button--cancel").onclick = () => dialog.destroy();
-  element.querySelector('[data-action="save"]').onclick = async () => {
-    const save = element.querySelector('[data-action="save"]');
+  element.querySelector('[data-field="template-manager"]').append(templateManager.element);
+  const actions = element.querySelector(".meeting-settings__actions");
+  actions.querySelector(".b3-button--cancel").onclick = async () => {
+    if (await templateManager.canClose()) dialog.destroy();
+  };
+  actions.querySelector('[data-action="save"]').onclick = async () => {
+    if (!await templateManager.canClose()) return;
+    const save = actions.querySelector('[data-action="save"]');
     save.disabled = true;
     try {
       if (value("cosEndpoint").trim()) parseCosEndpoint(value("cosEndpoint"));

@@ -830,6 +830,8 @@
 .meeting-settings__row .b3-slider { flex: 1 1 auto; }
 .meeting-settings__value { width: 38px; text-align: right; font-variant-numeric: tabular-nums; color: var(--b3-theme-on-surface); }
 .meeting-settings__hint { margin: 0; font-size: 12px; line-height: 1.6; color: var(--b3-theme-on-surface); }
+.meeting-settings .meeting-template-manager { max-height: none; overflow: visible; margin-top: 12px; }
+.meeting-settings__hint .meeting-link { margin-left: 4px; padding: 0; font-size: inherit; }
 .meeting-settings__actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* ---- top bar ------------------------------------------------------------ */

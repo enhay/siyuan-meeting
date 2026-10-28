@@ -44,13 +44,12 @@ function createTemplatePicker({ store, selectedId, disabled = false, onSelect, o
   return wrapper;
 }
 
-function openTemplateManager({ store, selectedId = "general", onUse, confirm }) {
+function createTemplateManager({ store, selectedId = "general", onUse, onClose, confirm }) {
   let currentId = store.get(selectedId)?.id || "general";
   let original = null;
   let busy = false;
-  const dialog = new Dialog({
-    title: "纪要模板", width: "720px", hideCloseIcon: true,
-    content: `<div class="b3-dialog__content meeting-template-manager">
+  const element = node("div", "meeting-template-manager");
+  element.innerHTML = `
       <div class="meeting-template-manager__toolbar">
         <select class="b3-select" aria-label="管理的模板" data-field="templates"></select>
         <button type="button" class="meeting-link" data-action="new">新建</button>
@@ -64,9 +63,7 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
       <p class="meeting-inline-notice" data-field="notice"></p>
       <p class="meeting-template-manager__error" role="alert" data-field="error"></p>
       <div class="meeting-confirm__actions"><button type="button" class="b3-button b3-button--cancel" data-action="close">关闭</button><button type="button" class="b3-button" data-action="save"></button></div>
-    </div>`,
-  });
-  const element = dialog.element;
+    `;
   const field = (name) => element.querySelector(`[data-field="${name}"]`);
   const action = (name) => element.querySelector(`[data-action="${name}"]`);
   const input = (name) => element.querySelector(`[name="${name}"]`);
@@ -126,8 +123,9 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
     render({ ...copy, name: `${copy.name || "模板"}（副本）` });
     input("name").focus();
   };
+  action("close").hidden = !onClose;
   action("close").onclick = async () => {
-    if (!busy && await allowDiscard()) dialog.destroy();
+    if (!busy && await allowDiscard()) onClose();
   };
   action("save").onclick = async () => {
     if (busy) return;
@@ -148,7 +146,7 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
       }
       if (onUse) {
         await onUse(saved.id);
-        dialog.destroy();
+        onClose();
       } else {
         render(saved);
         field("notice").textContent = "模板已保存。";
@@ -178,7 +176,17 @@ function openTemplateManager({ store, selectedId = "general", onUse, confirm }) 
     }
   };
   render(store.get(currentId));
+  return { element, canClose: async () => !busy && await allowDiscard() };
+}
+
+function openTemplateManager(options) {
+  const dialog = new Dialog({
+    title: "纪要模板", width: "720px", hideCloseIcon: true,
+    content: '<div class="b3-dialog__content"></div>',
+  });
+  const manager = createTemplateManager({ ...options, onClose: () => dialog.destroy() });
+  dialog.element.querySelector(".b3-dialog__content").append(manager.element);
   return dialog;
 }
 
-module.exports = { createTemplatePicker, openTemplateManager };
+module.exports = { createTemplatePicker, createTemplateManager, openTemplateManager };
