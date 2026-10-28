@@ -25,19 +25,15 @@ body.is-hovered .envelope {
   background: var(--bar-envelope-surface);
 }
 
-/* Two caption lines above the control bar; overflow is clipped at the top so
-   the newest text stays visible. */
+/* Captions share the control bar's surface and keep the newest two lines visible. */
 .captions {
   display: none;
   position: absolute;
-  left: 4px;
-  right: 4px;
-  top: 4px;
+  left: 0;
+  right: 0;
+  top: 21px;
   height: 50px;
   padding: 7px 12px;
-  border-radius: 14px;
-  background: var(--bar-surface);
-  box-shadow: inset 0 0 0 0.5px var(--bar-stroke);
   flex-direction: column;
   justify-content: flex-end;
   overflow: hidden;
@@ -48,13 +44,8 @@ body.has-captions .captions { display: flex; }
 .caption { margin: 0; flex: 0 0 auto; }
 .caption.is-pending { opacity: 0.6; }
 body.has-captions .envelope {
-  top: 79px;
-  left: 50%;
-  right: auto;
-  width: 222px;
-  transform: translateX(-50%);
+  top: 4px;
 }
-body.has-captions.is-hovered .envelope { top: 58px; }
 .caption-toggle[aria-pressed="true"] { background: var(--bar-control-fill); }
 .control[hidden] { display: none; }
 
@@ -69,6 +60,9 @@ body.has-captions.is-hovered .envelope { top: 58px; }
   -webkit-app-region: drag;
 }
 body.is-hovered .hover-handle { display: flex; }
+/* An open caption bar keeps its size; hover only reveals the drag handle. */
+body.has-captions .hover-handle { display: flex; }
+body.has-captions:not(.is-hovered) .handle-dots { visibility: hidden; }
 .handle-dots {
   height: 100%;
   width: calc(100% - 16px);
@@ -239,5 +233,6 @@ body.is-save-failed .message { color: var(--bar-error); }
 
 @keyframes dancing-stick { 0%, 100% { transform: scaleY(0.2); } 50% { transform: scaleY(1); } }
 @media (prefers-reduced-motion: reduce) {
+  .envelope { transition: none; }
   .sticks .stick { animation: none; transform: scaleY(0.75); }
 }
