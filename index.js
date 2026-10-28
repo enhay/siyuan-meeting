@@ -8056,9 +8056,21 @@ function openSettings(plugin) {
   const hasApiKey = Boolean(plugin.getSecret?.("meeting.doubao.apiKey"));
   const hasSecretId = Boolean(plugin.getSecret?.("meeting.tencent.secretId"));
   const hasSecretKey = Boolean(plugin.getSecret?.("meeting.tencent.secretKey"));
+  const categories = [
+    ["recording", "会议与录音"],
+    ["transcription", "语音转写"],
+    ["cloud", "腾讯云与 COS"],
+    ["summary", "AI 纪要"],
+  ];
+  const settingsId = `meeting-settings-${Date.now()}`;
+  const panel = (key) => `role="tabpanel" id="${settingsId}-${key}" aria-labelledby="${settingsId}-tab-${key}" tabindex="0" data-settings-panel="${key}"${key === "recording" ? "" : " hidden"}`;
   const content = `
-    <div class="b3-dialog__content meeting-settings">
-      <section>
+    <div class="meeting-settings">
+      <nav class="meeting-settings__nav" role="tablist" aria-label="设置分类" aria-orientation="vertical">
+        ${categories.map(([key, label], index) => `<button type="button" role="tab" id="${settingsId}-tab-${key}" aria-controls="${settingsId}-${key}" aria-selected="${index === 0}" tabindex="${index === 0 ? 0 : -1}" data-settings-tab="${key}">${label}</button>`).join("")}
+      </nav>
+      <div class="meeting-settings__content">
+      <section ${panel("recording")}>
         <h3>会议与录音</h3>
         <label class="meeting-settings__row"><span>新会议保存到</span>
           <select class="b3-select" name="notebook">${notebooks
@@ -8079,7 +8091,7 @@ function openSettings(plugin) {
           <span class="meeting-settings__value" data-field="opacity-value">${Math.round((prefs.opacity || 0.9) * 100)}%</span>
         </label>
       </section>
-      <section>
+      <section ${panel("transcription")}>
         <h3>转写</h3>
         <p class="meeting-settings__hint">密钥仅保存在本机。转写时会将录音发送给你选择的服务；密钥留空表示不修改。</p>
         <label class="meeting-settings__row"><span>转写服务</span>
@@ -8112,7 +8124,7 @@ function openSettings(plugin) {
         </label>
         <p class="meeting-settings__hint">只补齐实时转写缺口；关闭实时转写时，由你手动识别整段。</p>
       </section>
-      <section>
+      <section ${panel("cloud")}>
         <h3>腾讯云与 COS 临时录音</h3>
         <p class="meeting-settings__hint">COS 与腾讯语音共用以下密钥，只需填写一次。两家会后识别均使用私有 COS，密钥需具备指定桶临时目录的上传、下载和删除权限。</p>
           <label class="meeting-settings__row"><span>SecretId</span>
@@ -8128,19 +8140,47 @@ function openSettings(plugin) {
         <p class="meeting-settings__hint">录音通过限时链接供识别服务读取，文字成功保存后删除 COS 临时录音，思源原录音保留。中断任务保留至继续处理；清理失败可重试。</p>
         <p class="meeting-settings__hint">计费：实时识别、会后识别分别按服务商规则收费；自动补齐只提交缺口，手动识别提交整段，会再次产生识别费用。COS 存储、请求及下载流量另计。继续查询原任务或重试清理不会新建识别任务。</p>
       </section>
-      <section>
+      <section ${panel("summary")}>
         <h3>AI 纪要</h3>
         <p class="meeting-settings__hint">纪要使用思源设置中的 AI 模型；本插件不保存模型密钥。</p>
         <button class="b3-button b3-button--outline" type="button" data-action="open-ai">打开思源设置</button>
         <button class="b3-button b3-button--outline" type="button" data-action="templates">管理纪要模板</button>
       </section>
+      </div>
     </div>
     <div class="b3-dialog__action meeting-settings__actions">
       <button class="b3-button b3-button--cancel">取消</button>
       <button class="b3-button b3-button--text" data-action="save">保存</button>
     </div>`;
-  const dialog = new Dialog({ title: "会议录音设置", width: "600px", content });
+  const dialog = new Dialog({ title: "会议录音设置", width: "800px", content });
   const element = dialog.element;
+  const tabs = Array.from(element.querySelectorAll("[data-settings-tab]"));
+  const selectCategory = (tab) => {
+    for (const item of tabs) {
+      const selected = item === tab;
+      item.setAttribute("aria-selected", String(selected));
+      item.tabIndex = selected ? 0 : -1;
+    }
+    for (const item of element.querySelectorAll("[data-settings-panel]")) {
+      item.hidden = item.dataset.settingsPanel !== tab.dataset.settingsTab;
+    }
+    element.querySelector(".meeting-settings__content").scrollTop = 0;
+  };
+  for (const tab of tabs) {
+    tab.onclick = () => selectCategory(tab);
+    tab.onkeydown = (event) => {
+      const index = tabs.indexOf(tab);
+      let next;
+      if (event.key === "ArrowDown") next = (index + 1) % tabs.length;
+      else if (event.key === "ArrowUp") next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      selectCategory(tabs[next]);
+      tabs[next].focus();
+    };
+  }
   const value = (name) => element.querySelector(`[name="${name}"]`)?.value || "";
   element.querySelector('[data-field="opacity-value"]').textContent = `${value("opacity")}%`;
   element.querySelector('[name="opacity"]').addEventListener("input", (event) => {

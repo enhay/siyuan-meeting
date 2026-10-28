@@ -777,9 +777,50 @@
 .meeting-pick { display: flex; flex-direction: column; gap: 8px; }
 .meeting-pick__intro { margin: 0 0 4px; font-size: 12px; color: var(--b3-theme-on-surface); }
 .meeting-pick__item { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-size: 13px; cursor: pointer; }
-.meeting-settings { display: flex; flex-direction: column; gap: 18px; }
+.meeting-settings {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  height: min(520px, max(0px, calc(100dvh - 180px)));
+  min-height: 0;
+  overflow: hidden;
+}
+.meeting-settings__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 10px;
+  overflow-y: auto;
+  background: var(--b3-theme-surface);
+  border-right: 1px solid var(--b3-border-color);
+}
+.meeting-settings__nav button {
+  flex-shrink: 0;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--b3-theme-on-background);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.meeting-settings__nav button:hover { background: var(--b3-theme-surface-light); }
+.meeting-settings__nav button[aria-selected="true"] { background: var(--b3-theme-primary-lightest); color: var(--b3-theme-primary); font-weight: 600; }
+.meeting-settings__nav button:focus-visible { outline: 2px solid var(--b3-theme-primary); outline-offset: -2px; }
+.meeting-settings__content { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 24px; }
+.meeting-settings [role="tabpanel"][hidden] { display: none; }
+@media (max-width: 600px) {
+  .meeting-settings { grid-template-columns: 116px minmax(0, 1fr); }
+  .meeting-settings__nav { padding: 12px 6px; }
+  .meeting-settings__nav button { padding: 10px 8px; font-size: 12px; }
+  .meeting-settings__content { padding: 16px 12px; }
+  .meeting-settings__row { flex-wrap: wrap; }
+  .meeting-settings__row > .b3-text-field,
+  .meeting-settings__row > .b3-select { flex-basis: 100%; }
+}
 .meeting-settings section { display: flex; flex-direction: column; gap: 9px; }
-.meeting-settings h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+.meeting-settings h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
 .meeting-settings__group { display: flex; flex-direction: column; gap: 9px; }
 .meeting-settings__group[hidden] { display: none; }
 .meeting-settings__row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
