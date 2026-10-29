@@ -1,6 +1,6 @@
 "use strict";
 
-const crypto = require("node:crypto");
+const { randomUUID } = require("./util");
 const api = require("./siyuan-api");
 const { parseHotwords } = require("./hotwords");
 const {
@@ -27,6 +27,9 @@ const ATTR = {
   recordingDuration: "custom-recording-duration",
   recordingSampleRate: "custom-recording-sample-rate",
   recordingChannels: "custom-recording-channels",
+  recordingSource: "custom-recording-source",
+  recordingName: "custom-recording-name",
+  recordingFormat: "custom-recording-format",
   recordingAsset: "custom-recording-asset",
   recordingEvents: "custom-recording-events",
   recordingInterrupted: "custom-recording-interrupted",
@@ -86,7 +89,7 @@ function meetingFrom(row, attrs = {}) {
 }
 
 async function createMeeting({ title, notebookId, mode = "offline" }) {
-  const meetingId = crypto.randomUUID();
+  const meetingId = randomUUID();
   const startedAt = new Date().toISOString();
   const finalTitle = String(title || "").trim() || defaultMeetingTitle(new Date());
   const docId = await api.createDoc({ notebookId, title: finalTitle, markdown: "" });
@@ -263,14 +266,14 @@ async function ensureRecording(meeting, meta) {
     return existing.blockId;
   }
   const transcriptId = await ensureTranscriptDoc(meeting);
-  const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
+  const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + randomUUID().slice(0, 7);
   const attrs = {
     id,
     [ATTR.recordingId]: meta.recordingId,
     [ATTR.recordingIndex]: String(Number(meta.segmentNo || 0) + 1),
-    [ATTR.recordingStarted]: meta.startedAt || new Date().toISOString(),
-    [ATTR.recordingSampleRate]: String(meta.sampleRate || 16000),
-    [ATTR.recordingChannels]: String(meta.channels || 1),
+    [ATTR.recordingStarted]: meta.source === "import" ? "" : meta.startedAt || new Date().toISOString(),
+    [ATTR.recordingSampleRate]: String(meta.sampleRate ?? 16000),
+    [ATTR.recordingChannels]: String(meta.channels ?? 1),
     [ATTR.realtimeEnabled]: meta.realtimeEnabled ? "1" : "0",
     [ATTR.realtimeHotwords]: parseHotwords(meta.hotwords).join(" "),
     [ATTR.recordingDevice]: meta.deviceId || "",
@@ -284,7 +287,7 @@ async function ensureRecording(meeting, meta) {
 
 async function appendRecording(meeting, { assetPath, meta, seconds, events = [] }) {
   if (!isAssetPath(assetPath)) throw new Error("录音尚未保存到思源，已保留本机文件");
-  const recordingId = meta.recordingId || crypto.randomUUID();
+  const recordingId = meta.recordingId || randomUUID();
   const blockId = await ensureRecording(meeting, { ...meta, recordingId });
   const savedAttrs = await api.getBlockAttrs(blockId);
   await api.post("/api/block/updateBlock", {
@@ -295,6 +298,12 @@ async function appendRecording(meeting, { assetPath, meta, seconds, events = [] 
     ...savedAttrs,
     [ATTR.recordingId]: recordingId,
     [ATTR.recordingAsset]: assetPath,
+    ...(meta.source === "import" ? {
+      [ATTR.recordingSource]: "import",
+      [ATTR.recordingName]: meta.originalName,
+      [ATTR.recordingFormat]: meta.format,
+      [ATTR.transcriptionStatus]: "idle",
+    } : {}),
     [ATTR.recordingDuration]: String(Math.max(0, Number(seconds) || 0)),
     [ATTR.recordingEvents]: eventsToAttr(events),
     [ATTR.recordingInterrupted]: meta.interrupted ? "1" : "0",
@@ -319,7 +328,10 @@ async function readRecordings(meeting) {
         startedAt: attrs[ATTR.recordingStarted] || "",
         seconds: Number(attrs[ATTR.recordingDuration] || 0) || 0,
         sampleRate: Number(attrs[ATTR.recordingSampleRate] || 0) || 0,
-        channels: Number(attrs[ATTR.recordingChannels] || 1) || 1,
+        channels: attrs[ATTR.recordingSource] === "import" ? Number(attrs[ATTR.recordingChannels]) || 0 : Number(attrs[ATTR.recordingChannels] || 1) || 1,
+        source: attrs[ATTR.recordingSource] || "",
+        originalName: attrs[ATTR.recordingName] || "",
+        format: attrs[ATTR.recordingFormat] || "",
         assetPath: isAssetPath(attrs[ATTR.recordingAsset]) ? attrs[ATTR.recordingAsset] : "",
         interrupted: attrs[ATTR.recordingInterrupted] === "1",
         events: parseEvents(attrs[ATTR.recordingEvents]),
@@ -447,7 +459,7 @@ async function writeTranscript(meeting, recordingId, segments, { append = false,
   try {
     for (let offset = 0; offset < list.length; offset += 200) {
       const data = list.slice(offset, offset + 200).map((segment) => {
-        const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
+        const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + randomUUID().slice(0, 7);
         addedIds.push(id);
         const attrs = {
           id,

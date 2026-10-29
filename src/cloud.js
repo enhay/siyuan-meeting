@@ -97,7 +97,7 @@ function cosHost({ bucket, region }) {
 }
 
 function cosSignature(config, method, key, headers = {}, seconds = 3600, now = Math.floor(Date.now() / 1000)) {
-  if (!/^siyuan-meeting\/[a-f0-9-]+\/\d+\.wav$/.test(key)) throw failure("云端录音路径无效，已停止操作");
+  if (!/^siyuan-meeting\/[a-f0-9-]+\/\d+\.(?:wav|mp3|m4a)$/.test(key)) throw failure("云端录音路径无效，已停止操作");
   if (!/^[A-Za-z0-9_-]+$/.test(config.secretId || "") || !config.secretKey) throw failure("请先配置 COS 密钥");
   const time = `${now - 60};${now + seconds}`;
   const signed = { host: cosHost(config), ...headers };
@@ -110,7 +110,8 @@ function cosSignature(config, method, key, headers = {}, seconds = 3600, now = M
 }
 
 async function upload(config, key, file, signal) {
-  const headers = { "content-type": "audio/wav", "content-length": fs.statSync(file).size, "x-cos-acl": "private" };
+  const mime = { wav: "audio/wav", mp3: "audio/mpeg", m4a: "audio/mp4" }[key.split(".").pop()];
+  const headers = { "content-type": mime, "content-length": fs.statSync(file).size, "x-cos-acl": "private" };
   const response = await request({ hostname: cosHost(config), path: `/${key}`, method: "PUT",
     headers: { ...headers, Authorization: cosSignature(config, "PUT", key, headers) }, file, signal });
   if (response.status !== 200) throw failure("录音上传 COS 失败，请检查桶、地域及写入权限", { httpStatus: response.status });

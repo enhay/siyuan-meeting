@@ -93,9 +93,9 @@ async function fileRequest(config, action, requestId, body, signal) {
   return { status, body: response.text ? cloud.json(response) : {} };
 }
 
-async function submit(config, url, requestId, signal, hotwords = []) {
+async function submit(config, url, requestId, signal, hotwords = [], audio = { format: "wav", rate: 16000, bits: 16, channel: 1 }) {
   const result = await fileRequest(config, "submit", requestId, {
-    user: { uid: "siyuan-meeting" }, audio: { url, format: "wav", rate: 16000, bits: 16, channel: 1 },
+    user: { uid: "siyuan-meeting" }, audio: { url, ...audio },
     request: { model_name: "bigmodel", enable_itn: true, enable_punc: true,
       enable_speaker_info: true, show_utterances: true, ssd_version: "300", ...doubaoCorpus(hotwords) },
   }, signal);

@@ -1,6 +1,8 @@
 "use strict";
 
-const crypto = require("node:crypto");
+function randomUUID() {
+  return globalThis.crypto.randomUUID();
+}
 
 const pad = (value, length = 2) => String(value).padStart(length, "0");
 
@@ -83,7 +85,7 @@ function parseIal(ial) {
 }
 
 function sha256(value) {
-  return crypto.createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
+  return require("node:crypto").createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
 }
 
 function clamp(value, min, max) {
@@ -109,7 +111,7 @@ function safeJson(value, fallback = null) {
 }
 
 function shortId() {
-  return crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  return randomUUID().replaceAll("-", "").slice(0, 12);
 }
 
 function sqlString(value) {
@@ -132,7 +134,7 @@ function isAssetPath(value) {
   const text = String(value || "");
   if (!text || text.includes("..") || text.includes("\\")) return false;
   if (/%2e|%2f|%5c/i.test(text)) return false;
-  return /^assets\/[^"'<>\u0000]+\.wav(?:\?box=[A-Za-z0-9-]+)?$/i.test(text);
+  return /^assets\/[^"'<>\u0000]+\.(?:wav|mp3|m4a)(?:\?box=[A-Za-z0-9-]+)?$/i.test(text);
 }
 
 /** A single source of truth for the labels shown by every recording surface. */
@@ -162,6 +164,7 @@ function barPhaseLabel(phase) {
 }
 
 module.exports = {
+  randomUUID,
   pad,
   formatDuration,
   formatSeconds,

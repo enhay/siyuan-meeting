@@ -1,11 +1,11 @@
 "use strict";
 
-const { Plugin, Menu, showMessage, openTab, getAllEditor } = require("siyuan");
+const { Plugin, Menu, showMessage, openTab, getAllEditor, getFrontend } = require("siyuan");
 const { ICONS } = require("./icons");
-const { MeetingController } = require("./controller");
-const { TranscriptionManager } = require("./transcription");
-const { SummaryTemplateStore } = require("./summary-templates");
-const ui = require("./ui");
+let MeetingController;
+let TranscriptionManager;
+let SummaryTemplateStore;
+let ui;
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const { formatDuration, formatDate, isBlockId } = require("./util");
@@ -16,6 +16,15 @@ const TAB_ALL = "meetings";
 module.exports = class MeetingPlugin extends Plugin {
   async onload() {
     this.addIcons(ICONS);
+    this.mobile = getFrontend() === "mobile";
+    if (this.mobile) {
+      this.mobileView = require("./mobile").installMobile(this);
+      return;
+    }
+    ({ MeetingController } = require("./controller"));
+    ({ TranscriptionManager } = require("./transcription"));
+    ({ SummaryTemplateStore } = require("./summary-templates"));
+    ui = require("./ui");
     this.controller = new MeetingController(this);
     this.transcription = new TranscriptionManager(this);
     await this.controller.init();
@@ -183,6 +192,7 @@ module.exports = class MeetingPlugin extends Plugin {
   }
 
   onLayoutReady() {
+    if (this.mobile) return;
     for (const editor of getAllEditor()) {
       void this.updateNativeMeetingEntry(editor.protyle);
     }
@@ -384,6 +394,7 @@ module.exports = class MeetingPlugin extends Plugin {
   }
 
   async onunload() {
+    this.mobileView?.destroy();
     this.nativeMeetingEntryActive = false;
     if (this.onNativeMeetingEditor) {
       this.eventBus.off("loaded-protyle-static", this.onNativeMeetingEditor);

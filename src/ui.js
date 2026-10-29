@@ -2,6 +2,7 @@
 
 const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
+const { openImport } = require("./audio-import");
 const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
 const { parseHotwords, effectiveHotwords, validateHotwords } = require("./hotwords");
@@ -74,6 +75,7 @@ function recordingTitle(index) {
 }
 
 function recordingRange(recording) {
+  if (recording.source === "import") return recording.originalName || "导入录音";
   const start = recording.startedAt ? new Date(recording.startedAt) : new Date();
   let end = new Date(start.getTime() + Number(recording.seconds || 0) * 1000);
   const events = Array.isArray(recording.events) ? recording.events : [];
@@ -337,6 +339,7 @@ function mountMeetingTab(plugin, tab) {
       </div>
       <div class="meeting-header__spacer"></div>
       <div class="meeting-header__actions">
+        <button class="meeting-btn meeting-btn--outline" data-action="import-audio">添加已有录音</button>
         <button class="meeting-btn meeting-btn--outline meeting-open-doc" data-action="open-doc">在思源文档中打开</button>
         <button class="meeting-icon-btn" data-action="more" aria-label="更多操作" title="更多">${icon("iconMeetingMore")}</button>
       </div>
@@ -630,6 +633,11 @@ function mountMeetingTab(plugin, tab) {
   });
   action("refresh-devices").addEventListener("click", () => void loadDevices(state, field));
 
+  action("import-audio").addEventListener("click", () => {
+    if (!state.meeting?.isMeeting) return;
+    const dialog = openImport(state.meeting, () => refreshAll(state));
+    onCleanup(() => dialog.destroy());
+  });
   action("start").addEventListener("click", () => void startFromMeeting(state));
   action("pause").addEventListener("click", () => void togglePause(state));
   action("stop").addEventListener("click", () => void stopMeeting(state));

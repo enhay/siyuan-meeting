@@ -265,3 +265,54 @@ test("realtime AppId is discovered once per credential and refreshed after chang
   assert.equal((await manager.realtimeConfig()).appId, "67890");
   assert.deepEqual(seen, ["first-secret", "second-secret"]);
 });
+
+// Later WAV preparation changes must not relabel or decode imported Apple audio.
+test("imported M4A submits its original bytes and format, then resumes the saved task without resubmitting", async (t) => {
+  const api = require("../src/siyuan-api");
+  const cloud = require("../src/cloud");
+  const doubao = require("../src/doubao");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-m4a-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const original = Buffer.from("synthetic-original-audio-bytes");
+  const source = path.join(root, "语音备忘录.m4a");
+  fs.writeFileSync(source, original);
+  const plugin = { controller: { storageRoot: root, getPrefs: () => ({}), recordTranscriptionFailure() {} } };
+  const manager = new TranscriptionManager(plugin);
+  const meeting = { id: "20261029100000-abcdefg" };
+  const recording = { recordingId: "recording", assetPath: "assets/语音备忘录.m4a", source: "import", format: "m4a", seconds: 30 };
+  t.mock.method(manager, "isFileConfigured", () => true);
+  t.mock.method(manager, "cosConfig", () => ({ bucket: "test-123", region: "ap-shanghai" }));
+  t.mock.method(manager, "config", () => ({ apiKey: "synthetic-api-key", secretId: "AKIDSYNTHETIC", secretKey: "synthetic-key" }));
+  t.mock.method(api, "resolveAssetPath", async () => source);
+  t.mock.method(store, "getMeeting", async () => meeting);
+  t.mock.method(store, "transcriptFingerprint", async () => "same");
+  t.mock.method(store, "updateRecordingTranscription", async () => {});
+  let saved;
+  t.mock.method(store, "writeTranscript", async (_meeting, _recording, rows) => { saved = rows; });
+  let uploaded;
+  t.mock.method(cloud, "upload", async (_config, key, file) => { uploaded = { key, bytes: fs.readFileSync(file) }; });
+  t.mock.method(cloud, "remove", async () => {});
+  const submissions = [];
+  t.mock.method(cloud, "request", async (request) => {
+    submissions.push(JSON.parse(request.body));
+    return { status: 200, headers: { "x-api-status-code": "20000000" }, text: JSON.stringify({ task_id: "apple-task" }) };
+  });
+  let disconnected = true;
+  t.mock.method(doubao, "query", async () => {
+    if (disconnected) throw new Error("connection interrupted");
+    return [{ startMs: 0, endMs: 1000, channel: 0, speaker: 0, text: "测试", speakerLabel: "说话人 1" }];
+  });
+  await manager.start(meeting, recording);
+  const job = manager.readJob(meeting.id, recording.recordingId);
+  assert.equal(job.parts[0].taskId, "apple-task");
+  assert.equal(job.parts[0].format, "m4a");
+  assert.deepEqual(uploaded.bytes, original);
+  assert.deepEqual(submissions.map(({ audio: { url, ...format } }) => format), [{ format: "m4a" }]);
+  assert.equal(new URL(submissions[0].audio.url).pathname, `/${uploaded.key}`);
+  disconnected = false;
+  await manager.start(meeting, recording, { resume: true });
+  assert.deepEqual(saved.map(({ text, startMs, endMs }) => ({ text, startMs, endMs })), [{ text: "测试", startMs: 0, endMs: 1000 }]);
+  assert.equal(submissions.length, 1);
+  assert.equal(manager.readJob(meeting.id, recording.recordingId), null);
+  assert.deepEqual(fs.readFileSync(source), original);
+});

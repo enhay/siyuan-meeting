@@ -104,7 +104,8 @@ class TranscriptionManager {
       const job = JSON.parse(fs.readFileSync(file, "utf8"));
       if (job.meetingId !== meetingId || job.recordingId !== recordingId ||
           !Object.hasOwn(CLIENTS, job.service) || !/^[a-f0-9-]{36}$/.test(job.id) || !Array.isArray(job.parts) ||
-          job.parts.some((part, index) => part.key !== `siyuan-meeting/${job.id}/${index}.wav`)) throw new Error("invalid job");
+          job.parts.some((part, index) => !["wav", "mp3", "m4a"].includes(part.format || "wav") ||
+            part.key !== `siyuan-meeting/${job.id}/${index}.${part.format || "wav"}`)) throw new Error("invalid job");
       return job;
     } catch (error) {
       if (error.code === "ENOENT") return null;
@@ -224,11 +225,31 @@ class TranscriptionManager {
           gapsOnly, phase: "preparing", parts: [] };
         this.saveJob(job);
         const dir = this.jobDirectory(meeting.id, recording.recordingId);
-        for (const [index, range] of ranges.entries()) {
-          for await (const part of wavParts(absolute, { ...range, signal, directory: dir, prefix: `range-${index}`,
-            maxBytes: job.service === "doubao" ? 512000000 - 1 : 1000000000 })) {
-            job.parts.push({ name: path.basename(part.file), startMs: part.startMs, endMs: part.endMs,
-              key: `siyuan-meeting/${job.id}/${job.parts.length}.wav`, stage: "prepared", requestId: crypto.randomUUID() });
+        if (recording.source === "import") {
+          const format = recording.format;
+          if (!["wav", "mp3", "m4a"].includes(format) ||
+              path.extname(absolute).toLowerCase() !== `.${format}`) throw cloud.failure("导入录音的格式信息无效，请重新导入原文件");
+          if (gapsOnly) throw cloud.failure("导入的录音请使用整段转写");
+          const maxBytes = job.service === "doubao" ? 512000000 - 1 : 1000000000;
+          const stat = await fs.promises.stat(absolute);
+          if (!stat.isFile() || !stat.size || !Number.isFinite(recording.seconds) || recording.seconds <= 0) {
+            throw cloud.failure("导入录音不完整，请检查附件后重新导入");
+          }
+          if (stat.size > maxBytes || recording.seconds >= 5 * 3600) {
+            throw cloud.failure("这份导入录音超过所选服务的文件大小或 5 小时时长限制，请分割后导入；原附件已保留");
+          }
+          const name = `original.${format}`;
+          await fs.promises.copyFile(absolute, path.join(dir, name));
+          signal.throwIfAborted();
+          job.parts.push({ name, format, original: true, startMs: 0, endMs: recording.seconds * 1000,
+            key: `siyuan-meeting/${job.id}/0.${format}`, stage: "prepared", requestId: crypto.randomUUID() });
+        } else {
+          for (const [index, range] of ranges.entries()) {
+            for await (const part of wavParts(absolute, { ...range, signal, directory: dir, prefix: `range-${index}`,
+              maxBytes: job.service === "doubao" ? 512000000 - 1 : 1000000000 })) {
+              job.parts.push({ name: path.basename(part.file), startMs: part.startMs, endMs: part.endMs,
+                key: `siyuan-meeting/${job.id}/${job.parts.length}.wav`, stage: "prepared", requestId: crypto.randomUUID() });
+            }
           }
         }
         job.phase = "ready";
@@ -263,7 +284,8 @@ class TranscriptionManager {
         if (!part.taskId) {
           if (queryOnly) throw cloud.failure("上次任务尚未全部提交，点击「继续原任务」完成剩余部分");
           publish("uploading");
-          if (!/^range-\d+-\d+\.wav$/.test(part.name)) throw cloud.failure("本机录音临时文件名无效");
+          if (!(part.original ? part.name === `original.${part.format}` && ["wav", "mp3", "m4a"].includes(part.format)
+            : /^range-\d+-\d+\.wav$/.test(part.name))) throw cloud.failure("本机录音临时文件名无效");
           part.stage = "uploading";
           this.saveJob(job);
           await cloud.upload(cos, part.key, path.join(this.jobDirectory(meeting.id, recording.recordingId), part.name), signal);
@@ -272,7 +294,7 @@ class TranscriptionManager {
           this.saveJob(job);
           publish("submitting");
           try {
-            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords);
+            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords, part.original ? { format: part.format } : undefined);
           } catch (error) {
             if (error.rejected) { part.stage = "rejected"; job.failed = true; this.saveJob(job); }
             throw error;

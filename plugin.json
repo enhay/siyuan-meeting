@@ -4,8 +4,8 @@
   "url": "",
   "version": "0.1.0",
   "minAppVersion": "3.8.7",
-  "backends": ["windows", "darwin"],
-  "frontends": ["desktop"],
+  "backends": ["windows", "darwin", "android", "ios"],
+  "frontends": ["desktop", "mobile"],
   "displayName": {"default": "会议录音"},
   "description": {"default": "在思源中录制会议、回听、转写并生成纪要。"},
   "readme": {"default": "docs/reports/使用说明.md"}

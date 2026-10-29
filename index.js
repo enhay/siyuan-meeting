@@ -1128,6 +1128,153 @@ module.exports = {
 };
 
   },
+  "src/audio-import.js": function (module, exports, require) {
+"use strict";
+
+const { Dialog, showMessage } = require("siyuan");
+const api = require("./siyuan-api");
+const store = require("./meeting-store");
+const { randomUUID, isAssetPath, formatSeconds } = require("./util");
+
+function audioFormat(name) {
+  const format = String(name).split(".").pop().toLowerCase();
+  if (!["m4a", "mp3", "wav"].includes(format)) throw new Error("请选择 M4A、MP3 或 WAV 录音文件");
+  return format;
+}
+
+// Read container metadata without decoding hours of Apple Voice Memos into RAM.
+async function m4aDuration(file) {
+  async function scan(start, end, inMoov = false) {
+    for (let offset = start; offset + 8 <= end;) {
+      const bytes = new Uint8Array(await file.slice(offset, Math.min(offset + 40, end)).arrayBuffer());
+      const view = new DataView(bytes.buffer);
+      const type = String.fromCharCode(...bytes.slice(4, 8));
+      let size = view.getUint32(0), header = 8;
+      if (size === 1) {
+        if (bytes.length < 16) throw new Error("M4A 文件不完整");
+        size = Number(view.getBigUint64(8));
+        header = 16;
+      } else if (size === 0) size = end - offset;
+      if (!Number.isSafeInteger(size) || size < header || offset + size > end) throw new Error("M4A 文件不完整");
+      if (type === "moov" && !inMoov) return scan(offset + header, offset + size, true);
+      if (type === "mvhd" && inMoov) {
+        const data = new DataView(await file.slice(offset + header, offset + Math.min(size, header + 32)).arrayBuffer());
+        if (!data.byteLength) throw new Error("M4A 时长信息无效");
+        const version = data.getUint8(0);
+        if (![0, 1].includes(version) || data.byteLength < (version ? 32 : 20)) throw new Error("M4A 时长信息无效");
+        const scale = data.getUint32(version ? 20 : 12);
+        const duration = version ? Number(data.getBigUint64(24)) : data.getUint32(16);
+        const seconds = duration / scale;
+        if (Number.isFinite(seconds) && seconds > 0) return seconds;
+        throw new Error("M4A 时长信息无效");
+      }
+      offset += size;
+    }
+    throw new Error("无法读取 M4A 时长，请从语音备忘录重新导出录音");
+  }
+  return scan(0, file.size);
+}
+
+async function inspectAudio(file) {
+  const format = audioFormat(file.name);
+  if (!file.size) throw new Error("这份录音是空文件");
+  const head = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const text = (start, end) => String.fromCharCode(...head.slice(start, end));
+  const valid = format === "m4a" ? text(4, 8) === "ftyp"
+    : format === "wav" ? text(0, 4) === "RIFF" && text(8, 12) === "WAVE"
+      : text(0, 3) === "ID3" || (head[0] === 255 && (head[1] & 224) === 224);
+  if (!valid) throw new Error("录音内容与扩展名不一致，请选择原始音频文件");
+  if (format === "m4a") return { format, seconds: await m4aDuration(file) };
+  const url = URL.createObjectURL(file);
+  const audio = document.createElement("audio");
+  try {
+    const seconds = await new Promise((resolve, reject) => {
+      audio.preload = "metadata";
+      audio.onloadedmetadata = () => Number.isFinite(audio.duration) && audio.duration > 0
+        ? resolve(audio.duration) : reject(new Error("无法读取录音时长，请检查文件是否完整"));
+      audio.onerror = () => reject(new Error("当前设备无法读取这份录音，请检查音频编码或在电脑上导入"));
+      audio.src = url;
+    });
+    return { format, seconds };
+  } finally {
+    audio.onloadedmetadata = audio.onerror = null;
+    audio.removeAttribute("src");
+    audio.load();
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function importRecording(meeting, ticket) {
+  const current = await store.getMeeting(meeting.id);
+  if (!current.isMeeting) throw new Error("请选择会议文档");
+  if (["recording", "paused"].includes(current.status)) throw new Error("请结束这场会议的录音后再导入文件");
+  if (!ticket.info) ticket.info = await inspectAudio(ticket.file);
+  if (!ticket.recordingId) ticket.recordingId = randomUUID();
+  if (!ticket.assetPath) {
+    const form = new FormData();
+    form.append("assetsDirPath", "assets/");
+    form.append("files[]", ticket.file, ticket.file.name);
+    const data = await api.post("/api/asset/upload", form);
+    const asset = data?.succMap?.[ticket.file.name] || Object.values(data?.succMap || {})[0];
+    if (!isAssetPath(asset)) throw new Error("录音上传未完成，请重试；原文件仍保留在设备上");
+    ticket.assetPath = asset;
+  }
+  const { recordings } = await store.readRecordings(current);
+  const existing = recordings.find((item) => item.recordingId === ticket.recordingId);
+  const result = await store.appendRecording(current, {
+    assetPath: ticket.assetPath, seconds: ticket.info.seconds,
+    meta: { recordingId: ticket.recordingId, segmentNo: existing ? existing.index - 1 : recordings.length,
+      source: "import", originalName: ticket.file.name, format: ticket.info.format,
+      sampleRate: 0, channels: 0 },
+  });
+  await store.setSegmentCount(current.id, Math.max(recordings.length, result.index));
+  if (!current.firstRecordedAt) await store.markFirstRecorded(current.id);
+  await store.markStatus(current.id, "done");
+  return result;
+}
+
+function openImport(meeting, onImported = () => {}) {
+  const dialog = new Dialog({ title: "添加已有录音", width: "480px", content: `
+    <div class="meeting-import">
+      <p>支持 M4A、MP3、WAV，包括苹果「语音备忘录」导出的 M4A。保留原文件，导入后在电脑端转写。</p>
+      <label>录音文件<input type="file" accept=".m4a,.mp3,.wav,audio/mp4,audio/mpeg,audio/wav"></label>
+      <p role="status" aria-live="polite"></p>
+      <button type="button" class="b3-button" disabled>添加到会议</button>
+    </div>` });
+  const root = dialog.element.querySelector(".meeting-import");
+  const input = root.querySelector("input");
+  const status = root.querySelector('[role="status"]');
+  const button = root.querySelector("button");
+  let ticket, busy = false;
+  input.onchange = () => {
+    ticket = input.files[0] ? { file: input.files[0] } : null;
+    button.disabled = !ticket;
+    status.textContent = "";
+  };
+  button.onclick = async () => {
+    if (!ticket || busy) return;
+    busy = true;
+    button.disabled = input.disabled = true;
+    status.textContent = "正在读取并保存录音，请保持思源在前台…";
+    try {
+      const result = await importRecording(meeting, ticket);
+      dialog.destroy();
+      showMessage(`录音已添加 · ${formatSeconds(result.seconds)}`);
+      try { await onImported(result); }
+      catch { showMessage("录音已保存，请重新打开会议刷新内容", 5000); }
+    } catch (error) {
+      status.textContent = error.message + (ticket.assetPath ? `。附件已保存：${ticket.assetPath}，可点击按钮重试归档。` : "");
+    } finally {
+      busy = false;
+      button.disabled = input.disabled = false;
+    }
+  };
+  return dialog;
+}
+
+module.exports = { audioFormat, m4aDuration, inspectAudio, importRecording, openImport };
+
+  },
   "src/cloud.js": function (module, exports, require) {
 "use strict";
 
@@ -1228,7 +1375,7 @@ function cosHost({ bucket, region }) {
 }
 
 function cosSignature(config, method, key, headers = {}, seconds = 3600, now = Math.floor(Date.now() / 1000)) {
-  if (!/^siyuan-meeting\/[a-f0-9-]+\/\d+\.wav$/.test(key)) throw failure("云端录音路径无效，已停止操作");
+  if (!/^siyuan-meeting\/[a-f0-9-]+\/\d+\.(?:wav|mp3|m4a)$/.test(key)) throw failure("云端录音路径无效，已停止操作");
   if (!/^[A-Za-z0-9_-]+$/.test(config.secretId || "") || !config.secretKey) throw failure("请先配置 COS 密钥");
   const time = `${now - 60};${now + seconds}`;
   const signed = { host: cosHost(config), ...headers };
@@ -1241,7 +1388,8 @@ function cosSignature(config, method, key, headers = {}, seconds = 3600, now = M
 }
 
 async function upload(config, key, file, signal) {
-  const headers = { "content-type": "audio/wav", "content-length": fs.statSync(file).size, "x-cos-acl": "private" };
+  const mime = { wav: "audio/wav", mp3: "audio/mpeg", m4a: "audio/mp4" }[key.split(".").pop()];
+  const headers = { "content-type": mime, "content-length": fs.statSync(file).size, "x-cos-acl": "private" };
   const response = await request({ hostname: cosHost(config), path: `/${key}`, method: "PUT",
     headers: { ...headers, Authorization: cosSignature(config, "PUT", key, headers) }, file, signal });
   if (response.status !== 200) throw failure("录音上传 COS 失败，请检查桶、地域及写入权限", { httpStatus: response.status });
@@ -2807,9 +2955,9 @@ async function fileRequest(config, action, requestId, body, signal) {
   return { status, body: response.text ? cloud.json(response) : {} };
 }
 
-async function submit(config, url, requestId, signal, hotwords = []) {
+async function submit(config, url, requestId, signal, hotwords = [], audio = { format: "wav", rate: 16000, bits: 16, channel: 1 }) {
   const result = await fileRequest(config, "submit", requestId, {
-    user: { uid: "siyuan-meeting" }, audio: { url, format: "wav", rate: 16000, bits: 16, channel: 1 },
+    user: { uid: "siyuan-meeting" }, audio: { url, ...audio },
     request: { model_name: "bigmodel", enable_itn: true, enable_punc: true,
       enable_speaker_info: true, show_utterances: true, ssd_version: "300", ...doubaoCorpus(hotwords) },
   }, signal);
@@ -2947,12 +3095,12 @@ module.exports = { ICONS };
   "src/main.js": function (module, exports, require) {
 "use strict";
 
-const { Plugin, Menu, showMessage, openTab, getAllEditor } = require("siyuan");
+const { Plugin, Menu, showMessage, openTab, getAllEditor, getFrontend } = require("siyuan");
 const { ICONS } = require("./icons");
-const { MeetingController } = require("./controller");
-const { TranscriptionManager } = require("./transcription");
-const { SummaryTemplateStore } = require("./summary-templates");
-const ui = require("./ui");
+let MeetingController;
+let TranscriptionManager;
+let SummaryTemplateStore;
+let ui;
 const meetingStore = require("./meeting-store");
 const api = require("./siyuan-api");
 const { formatDuration, formatDate, isBlockId } = require("./util");
@@ -2963,6 +3111,15 @@ const TAB_ALL = "meetings";
 module.exports = class MeetingPlugin extends Plugin {
   async onload() {
     this.addIcons(ICONS);
+    this.mobile = getFrontend() === "mobile";
+    if (this.mobile) {
+      this.mobileView = require("./mobile").installMobile(this);
+      return;
+    }
+    ({ MeetingController } = require("./controller"));
+    ({ TranscriptionManager } = require("./transcription"));
+    ({ SummaryTemplateStore } = require("./summary-templates"));
+    ui = require("./ui");
     this.controller = new MeetingController(this);
     this.transcription = new TranscriptionManager(this);
     await this.controller.init();
@@ -3130,6 +3287,7 @@ module.exports = class MeetingPlugin extends Plugin {
   }
 
   onLayoutReady() {
+    if (this.mobile) return;
     for (const editor of getAllEditor()) {
       void this.updateNativeMeetingEntry(editor.protyle);
     }
@@ -3331,6 +3489,7 @@ module.exports = class MeetingPlugin extends Plugin {
   }
 
   async onunload() {
+    this.mobileView?.destroy();
     this.nativeMeetingEntryActive = false;
     if (this.onNativeMeetingEditor) {
       this.eventBus.off("loaded-protyle-static", this.onNativeMeetingEditor);
@@ -3357,7 +3516,7 @@ module.exports = class MeetingPlugin extends Plugin {
   "src/meeting-store.js": function (module, exports, require) {
 "use strict";
 
-const crypto = require("node:crypto");
+const { randomUUID } = require("./util");
 const api = require("./siyuan-api");
 const { parseHotwords } = require("./hotwords");
 const {
@@ -3384,6 +3543,9 @@ const ATTR = {
   recordingDuration: "custom-recording-duration",
   recordingSampleRate: "custom-recording-sample-rate",
   recordingChannels: "custom-recording-channels",
+  recordingSource: "custom-recording-source",
+  recordingName: "custom-recording-name",
+  recordingFormat: "custom-recording-format",
   recordingAsset: "custom-recording-asset",
   recordingEvents: "custom-recording-events",
   recordingInterrupted: "custom-recording-interrupted",
@@ -3443,7 +3605,7 @@ function meetingFrom(row, attrs = {}) {
 }
 
 async function createMeeting({ title, notebookId, mode = "offline" }) {
-  const meetingId = crypto.randomUUID();
+  const meetingId = randomUUID();
   const startedAt = new Date().toISOString();
   const finalTitle = String(title || "").trim() || defaultMeetingTitle(new Date());
   const docId = await api.createDoc({ notebookId, title: finalTitle, markdown: "" });
@@ -3620,14 +3782,14 @@ async function ensureRecording(meeting, meta) {
     return existing.blockId;
   }
   const transcriptId = await ensureTranscriptDoc(meeting);
-  const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
+  const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + randomUUID().slice(0, 7);
   const attrs = {
     id,
     [ATTR.recordingId]: meta.recordingId,
     [ATTR.recordingIndex]: String(Number(meta.segmentNo || 0) + 1),
-    [ATTR.recordingStarted]: meta.startedAt || new Date().toISOString(),
-    [ATTR.recordingSampleRate]: String(meta.sampleRate || 16000),
-    [ATTR.recordingChannels]: String(meta.channels || 1),
+    [ATTR.recordingStarted]: meta.source === "import" ? "" : meta.startedAt || new Date().toISOString(),
+    [ATTR.recordingSampleRate]: String(meta.sampleRate ?? 16000),
+    [ATTR.recordingChannels]: String(meta.channels ?? 1),
     [ATTR.realtimeEnabled]: meta.realtimeEnabled ? "1" : "0",
     [ATTR.realtimeHotwords]: parseHotwords(meta.hotwords).join(" "),
     [ATTR.recordingDevice]: meta.deviceId || "",
@@ -3641,7 +3803,7 @@ async function ensureRecording(meeting, meta) {
 
 async function appendRecording(meeting, { assetPath, meta, seconds, events = [] }) {
   if (!isAssetPath(assetPath)) throw new Error("录音尚未保存到思源，已保留本机文件");
-  const recordingId = meta.recordingId || crypto.randomUUID();
+  const recordingId = meta.recordingId || randomUUID();
   const blockId = await ensureRecording(meeting, { ...meta, recordingId });
   const savedAttrs = await api.getBlockAttrs(blockId);
   await api.post("/api/block/updateBlock", {
@@ -3652,6 +3814,12 @@ async function appendRecording(meeting, { assetPath, meta, seconds, events = [] 
     ...savedAttrs,
     [ATTR.recordingId]: recordingId,
     [ATTR.recordingAsset]: assetPath,
+    ...(meta.source === "import" ? {
+      [ATTR.recordingSource]: "import",
+      [ATTR.recordingName]: meta.originalName,
+      [ATTR.recordingFormat]: meta.format,
+      [ATTR.transcriptionStatus]: "idle",
+    } : {}),
     [ATTR.recordingDuration]: String(Math.max(0, Number(seconds) || 0)),
     [ATTR.recordingEvents]: eventsToAttr(events),
     [ATTR.recordingInterrupted]: meta.interrupted ? "1" : "0",
@@ -3676,7 +3844,10 @@ async function readRecordings(meeting) {
         startedAt: attrs[ATTR.recordingStarted] || "",
         seconds: Number(attrs[ATTR.recordingDuration] || 0) || 0,
         sampleRate: Number(attrs[ATTR.recordingSampleRate] || 0) || 0,
-        channels: Number(attrs[ATTR.recordingChannels] || 1) || 1,
+        channels: attrs[ATTR.recordingSource] === "import" ? Number(attrs[ATTR.recordingChannels]) || 0 : Number(attrs[ATTR.recordingChannels] || 1) || 1,
+        source: attrs[ATTR.recordingSource] || "",
+        originalName: attrs[ATTR.recordingName] || "",
+        format: attrs[ATTR.recordingFormat] || "",
         assetPath: isAssetPath(attrs[ATTR.recordingAsset]) ? attrs[ATTR.recordingAsset] : "",
         interrupted: attrs[ATTR.recordingInterrupted] === "1",
         events: parseEvents(attrs[ATTR.recordingEvents]),
@@ -3804,7 +3975,7 @@ async function writeTranscript(meeting, recordingId, segments, { append = false,
   try {
     for (let offset = 0; offset < list.length; offset += 200) {
       const data = list.slice(offset, offset + 200).map((segment) => {
-        const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(4).toString("hex").slice(0, 7);
+        const id = new Date().toISOString().replace(/\D/g, "").slice(0, 14) + "-" + randomUUID().slice(0, 7);
         addedIds.push(id);
         const attrs = {
           id,
@@ -4017,6 +4188,141 @@ module.exports = {
   transcriptLine,
   parseEvents,
 };
+
+  },
+  "src/mobile.js": function (module, exports, require) {
+"use strict";
+
+const { Dialog, openMobileFileById, showMessage } = require("siyuan");
+const api = require("./siyuan-api");
+const store = require("./meeting-store");
+const { openImport } = require("./audio-import");
+const { formatSeconds, defaultMeetingTitle, isAssetPath } = require("./util");
+
+function element(tag, text = "") {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  return node;
+}
+
+function installMobile(plugin) {
+  let dialog = null, importDialog = null, generation = 0;
+  const close = () => { dialog?.destroy(); dialog = null; };
+  const report = (error) => showMessage(error.message, 6000, "error");
+  const button = (text, handler) => {
+    const node = element("button", text);
+    node.type = "button";
+    node.className = "b3-button b3-button--outline";
+    node.onclick = () => Promise.resolve().then(handler).catch(report);
+    return node;
+  };
+  const shell = (title) => {
+    close();
+    const token = ++generation;
+    let current;
+    current = new Dialog({ title, width: "640px", content: '<div class="meeting-mobile"></div>',
+      destroyCallback: () => {
+        current?.element.querySelectorAll("audio").forEach((audio) => { audio.pause(); audio.removeAttribute("src"); audio.load(); });
+        if (token === generation) generation++;
+      } });
+    dialog = current;
+    const root = dialog.element.querySelector(".meeting-mobile");
+    return { root, active: () => token === generation };
+  };
+  const openDocument = (id) => {
+    close();
+    openMobileFileById(plugin.app, id);
+  };
+  async function detail(id) {
+    const { root, active } = shell("会议");
+    root.append(element("p", "正在读取会议…"));
+    const meeting = await store.getMeeting(id);
+    const [saved, transcript, summaries] = await Promise.all([
+      store.readRecordings(meeting), store.findChild(id, "transcript"), store.readSummaries(meeting),
+    ]);
+    if (!active()) return;
+    root.replaceChildren(element("h2", meeting.title));
+    const nav = element("nav");
+    nav.setAttribute("aria-label", "会议内容");
+    nav.append(button("笔记", () => openDocument(id)));
+    const transcriptButton = button("转写", () => openDocument(transcript.id));
+    transcriptButton.disabled = !transcript;
+    nav.append(transcriptButton);
+    for (const summary of summaries) nav.append(button(summary.title || "纪要", () => openDocument(summary.id)));
+    root.append(nav);
+    if (!summaries.length) root.append(element("p", "尚无纪要，可在电脑端生成后同步查看。"));
+    const add = button("添加已有录音", () => {
+      importDialog = openImport(meeting, () => active() ? detail(id) : undefined);
+    });
+    add.disabled = ["recording", "paused"].includes(meeting.status);
+    root.append(add, element("p", "支持苹果语音备忘录 M4A、MP3、WAV。转写与生成纪要请在电脑端操作。"));
+    if (add.disabled) root.append(element("p", "这场会议仍在录音，请结束后再添加文件。"));
+    if (!saved.recordings.length) root.append(element("p", "还没有录音。"));
+    for (const recording of saved.recordings) {
+      const section = element("section");
+      section.append(element("h3", recording.originalName || `录音 ${recording.index}`), element("p", formatSeconds(recording.seconds)));
+      if (isAssetPath(recording.assetPath)) {
+        const audio = element("audio");
+        audio.controls = true;
+        audio.preload = "none";
+        audio.src = `/${recording.assetPath}`;
+        audio.setAttribute("aria-label", recording.originalName || `录音 ${recording.index}`);
+        audio.onerror = () => showMessage("录音暂时无法播放，请确认附件已同步；若当前设备不支持其编码，可在原录音设备回听。", 6000, "error");
+        audio.onplay = () => root.querySelectorAll("audio").forEach((other) => { if (other !== audio) other.pause(); });
+        section.append(audio);
+      } else section.append(element("p", "录音尚未归档。"));
+      root.append(section);
+    }
+    root.append(button("刷新会议", () => detail(id)), button("返回会议列表", list));
+  }
+  function create() {
+    const { root } = shell("新建会议");
+    const titleLabel = element("label", "会议名称");
+    const title = element("input");
+    title.value = defaultMeetingTitle();
+    titleLabel.append(title);
+    const notebookLabel = element("label", "保存到笔记本");
+    const notebook = element("select");
+    for (const item of api.notebooks()) {
+      const option = element("option", item.name);
+      option.value = item.id;
+      notebook.append(option);
+    }
+    notebook.value = api.currentNotebookId();
+    notebookLabel.append(notebook);
+    const submit = button("创建会议", async () => {
+      submit.disabled = true;
+      try {
+        const meeting = await store.createMeeting({ title: title.value, notebookId: notebook.value });
+        await detail(meeting.id);
+      } finally { submit.disabled = false; }
+    });
+    root.append(titleLabel, notebookLabel, submit);
+  }
+  async function list() {
+    const { root, active } = shell("会议");
+    const search = element("input");
+    search.type = "search";
+    search.placeholder = "搜索会议";
+    search.setAttribute("aria-label", "搜索会议标题");
+    const content = element("div", "正在读取会议…");
+    root.append(button("新建会议", create), search, content);
+    const meetings = await store.listMeetings(500);
+    if (!active()) return;
+    const render = () => {
+      content.replaceChildren();
+      const visible = meetings.filter((meeting) => meeting.title.toLowerCase().includes(search.value.trim().toLowerCase()));
+      for (const meeting of visible) content.append(button(meeting.title, () => detail(meeting.id)));
+      if (!visible.length) content.append(element("p", meetings.length ? "没有匹配的会议" : "还没有会议，创建后即可添加已有录音。"));
+    };
+    search.oninput = render;
+    render();
+  }
+  plugin.addTopBar({ icon: "iconMeetingMic", title: "会议", position: "right", callback: () => void list().catch(report) });
+  return { destroy() { generation++; close(); importDialog?.destroy(); } };
+}
+
+module.exports = { installMobile };
 
   },
   "src/prompts.js": function (module, exports, require) {
@@ -5226,7 +5532,8 @@ class TranscriptionManager {
       const job = JSON.parse(fs.readFileSync(file, "utf8"));
       if (job.meetingId !== meetingId || job.recordingId !== recordingId ||
           !Object.hasOwn(CLIENTS, job.service) || !/^[a-f0-9-]{36}$/.test(job.id) || !Array.isArray(job.parts) ||
-          job.parts.some((part, index) => part.key !== `siyuan-meeting/${job.id}/${index}.wav`)) throw new Error("invalid job");
+          job.parts.some((part, index) => !["wav", "mp3", "m4a"].includes(part.format || "wav") ||
+            part.key !== `siyuan-meeting/${job.id}/${index}.${part.format || "wav"}`)) throw new Error("invalid job");
       return job;
     } catch (error) {
       if (error.code === "ENOENT") return null;
@@ -5346,11 +5653,31 @@ class TranscriptionManager {
           gapsOnly, phase: "preparing", parts: [] };
         this.saveJob(job);
         const dir = this.jobDirectory(meeting.id, recording.recordingId);
-        for (const [index, range] of ranges.entries()) {
-          for await (const part of wavParts(absolute, { ...range, signal, directory: dir, prefix: `range-${index}`,
-            maxBytes: job.service === "doubao" ? 512000000 - 1 : 1000000000 })) {
-            job.parts.push({ name: path.basename(part.file), startMs: part.startMs, endMs: part.endMs,
-              key: `siyuan-meeting/${job.id}/${job.parts.length}.wav`, stage: "prepared", requestId: crypto.randomUUID() });
+        if (recording.source === "import") {
+          const format = recording.format;
+          if (!["wav", "mp3", "m4a"].includes(format) ||
+              path.extname(absolute).toLowerCase() !== `.${format}`) throw cloud.failure("导入录音的格式信息无效，请重新导入原文件");
+          if (gapsOnly) throw cloud.failure("导入的录音请使用整段转写");
+          const maxBytes = job.service === "doubao" ? 512000000 - 1 : 1000000000;
+          const stat = await fs.promises.stat(absolute);
+          if (!stat.isFile() || !stat.size || !Number.isFinite(recording.seconds) || recording.seconds <= 0) {
+            throw cloud.failure("导入录音不完整，请检查附件后重新导入");
+          }
+          if (stat.size > maxBytes || recording.seconds >= 5 * 3600) {
+            throw cloud.failure("这份导入录音超过所选服务的文件大小或 5 小时时长限制，请分割后导入；原附件已保留");
+          }
+          const name = `original.${format}`;
+          await fs.promises.copyFile(absolute, path.join(dir, name));
+          signal.throwIfAborted();
+          job.parts.push({ name, format, original: true, startMs: 0, endMs: recording.seconds * 1000,
+            key: `siyuan-meeting/${job.id}/0.${format}`, stage: "prepared", requestId: crypto.randomUUID() });
+        } else {
+          for (const [index, range] of ranges.entries()) {
+            for await (const part of wavParts(absolute, { ...range, signal, directory: dir, prefix: `range-${index}`,
+              maxBytes: job.service === "doubao" ? 512000000 - 1 : 1000000000 })) {
+              job.parts.push({ name: path.basename(part.file), startMs: part.startMs, endMs: part.endMs,
+                key: `siyuan-meeting/${job.id}/${job.parts.length}.wav`, stage: "prepared", requestId: crypto.randomUUID() });
+            }
           }
         }
         job.phase = "ready";
@@ -5385,7 +5712,8 @@ class TranscriptionManager {
         if (!part.taskId) {
           if (queryOnly) throw cloud.failure("上次任务尚未全部提交，点击「继续原任务」完成剩余部分");
           publish("uploading");
-          if (!/^range-\d+-\d+\.wav$/.test(part.name)) throw cloud.failure("本机录音临时文件名无效");
+          if (!(part.original ? part.name === `original.${part.format}` && ["wav", "mp3", "m4a"].includes(part.format)
+            : /^range-\d+-\d+\.wav$/.test(part.name))) throw cloud.failure("本机录音临时文件名无效");
           part.stage = "uploading";
           this.saveJob(job);
           await cloud.upload(cos, part.key, path.join(this.jobDirectory(meeting.id, recording.recordingId), part.name), signal);
@@ -5394,7 +5722,7 @@ class TranscriptionManager {
           this.saveJob(job);
           publish("submitting");
           try {
-            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords);
+            part.taskId = await CLIENTS[job.service].submit(config, cloud.downloadUrl(cos, part.key), part.requestId, signal, job.hotwords, part.original ? { format: part.format } : undefined);
           } catch (error) {
             if (error.rejected) { part.stage = "rejected"; job.failed = true; this.saveJob(job); }
             throw error;
@@ -5529,6 +5857,7 @@ module.exports = { TranscriptionManager };
 
 const { Menu, Dialog, showMessage, openSetting, Protyle } = require("siyuan");
 const api = require("./siyuan-api");
+const { openImport } = require("./audio-import");
 const { parseCosEndpoint } = require("./cloud");
 const meetingStore = require("./meeting-store");
 const { parseHotwords, effectiveHotwords, validateHotwords } = require("./hotwords");
@@ -5601,6 +5930,7 @@ function recordingTitle(index) {
 }
 
 function recordingRange(recording) {
+  if (recording.source === "import") return recording.originalName || "导入录音";
   const start = recording.startedAt ? new Date(recording.startedAt) : new Date();
   let end = new Date(start.getTime() + Number(recording.seconds || 0) * 1000);
   const events = Array.isArray(recording.events) ? recording.events : [];
@@ -5864,6 +6194,7 @@ function mountMeetingTab(plugin, tab) {
       </div>
       <div class="meeting-header__spacer"></div>
       <div class="meeting-header__actions">
+        <button class="meeting-btn meeting-btn--outline" data-action="import-audio">添加已有录音</button>
         <button class="meeting-btn meeting-btn--outline meeting-open-doc" data-action="open-doc">在思源文档中打开</button>
         <button class="meeting-icon-btn" data-action="more" aria-label="更多操作" title="更多">${icon("iconMeetingMore")}</button>
       </div>
@@ -6157,6 +6488,11 @@ function mountMeetingTab(plugin, tab) {
   });
   action("refresh-devices").addEventListener("click", () => void loadDevices(state, field));
 
+  action("import-audio").addEventListener("click", () => {
+    if (!state.meeting?.isMeeting) return;
+    const dialog = openImport(state.meeting, () => refreshAll(state));
+    onCleanup(() => dialog.destroy());
+  });
   action("start").addEventListener("click", () => void startFromMeeting(state));
   action("pause").addEventListener("click", () => void togglePause(state));
   action("stop").addEventListener("click", () => void stopMeeting(state));
@@ -8608,7 +8944,9 @@ module.exports = {
   "src/util.js": function (module, exports, require) {
 "use strict";
 
-const crypto = require("node:crypto");
+function randomUUID() {
+  return globalThis.crypto.randomUUID();
+}
 
 const pad = (value, length = 2) => String(value).padStart(length, "0");
 
@@ -8691,7 +9029,7 @@ function parseIal(ial) {
 }
 
 function sha256(value) {
-  return crypto.createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
+  return require("node:crypto").createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
 }
 
 function clamp(value, min, max) {
@@ -8717,7 +9055,7 @@ function safeJson(value, fallback = null) {
 }
 
 function shortId() {
-  return crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  return randomUUID().replaceAll("-", "").slice(0, 12);
 }
 
 function sqlString(value) {
@@ -8740,7 +9078,7 @@ function isAssetPath(value) {
   const text = String(value || "");
   if (!text || text.includes("..") || text.includes("\\")) return false;
   if (/%2e|%2f|%5c/i.test(text)) return false;
-  return /^assets\/[^"'<>\u0000]+\.wav(?:\?box=[A-Za-z0-9-]+)?$/i.test(text);
+  return /^assets\/[^"'<>\u0000]+\.(?:wav|mp3|m4a)(?:\?box=[A-Za-z0-9-]+)?$/i.test(text);
 }
 
 /** A single source of truth for the labels shown by every recording surface. */
@@ -8770,6 +9108,7 @@ function barPhaseLabel(phase) {
 }
 
 module.exports = {
+  randomUUID,
   pad,
   formatDuration,
   formatSeconds,

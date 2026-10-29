@@ -66,5 +66,9 @@ test("block ids and archived asset paths are validated before use", () => {
   assert.equal(isAssetPath("assets/../secret.wav"), false);
   assert.equal(isAssetPath("assets/%2e%2e/secret.wav"), false);
   assert.equal(isAssetPath('assets/a"b.wav'), false);
-  assert.equal(isAssetPath("assets/meeting.mp3"), false);
+  for (const format of ["mp3", "m4a"]) {
+    assert.equal(isAssetPath(`assets/meeting.${format}`), true);
+    assert.equal(isAssetPath(`assets/../secret.${format}`), false);
+  }
+  assert.equal(isAssetPath("assets/meeting.exe"), false);
 });
