@@ -425,7 +425,7 @@ class MeetingController {
 
     if (!meeting.segments) {
       try {
-        const notes = await api.getDocMarkdown(meeting.id);
+        const notes = await meetingStore.readBodyMarkdown(meeting.id);
         try {
           // Keep the full snapshot locally; the synced attribute is bounded.
           localStorage.setItem(`siyuan-meeting.preNotes.${meeting.meetingId}`, notes);

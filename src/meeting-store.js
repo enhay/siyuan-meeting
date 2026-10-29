@@ -9,9 +9,11 @@ const {
   defaultMeetingTitle,
   isBlockId,
   isAssetPath,
+  sqlString,
 } = require("./util");
 
 const ATTR = {
+  navigation: "custom-meeting-navigation",
   id: "custom-meeting-id",
   started: "custom-meeting-started",
   firstRecorded: "custom-meeting-first-recorded",
@@ -88,11 +90,54 @@ function meetingFrom(row, attrs = {}) {
   };
 }
 
+async function ensureMeetingDirectory(notebookId) {
+  if (!notebookId) throw new Error("请先选择保存会议的笔记本");
+  const rows = await api.sql(`SELECT id FROM blocks WHERE type='d' AND box=${sqlString(notebookId)} AND hpath='/会议' ORDER BY id`);
+  if (rows.length > 1) throw new Error("笔记本中有多个同名「会议」目录，请先整理为一个目录");
+  if (rows[0]) return rows[0].id;
+  return api.createDoc({ notebookId, title: "会议", markdown: "" });
+}
+
+async function addNavigationLink(docId, role, targetId, label) {
+  if (![docId, targetId].every(isBlockId)) throw new Error("会议导航的文档地址无效");
+  const links = await api.listBlocksWithAttr(docId, ATTR.navigation);
+  if (links.some((block) => block.attrs[ATTR.navigation] === role)) return;
+  await api.prependMarkdownRaw(docId,
+    `((${targetId} '${label}'))\n{: ${ATTR.navigation}="${role}"}\n`);
+}
+
+async function linkChildDoc(meeting, childId, kind, title) {
+  await addNavigationLink(childId, "parent", meeting.id, "返回会议");
+  await addNavigationLink(meeting.id, kind, childId, title);
+}
+
+async function contentBlocks(docId) {
+  const [blocks, navigation] = await Promise.all([
+    api.post("/api/block/getChildBlocks", { id: docId }),
+    api.listBlocksWithAttr(docId, ATTR.navigation),
+  ]);
+  const excluded = new Set(navigation.map((block) => block.id));
+  return blocks.filter((block) => !excluded.has(block.id));
+}
+
+// Navigation is document structure, not meeting material or generated content.
+async function readBodyMarkdown(docId) {
+  const navigation = await api.listBlocksWithAttr(docId, ATTR.navigation);
+  if (!navigation.length) return api.getDocMarkdown(docId);
+  const excluded = new Set(navigation.map((block) => block.id));
+  const blocks = await api.post("/api/block/getChildBlocks", { id: docId });
+  return blocks.filter((block) => !excluded.has(block.id)).map((block) => {
+    if (typeof block.markdown !== "string") throw new Error("无法完整读取会议正文，请重新打开会议后重试");
+    return block.markdown;
+  }).join("\n\n").trim();
+}
+
 async function createMeeting({ title, notebookId, mode = "offline" }) {
   const meetingId = randomUUID();
   const startedAt = new Date().toISOString();
   const finalTitle = String(title || "").trim() || defaultMeetingTitle(new Date());
-  const docId = await api.createDoc({ notebookId, title: finalTitle, markdown: "" });
+  const parentID = await ensureMeetingDirectory(notebookId);
+  const docId = await api.createDoc({ notebookId, parentID, title: finalTitle, markdown: "" });
   await api.setBlockAttrs(docId, {
     [ATTR.id]: meetingId,
     [ATTR.started]: startedAt,
@@ -215,6 +260,7 @@ async function ensureTranscriptDoc(meeting) {
     [ATTR.child]: "transcript",
     [ATTR.parent]: meeting.id,
   });
+  await linkChildDoc(meeting, id, "transcript", title);
   return id;
 }
 
@@ -230,6 +276,7 @@ async function ensureSummaryDoc(meeting) {
     [ATTR.child]: "summary",
     [ATTR.parent]: meeting.id,
   });
+  await linkChildDoc(meeting, id, "summary", title);
   return { id, title };
 }
 
@@ -563,7 +610,7 @@ function readSummaryBasis(value) {
 }
 
 async function readSummaryContent(docId) {
-  return api.getDocMarkdown(docId);
+  return readBodyMarkdown(docId);
 }
 
 async function saveSummary(meeting, { markdown, sources = "", generatedAt = new Date().toISOString(), expectedFingerprint = "", receipt = {}, basis = null }) {
@@ -608,7 +655,7 @@ async function saveSummary(meeting, { markdown, sources = "", generatedAt = new 
     target = { id: latest.id, title: latest.title };
     // Capture the old block ids and append the new content first. If the
     // append fails, the previous summary is still intact.
-    oldBlocks = await api.post("/api/block/getChildBlocks", { id: target.id });
+    oldBlocks = await contentBlocks(target.id);
     replaced = true;
   }
 
@@ -668,6 +715,7 @@ module.exports = {
   updateRecordingTranscription,
   readSummaries,
   readSummaryContent,
+  readBodyMarkdown,
   saveSummary,
   transcriptLine,
   parseEvents,

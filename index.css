@@ -1003,3 +1003,18 @@
   line-height: 1.5;
   color: var(--b3-theme-on-surface);
 }
+.meeting-mobile--detail { height: 75vh; display: flex; flex-direction: column; overflow: hidden; }
+.meeting-mobile--detail > h2 { font-size: 18px; margin: 0 0 8px; flex-shrink: 0; }
+.meeting-mobile-tabs { flex-shrink: 0; }
+.meeting-mobile-tabs > [role="tab"] { flex: 1; }
+.meeting-mobile-tabs > [aria-selected="true"] { color: var(--b3-theme-primary); background: var(--b3-theme-primary-lightest); }
+.meeting-mobile-tabs > [role="tab"]:focus-visible { outline: 2px solid var(--b3-theme-primary); outline-offset: 2px; }
+.meeting-mobile-content { flex: 1; min-height: 0; overflow: hidden; }
+.meeting-mobile .meeting-mobile-panel { height: 100%; overflow: auto; padding: 0; border: 0; }
+.meeting-mobile .meeting-mobile-panel[hidden] { display: none; }
+.meeting-mobile-reader { height: calc(100% - 52px); min-height: 100px; }
+.meeting-mobile-edit { font-size: 12px; color: var(--b3-theme-on-surface); }
+.meeting-mobile-recordings { flex-shrink: 0; max-height: 25vh; overflow: auto; border-top: 1px solid var(--b3-border-color); }
+.meeting-mobile-recordings > summary { cursor: pointer; padding: 12px 0; }
+.meeting-mobile-footer { display: flex; flex-shrink: 0; gap: 8px; }
+.meeting-mobile-footer > button { flex: 1; }

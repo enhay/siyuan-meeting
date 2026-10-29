@@ -14,6 +14,7 @@ Module._load = originalLoad;
 
 test("retrying summary metadata save preserves a single result and refuses to overwrite a later edit", async (t) => {
   const document = { id: "summary", content: "", attrs: {} };
+  t.mock.method(api, "listBlocksWithAttr", async () => []);
   t.mock.method(api, "listChildDocs", async () => [{ id: document.id, attrs: document.attrs }]);
   t.mock.method(api, "getDocMarkdown", async () => document.content);
   t.mock.method(api, "post", async (endpoint) => {
@@ -39,7 +40,9 @@ test("retrying summary metadata save preserves a single result and refuses to ov
 });
 
 test("replacing a synced summary uses native blocks when the SQL index still has the previous revision", async (t) => {
-  let blocks = [{ id: "old-summary-block", markdown: "原纪要", content: "原纪要" }];
+  const navigation = { id: "navigation", markdown: "((20261029100000-abcdefg '返回会议'))", attrs: { [store.ATTR.navigation]: "parent" } };
+  let blocks = [navigation, { id: "old-summary-block", markdown: "原纪要", content: "原纪要" }];
+  t.mock.method(api, "listBlocksWithAttr", async () => [navigation]);
   let attrs = {};
   t.mock.method(api, "listChildDocs", async () => [{ id: "summary", attrs }]);
   t.mock.method(api, "sql", async () => []);
@@ -55,6 +58,7 @@ test("replacing a synced summary uses native blocks when the SQL index still has
   t.mock.method(api, "setBlockAttrs", async (_id, patch) => { attrs = { ...attrs, ...patch }; });
   const saved = await store.saveSummary({ id: "meeting" }, { markdown: "更新后的纪要", expectedFingerprint: sha256("原纪要") });
   assert.equal(saved.content, "更新后的纪要");
+  assert.deepEqual(blocks.find((block) => block.id === navigation.id), navigation);
   assert.equal(attrs[store.ATTR.summaryFingerprint], sha256("更新后的纪要"));
 });
 

@@ -1292,7 +1292,7 @@ function safeRefreshMaterial(state) {
 
 async function refreshMaterial(state) {
   const [notes, { segments }] = await Promise.all([
-    api.getDocMarkdown(state.docId), meetingStore.readTranscript(state.meeting),
+    meetingStore.readBodyMarkdown(state.docId), meetingStore.readTranscript(state.meeting),
   ]);
   if (state.destroyed) return;
   state.transcript = segments;

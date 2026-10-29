@@ -68,3 +68,63 @@ test("a newly created meeting falls back to block info while SQL catches up", as
   assert.equal(meeting.isMeeting, true);
   assert.equal(meeting.mode, "online");
 });
+
+// A future change to notebook selection must not scatter new meetings at the root.
+test("new meetings share the selected notebook meeting directory while keeping notes on the meeting document", async (t) => {
+  const api = require("../src/siyuan-api");
+  const directoryId = "20261029100000-abcdefg";
+  const meetingId = "20261029100100-abcdefg";
+  const writes = [];
+  let directory = [];
+  t.mock.method(api, "sql", async () => directory);
+  t.mock.method(api, "createDoc", async (payload) => {
+    writes.push(payload);
+    if (payload.title === "会议") { directory = [{ id: directoryId }]; return directoryId; }
+    return meetingId;
+  });
+  t.mock.method(api, "setBlockAttrs", async () => {});
+  t.mock.method(api, "getDocMeta", async () => ({ id: meetingId, box: "notebook", content: "评审" }));
+  await meetingStore.createMeeting({ title: "评审", notebookId: "notebook" });
+  await meetingStore.createMeeting({ title: "复盘", notebookId: "notebook" });
+  assert.deepEqual(writes, [
+    { notebookId: "notebook", title: "会议", markdown: "" },
+    { notebookId: "notebook", parentID: directoryId, title: "评审", markdown: "" },
+    { notebookId: "notebook", parentID: directoryId, title: "复盘", markdown: "" },
+  ]);
+});
+
+// New child-document creation must preserve links in both native reading directions.
+test("creating transcript and summary children persists native references back to the meeting and excludes navigation from notes", async (t) => {
+  const api = require("../src/siyuan-api");
+  const { parseIal } = require("../src/util");
+  const parent = "20261029100000-abcdefg";
+  const transcript = "20261029100100-abcdefg";
+  const summary = "20261029100200-abcdefg";
+  const docs = new Map([[parent, [{ id: "note", markdown: "**保留原始笔记**" }]]]);
+  const children = [];
+  t.mock.method(api, "listChildDocs", async (_id, kind) => children.filter((child) => child.attrs[meetingStore.ATTR.child] === kind));
+  t.mock.method(api, "createDoc", async ({ title, parentID }) => {
+    assert.equal(parentID, parent);
+    const id = title === "转写" ? transcript : summary;
+    docs.set(id, []);
+    return id;
+  });
+  t.mock.method(api, "setBlockAttrs", async (id, attrs) => children.push({ id, attrs }));
+  t.mock.method(api, "listBlocksWithAttr", async (id, attr) => docs.get(id).filter((block) => block.attrs?.[attr]));
+  t.mock.method(api, "prependMarkdownRaw", async (id, markdown) => {
+    docs.get(id).unshift({ id: `nav-${id}-${docs.get(id).length}`, markdown, attrs: parseIal(markdown) });
+  });
+  t.mock.method(api, "post", async (_endpoint, { id }) => docs.get(id));
+  const meeting = { id: parent, notebookId: "notebook" };
+  assert.equal(await meetingStore.ensureTranscriptDoc(meeting), transcript);
+  await meetingStore.ensureSummaryDoc(meeting);
+  assert.equal(await meetingStore.ensureTranscriptDoc(meeting), transcript);
+  assert.deepEqual(docs.get(parent).filter((block) => block.attrs).map((block) => block.markdown), [
+    `((` + summary + ` '纪要'))\n{: custom-meeting-navigation="summary"}\n`,
+    `((` + transcript + ` '转写'))\n{: custom-meeting-navigation="transcript"}\n`,
+  ]);
+  for (const id of [transcript, summary]) {
+    assert.equal(docs.get(id)[0].markdown, `((` + parent + ` '返回会议'))\n{: custom-meeting-navigation="parent"}\n`);
+  }
+  assert.equal(await meetingStore.readBodyMarkdown(parent), "**保留原始笔记**");
+});
