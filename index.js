@@ -1236,8 +1236,8 @@ async function importRecording(meeting, ticket) {
 function openImport(meeting, onImported = () => {}) {
   const dialog = new Dialog({ title: "添加已有录音", width: "480px", content: `
     <div class="meeting-import">
-      <p>支持 M4A、MP3、WAV，包括苹果「语音备忘录」导出的 M4A。保留原文件，导入后在电脑端转写。</p>
       <label>录音文件<input type="file" accept=".m4a,.mp3,.wav,audio/mp4,audio/mpeg,audio/wav"></label>
+      <p class="meeting-import-hint">支持 M4A（含苹果语音备忘录）、MP3、WAV。原文件保留，转写在电脑端进行。</p>
       <p role="status" aria-live="polite"></p>
       <button type="button" class="b3-button" disabled>添加到会议</button>
     </div>` });
@@ -4255,7 +4255,9 @@ function installMobile(plugin) {
       importDialog = openImport(meeting, () => active() ? detail(id) : undefined);
     });
     add.disabled = ["recording", "paused"].includes(meeting.status);
-    root.append(add, element("p", "支持苹果语音备忘录 M4A、MP3、WAV。转写与生成纪要请在电脑端操作。"));
+    const importHint = element("p", "M4A（含苹果录音）、MP3、WAV · 电脑端转写与生成纪要");
+    importHint.className = "meeting-import-hint";
+    root.append(add, importHint);
     if (add.disabled) root.append(element("p", "这场会议仍在录音，请结束后再添加文件。"));
     if (!saved.recordings.length) root.append(element("p", "还没有录音。"));
     for (const recording of saved.recordings) {
