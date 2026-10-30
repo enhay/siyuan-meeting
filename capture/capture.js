@@ -9,7 +9,7 @@ const crypto = require("node:crypto");
 
 const channel = new URLSearchParams(location.search).get("channel");
 const CAPTURE_RATE = 16000;
-const SIGNAL_TIMEOUT = 15000;
+const SAMPLE_TIMEOUT = 15000;
 
 let phase = "idle";
 let store = null;
@@ -23,7 +23,7 @@ let online = false;
 let busy = false;
 let nextWallStart = 0;
 let flushResolve = null;
-let signalTimer = null;
+let sampleTimer = null;
 let operation = null;
 let pendingAction = null;
 let options = null;
@@ -215,8 +215,8 @@ async function openStreams() {
 }
 
 function stopTracks() {
-  clearTimeout(signalTimer);
-  signalTimer = null;
+  clearTimeout(sampleTimer);
+  sampleTimer = null;
   for (const stream of streams) {
     for (const track of stream.getTracks()) {
       track.onended = null;
@@ -310,7 +310,6 @@ async function connect() {
   processor.connect(mute);
   mute.connect(context.destination);
   nextWallStart = Date.now();
-  cleared = [false, !online];
 
   processor.port.onmessage = ({ data }) => {
     if (data.flushed || data.flushedEmpty) {
@@ -322,7 +321,7 @@ async function connect() {
       fail(new Error(data.error));
       return;
     }
-    if (!data.samples) return;
+    if (!data.samples?.length) return;
     try {
       const audioStartMs = elapsedMs();
       store.append(data.samples, nextWallStart, [data.rms?.[0] || 0, data.rms?.[1] || 0]);
@@ -334,8 +333,16 @@ async function connect() {
       nextWallStart += (data.frames / context.sampleRate) * 1000;
       lastLevels = [data.rms?.[0] || 0, data.rms?.[1] || 0];
       lastPeaks = [data.peaks?.[0] || 0, data.peaks?.[1] || 0];
-      if (lastPeaks[0] > 0) cleared[0] = true;
-      if (lastPeaks[1] > 0) cleared[1] = true;
+      // Silent PCM is valid recording data; startup must not wait for speech.
+      if (phase === "preparing") {
+        clearTimeout(sampleTimer);
+        sampleTimer = null;
+        phase = "recording";
+        store.phase("recording");
+        if (options.meta?.segmentNo === 0 && !options.meta?.resumed) {
+          store.addEvent({ type: "start" });
+        }
+      }
       if (online && phase === "recording") {
         const silentMessage = "电脑声音长时间无信号，请确认会议声音正在播放";
         if (lastLevels[1] < 0.0005) {
@@ -352,35 +359,19 @@ async function connect() {
           if (noticeMessage === silentMessage) noticeMessage = "";
         }
       }
-      if (phase === "preparing" && cleared.every(Boolean)) {
-        clearTimeout(signalTimer);
-        signalTimer = null;
-        phase = "recording";
-        store.phase("recording");
-        if (options.meta?.segmentNo === 0 && !options.meta?.resumed) {
-          store.addEvent({ type: "start" });
-        }
-      }
       sendState();
     } catch (error) {
       fail(error);
     }
   };
 
-  clearTimeout(signalTimer);
-  signalTimer = setTimeout(() => {
-    if (!cleared.every(Boolean)) {
-      stopTracks();
-      fail(
-        new Error(
-          `未检测到${!cleared[0] ? "麦克风" : "电脑声音"}的真实信号，已停止采集。请检查设备后重新开始；不能把“有音轨”当作采集成功。`,
-        ),
-      );
+  clearTimeout(sampleTimer);
+  sampleTimer = setTimeout(() => {
+    if (phase === "preparing") {
+      fail(new Error("未收到录音数据，已停止采集。请检查设备后重新开始。"));
     }
-  }, SIGNAL_TIMEOUT);
+  }, SAMPLE_TIMEOUT);
 }
-
-let cleared = [false, false];
 
 async function disconnect() {
   stopTracks();
