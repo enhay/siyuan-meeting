@@ -176,77 +176,48 @@
 .meeting-controlbar__live { display: flex; align-items: center; gap: 8px; width: auto; min-width: 0; }
 .meeting-controlbar .meeting-btn { font-size: 14px; }
 
-.meeting-mode {
-  height: 28px;
-  padding: 2px;
-  display: inline-flex;
+.meeting-controlbar__setup { position: relative; }
+.meeting-mode-picker > summary {
+  display: flex;
   align-items: center;
-  gap: 2px;
-  border-radius: 999px;
-  background: var(--meeting-faint);
-  flex: 0 0 auto;
+  gap: 4px;
+  min-height: 32px;
+  padding: 0 6px;
+  border-radius: 6px;
+  color: var(--meeting-muted);
+  font-size: 12px;
+  list-style: none;
+  cursor: pointer;
+}
+.meeting-mode-picker > summary::-webkit-details-marker { display: none; }
+.meeting-mode-picker > summary:hover { background: var(--meeting-hover); color: var(--b3-theme-on-background); }
+.meeting-mode-picker > summary .meeting-icon { width: 12px; height: 12px; }
+.meeting-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 280px;
 }
 .meeting-mode button {
-  height: 24px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--meeting-muted);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-}
-.meeting-mode button:hover { color: var(--b3-theme-on-background); }
-.meeting-mode button.is-active {
-  background: var(--b3-theme-background);
-  color: var(--b3-theme-on-background);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
-}
-.meeting-page[data-theme="dark"] .meeting-mode button.is-active {
-  background: var(--b3-theme-surface);
-  box-shadow: none;
-}
-
-.meeting-device {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  height: 28px;
-  max-width: 240px;
-  flex: 0 1 auto;
-}
-.meeting-device__select {
-  appearance: none;
-  -webkit-appearance: none;
-  height: 28px;
-  width: 100%;
-  min-width: 132px;
-  max-width: 240px;
-  padding: 0 24px 0 10px;
-  border: 1px solid var(--meeting-border);
-  border-radius: 999px;
-  background: var(--b3-theme-background);
-  color: var(--b3-theme-on-background);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  outline: none;
-  cursor: pointer;
-}
-.meeting-device__select:focus { border-color: var(--b3-theme-primary); }
-.meeting-device__chevron {
-  position: absolute;
-  right: 6px;
   display: flex;
-  color: var(--meeting-muted);
-  pointer-events: none;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--b3-theme-on-background);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
 }
-.meeting-device__chevron .meeting-icon { width: 12px; height: 12px; }
-.meeting-device__refresh { width: 28px; height: 28px; color: var(--meeting-muted); }
-.meeting-device__refresh .meeting-icon { width: 14px; height: 14px; }
+.meeting-mode button small { color: var(--meeting-muted); font-size: 12px; line-height: 1.5; }
+.meeting-mode button:hover { background: var(--meeting-hover); }
+.meeting-mode button[aria-pressed="true"] { background: var(--meeting-faint); box-shadow: inset 2px 0 var(--b3-theme-primary); }
+.meeting-recording-settings label { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.meeting-recording-settings .b3-select { width: 100%; }
+.meeting-recording-settings p { color: var(--b3-theme-on-surface); font-size: 12px; line-height: 1.6; }
 
 .meeting-btn {
   height: 28px;
@@ -927,17 +898,13 @@
   .meeting-caret { animation: none; }
 }
 
-.meeting-recording-options { position: relative; font-size: 12px; }
-.meeting-recording-options summary { cursor: pointer; padding: 6px; }
-.meeting-recording-options__note { flex: 1 1 100%; margin: 0; color: var(--meeting-muted); line-height: 1.5; }
-.meeting-recording-options__panel,
+.meeting-mode,
 .meeting-hotwords__panel {
   position: absolute; right: 0; top: 100%; z-index: 5; min-width: 240px;
   box-sizing: border-box; max-width: calc(100cqw - 32px); max-height: min(60vh, 420px); overflow: auto; padding: 12px;
   background: var(--b3-theme-background); border: 1px solid var(--meeting-border);
   border-radius: 8px; box-shadow: var(--b3-dialog-shadow);
 }
-.meeting-recording-options__panel { display: flex; flex-wrap: wrap; gap: 8px; }
 .meeting-view--summary { display: flex; flex-direction: column; }
 .meeting-summary-editor { flex: 1 1 auto; min-height: 240px; width: 100%; }
 .meeting-summary-editor .protyle { height: 100%; }

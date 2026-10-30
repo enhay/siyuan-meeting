@@ -6324,6 +6324,13 @@ function mountMeetingTab(plugin, tab) {
       </div>
       <div class="meeting-controlbar">
         <div class="meeting-controlbar__setup">
+          <details class="meeting-mode-picker">
+            <summary><span data-field="mode-label">线下会议</span>${icon("iconMeetingChevron")}</summary>
+            <div class="meeting-mode" role="group" aria-label="录音模式">
+              <button type="button" data-mode="offline"><span>线下会议</span><small>录下你和身边人的声音</small></button>
+              <button type="button" data-mode="online"><span>线上会议</span><small>同时录下麦克风和电脑播放的声音，请使用耳机</small></button>
+            </div>
+          </details>
           <button class="meeting-btn meeting-btn--start" data-action="start">
             ${RECORDING_ICON}
             <span data-field="start-label">开始录音</span>
@@ -6358,19 +6365,6 @@ function mountMeetingTab(plugin, tab) {
       </div>
       <div class="meeting-content-nav__settings">
         <div class="meeting-hotwords" data-field="hotwords"></div>
-        <details class="meeting-recording-options"><summary aria-label="录音设置">录音设置</summary><div class="meeting-recording-options__panel">
-          <div class="meeting-mode" role="group" aria-label="录音模式">
-            <button type="button" data-mode="offline">线下</button>
-            <button type="button" data-mode="online">线上</button>
-          </div>
-          <span class="meeting-device">
-            <select class="meeting-device__select" data-field="mic" aria-label="麦克风设备"></select>
-            <span class="meeting-device__chevron">${icon("iconMeetingChevron")}</span>
-          </span>
-          <button class="meeting-icon-btn meeting-device__refresh" data-action="refresh-devices" aria-label="刷新麦克风列表" title="刷新麦克风列表">${icon("iconMeetingRefresh")}</button>
-          <p class="meeting-recording-options__note" data-field="source"></p>
-          <p class="meeting-recording-options__note" data-field="online-tip">线上录音会同时录下电脑播放的声音，请使用耳机，避免外放声音被重复录入。</p>
-        </div></details>
       </div>
     </div>
     <div class="meeting-hint" data-field="hint"></div>
@@ -6448,6 +6442,7 @@ function mountMeetingTab(plugin, tab) {
     snapshot: plugin.controller.snapshot(),
     devices: [],
     micDeviceId: "",
+    recordingSettingsDialog: null,
     mode: plugin.controller.getPrefs().mode || "offline",
     protyle: null,
     summaryProtyle: null,
@@ -6463,6 +6458,7 @@ function mountMeetingTab(plugin, tab) {
 
   const cleanupFns = [];
   const onCleanup = (fn) => cleanupFns.push(fn);
+  onCleanup(() => state.recordingSettingsDialog?.destroy());
   // SiYuan calls custom-tab update after a sync merge or native doc reload.
   const refreshSyncedMeeting = debounce(async () => {
     if (state.destroyed || !state.meeting) return;
@@ -6612,14 +6608,19 @@ function mountMeetingTab(plugin, tab) {
       state.mode = button.dataset.mode;
       plugin.controller.setPrefs({ mode: state.mode });
       renderChrome(state, field, action);
+      const picker = root.querySelector(".meeting-mode-picker");
+      picker.open = false;
+      picker.querySelector("summary").focus();
     });
   });
 
-  field("mic").addEventListener("change", () => {
-    state.micDeviceId = field("mic").value;
-    plugin.controller.setPrefs({ deviceId: state.micDeviceId });
+  root.querySelector(".meeting-mode-picker").addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    const picker = event.currentTarget;
+    picker.open = false;
+    picker.querySelector("summary").focus();
   });
-  action("refresh-devices").addEventListener("click", () => void loadDevices(state, field));
 
   action("import-audio").addEventListener("click", () => {
     if (!state.meeting?.isMeeting) return;
@@ -6764,7 +6765,7 @@ function mountMeetingTab(plugin, tab) {
         refreshSummaries(state),
       ]);
       await safeRefreshMaterial(state);
-      await loadDevices(state, field);
+      await loadDevices(state);
       renderChrome(state, field, action);
       renderMeetingView(state);
       renderBanners(state);
@@ -6830,18 +6831,19 @@ async function renameFromInput(state, input) {
   }
 }
 
-async function loadDevices(state, field) {
-  const select = field("mic");
+async function loadDevices(state, select) {
   const devices = await state.controller.getDevices(true);
   state.devices = devices;
-  select.replaceChildren(new Option("系统默认麦克风", ""));
-  devices.forEach((device, index) => {
-    select.add(new Option(device.label || `麦克风 ${index + 1}`, device.deviceId));
-  });
   if (state.micDeviceId && !devices.some((item) => item.deviceId === state.micDeviceId)) {
     state.micDeviceId = "";
   }
-  select.value = state.micDeviceId;
+  if (select) {
+    select.replaceChildren(new Option("系统默认麦克风", ""));
+    devices.forEach((device, index) => {
+      select.add(new Option(device.label || `麦克风 ${index + 1}`, device.deviceId));
+    });
+    select.value = state.micDeviceId;
+  }
 }
 
 async function startFromMeeting(state) {
@@ -6892,7 +6894,10 @@ function renderChrome(state, field, action) {
   const liveBar = state.root.querySelector(".meeting-controlbar__live");
   setup.hidden = live;
   liveBar.hidden = !live;
-  state.root.querySelector(".meeting-recording-options").hidden = live;
+  if (live) {
+    state.root.querySelector(".meeting-mode-picker").open = false;
+    state.recordingSettingsDialog?.destroy();
+  }
 
   const hasSegments = Boolean(state.meeting?.segments) || state.recordings.length > 0;
   rootSetText(field("start-label"), hasSegments ? "补录" : "开始录音");
@@ -6901,7 +6906,6 @@ function renderChrome(state, field, action) {
 
   state.root.querySelectorAll("[data-mode]").forEach((button) => {
     const selected = button.dataset.mode === state.mode;
-    button.classList.toggle("is-active", selected);
     button.setAttribute("aria-pressed", String(selected));
   });
 
@@ -6937,12 +6941,12 @@ function renderChrome(state, field, action) {
   const online = live ? snapshot.online : state.mode === "online";
   const deviceId = live ? snapshot.deviceId : state.micDeviceId;
   const deviceName = state.devices.find((device) => device.deviceId === deviceId)?.label || "系统默认麦克风";
-  rootSetText(field("source"), `${online ? "麦克风 + 电脑声音" : "仅麦克风"} · ${deviceName}`);
+  rootSetText(field("mode-label"), online ? "线上会议" : "线下会议");
+  const source = `${online ? "麦克风 + 电脑声音" : "仅麦克风"} · ${deviceName}`;
   const capturing = live && ["recording", "paused"].includes(phase);
   field("levels").hidden = !capturing;
-  field("levels").title = field("source").textContent;
-  field("online-tip").hidden = !online;
-  if (!anotherActive) action("start").title += ` · ${field("source").textContent}${online ? "。请使用耳机，避免外放声音被重复录入" : ""}`;
+  field("levels").title = source;
+  if (!anotherActive) action("start").title += ` · ${source}${online ? "。请使用耳机，避免外放声音被重复录入" : ""}`;
   field("speaker-level").hidden = !online;
   field("mic-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[0] || 0)) * 6) : 0;
   field("speaker-level").value = phase === "recording" ? Math.min(1, Math.max(0, Number(snapshot.levels?.[1] || 0)) * 6) : 0;
@@ -8571,6 +8575,44 @@ function renderFatal(state, error) {
   }
 }
 
+function openRecordingSettings(state) {
+  state.recordingSettingsDialog?.destroy();
+  const dialog = new Dialog({
+    title: "录音设置",
+    width: "420px",
+    content: `<div class="b3-dialog__content meeting-recording-settings">
+      <label>麦克风设备<select class="b3-select" data-field="mic" aria-label="麦克风设备"></select></label>
+      <button type="button" class="b3-button b3-button--outline" data-action="refresh-devices">刷新麦克风列表</button>
+      <p>会议模式可在开始录音按钮旁切换。设备选择用于下一段录音。</p>
+    </div>`,
+    destroyCallback: () => { state.recordingSettingsDialog = null; },
+  });
+  state.recordingSettingsDialog = dialog;
+  const select = dialog.element.querySelector('[data-field="mic"]');
+  const refresh = dialog.element.querySelector('[data-action="refresh-devices"]');
+  const render = () => renderChrome(state,
+    (name) => state.root.querySelector(`[data-field="${name}"]`),
+    (name) => state.root.querySelector(`[data-action="${name}"]`));
+  select.onchange = () => {
+    state.micDeviceId = select.value;
+    state.controller.setPrefs({ deviceId: state.micDeviceId });
+    render();
+  };
+  const refreshDevices = async () => {
+    select.disabled = refresh.disabled = true;
+    try {
+      await loadDevices(state, select);
+      if (!state.destroyed) render();
+    } catch (error) {
+      showMessage(`刷新麦克风失败：${error.message}`, 5000, "error");
+    } finally {
+      select.disabled = refresh.disabled = false;
+    }
+  };
+  refresh.onclick = () => void refreshDevices();
+  void refreshDevices();
+}
+
 function openMoreMenu(state) {
   const button = state.root.querySelector('[data-action="more"]');
   const rect = button.getBoundingClientRect();
@@ -8591,6 +8633,12 @@ function openMoreMenu(state) {
     click: () => openChildDoc(state, "summary"),
   });
   menu.addSeparator();
+  menu.addItem({
+    icon: "iconMeetingMic",
+    label: "录音设置",
+    disabled: state.root.classList.contains("is-active"),
+    click: () => openRecordingSettings(state),
+  });
   menu.addItem({
     icon: "iconMeetingRefresh",
     label: "重新加载会议数据",
