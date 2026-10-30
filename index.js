@@ -6312,36 +6312,18 @@ function mountMeetingTab(plugin, tab) {
   const viewId = `${plugin.name}-${docId}`;
   root.innerHTML = `
     <header class="meeting-header">
-      <div class="meeting-view-switcher meeting-switcher" role="tablist" aria-label="会议视图">
-        <button type="button" role="tab" id="${viewId}-summary-tab" aria-controls="${viewId}-summary-panel" data-view="summary" aria-selected="false">纪要</button>
-        <button type="button" role="tab" id="${viewId}-notes-tab" aria-controls="${viewId}-notes-panel" data-view="notes" aria-selected="true">笔记</button>
-        <button type="button" role="tab" id="${viewId}-transcript-tab" aria-controls="${viewId}-transcript-panel" data-view="transcript" aria-selected="false">转写</button>
-      </div>
       <div class="meeting-crumb">
         <span class="meeting-crumb__icon">${icon("iconMeetingCalendar")}</span>
         <input class="meeting-title" aria-label="会议标题" spellcheck="false" autocomplete="off">
       </div>
       <div class="meeting-header__spacer"></div>
       <div class="meeting-header__actions">
-        <button class="meeting-btn meeting-btn--outline" data-action="import-audio">添加已有录音</button>
-        <button class="meeting-btn meeting-btn--outline meeting-open-doc" data-action="open-doc">在思源文档中打开</button>
-        <button class="meeting-icon-btn" data-action="more" aria-label="更多操作" title="更多">${icon("iconMeetingMore")}</button>
+        <button class="meeting-btn" data-action="import-audio">添加已有录音</button>
+        <button class="meeting-btn meeting-open-doc" data-action="open-doc">在思源文档中打开</button>
+        <button class="meeting-icon-btn" data-action="more" data-menu="true" aria-haspopup="menu" aria-label="更多操作" title="更多">${icon("iconMeetingMore")}</button>
       </div>
       <div class="meeting-controlbar">
         <div class="meeting-controlbar__setup">
-          <details class="meeting-recording-options"><summary aria-label="录音设置">录音设置</summary><div class="meeting-recording-options__panel">
-          <div class="meeting-mode" role="group" aria-label="录音模式">
-            <button type="button" data-mode="offline">线下</button>
-            <button type="button" data-mode="online">线上</button>
-          </div>
-          <span class="meeting-device">
-            <select class="meeting-device__select" data-field="mic" aria-label="麦克风设备"></select>
-            <span class="meeting-device__chevron">${icon("iconMeetingChevron")}</span>
-          </span>
-          <button class="meeting-icon-btn meeting-device__refresh" data-action="refresh-devices" aria-label="刷新麦克风列表" title="刷新麦克风列表">${icon("iconMeetingRefresh")}</button>
-          <p class="meeting-recording-options__note" data-field="source"></p>
-          <p class="meeting-recording-options__note" data-field="online-tip">线上录音会同时录下电脑播放的声音，请使用耳机，避免外放声音被重复录入。</p>
-          </div></details>
           <button class="meeting-btn meeting-btn--start" data-action="start">
             ${RECORDING_ICON}
             <span data-field="start-label">开始录音</span>
@@ -6368,7 +6350,29 @@ function mountMeetingTab(plugin, tab) {
         </div>
       </div>
     </header>
-    <div class="meeting-hotwords" data-field="hotwords"></div>
+    <div class="meeting-content-nav">
+      <div class="meeting-view-switcher meeting-switcher" role="tablist" aria-label="会议视图">
+        <button type="button" role="tab" id="${viewId}-summary-tab" aria-controls="${viewId}-summary-panel" data-view="summary" aria-selected="false">纪要</button>
+        <button type="button" role="tab" id="${viewId}-notes-tab" aria-controls="${viewId}-notes-panel" data-view="notes" aria-selected="true">笔记</button>
+        <button type="button" role="tab" id="${viewId}-transcript-tab" aria-controls="${viewId}-transcript-panel" data-view="transcript" aria-selected="false">转写</button>
+      </div>
+      <div class="meeting-content-nav__settings">
+        <div class="meeting-hotwords" data-field="hotwords"></div>
+        <details class="meeting-recording-options"><summary aria-label="录音设置">录音设置</summary><div class="meeting-recording-options__panel">
+          <div class="meeting-mode" role="group" aria-label="录音模式">
+            <button type="button" data-mode="offline">线下</button>
+            <button type="button" data-mode="online">线上</button>
+          </div>
+          <span class="meeting-device">
+            <select class="meeting-device__select" data-field="mic" aria-label="麦克风设备"></select>
+            <span class="meeting-device__chevron">${icon("iconMeetingChevron")}</span>
+          </span>
+          <button class="meeting-icon-btn meeting-device__refresh" data-action="refresh-devices" aria-label="刷新麦克风列表" title="刷新麦克风列表">${icon("iconMeetingRefresh")}</button>
+          <p class="meeting-recording-options__note" data-field="source"></p>
+          <p class="meeting-recording-options__note" data-field="online-tip">线上录音会同时录下电脑播放的声音，请使用耳机，避免外放声音被重复录入。</p>
+        </div></details>
+      </div>
+    </div>
     <div class="meeting-hint" data-field="hint"></div>
     <div class="meeting-banners" data-field="banners"></div>
     <div class="meeting-body">
@@ -6888,6 +6892,7 @@ function renderChrome(state, field, action) {
   const liveBar = state.root.querySelector(".meeting-controlbar__live");
   setup.hidden = live;
   liveBar.hidden = !live;
+  state.root.querySelector(".meeting-recording-options").hidden = live;
 
   const hasSegments = Boolean(state.meeting?.segments) || state.recordings.length > 0;
   rootSetText(field("start-label"), hasSegments ? "补录" : "开始录音");
@@ -8678,9 +8683,16 @@ function renderMeetingHotwords(state) {
     state.meeting.useGlobalHotwords, service]);
   if (state.hotwordsKey === key) return;
   state.hotwordsKey = key;
+  const wasOpen = container.querySelector("details")?.open || false;
   container.replaceChildren();
+  const disclosure = h("details", "meeting-hotwords__disclosure");
+  disclosure.open = wasOpen;
+  const words = effectiveHotwords(prefs.hotwords, state.meeting);
+  const toggle = h("summary", "", `热词 · ${words.length}`);
+  const panel = h("div", "meeting-hotwords__panel");
+  disclosure.append(toggle, panel);
+  container.append(disclosure);
   const tags = h("div", "meeting-hotwords__tags");
-  tags.append(h("span", "meeting-hotwords__label", "本场热词"));
   const error = h("p", "meeting-hotwords__error");
   error.setAttribute("role", "alert");
   const save = async (change) => {
@@ -8716,8 +8728,10 @@ function renderMeetingHotwords(state) {
       if (savedChanges && restoreFocus && !state.destroyed) container.querySelector(".meeting-hotword__add")?.focus();
     }
   };
-  const words = effectiveHotwords(prefs.hotwords, state.meeting);
-  try { validateHotwords(words, service); } catch (failure) { error.textContent = failure.message; }
+  try { validateHotwords(words, service); } catch (failure) {
+    error.textContent = failure.message;
+    disclosure.open = true;
+  }
   for (const word of words) tags.append(hotwordTag(word, () => void save((current) => ({
     ...current, hotwords: current.hotwords.filter((item) => item !== word),
     excludedHotwords: parseHotwords([...current.excludedHotwords, word]),
@@ -8752,8 +8766,7 @@ function renderMeetingHotwords(state) {
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); confirm.click(); }
   };
   editor.append(input, confirm, cancel);
-  const options = h("details", "meeting-hotwords__options");
-  options.append(h("summary", "", "使用说明与选项"));
+  const options = h("div", "meeting-hotwords__options");
   const label = h("label", "meeting-hotwords__global");
   const useGlobal = h("input");
   useGlobal.type = "checkbox";
@@ -8770,7 +8783,7 @@ function renderMeetingHotwords(state) {
   options.append(label, reset,
     h("p", "meeting-hotwords__hint", "× 和 + 仅调整本场会议。修改用于下一段录音或会后重新识别，不改变当前实时转写与已有文字。热词帮助识别，不保证命中。"),
     h("p", "meeting-hotwords__hint", hotwordServiceHint(service)));
-  container.append(tags, editor, options, error);
+  panel.append(tags, editor, options, error);
 }
 
 function openSettings(plugin) {
